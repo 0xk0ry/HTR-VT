@@ -77,6 +77,15 @@ def get_args_parser():
                        help='Label smoothing factor for cross-entropy loss')
     parser.add_argument('--beam-size', default=5, type=int,
                        help='Beam size for beam search decoding')
+    parser.add_argument('--generation-method', default='nucleus', type=str,
+                       choices=['greedy', 'nucleus', 'beam_search'],
+                       help='Generation method for inference')
+    parser.add_argument('--generation-temperature', default=0.7, type=float,
+                       help='Temperature for sampling-based generation')
+    parser.add_argument('--repetition-penalty', default=1.3, type=float,
+                       help='Penalty for repeated tokens during generation')
+    parser.add_argument('--top-p', default=0.9, type=float,
+                       help='Top-p (nucleus) sampling threshold')
 
     subparsers = parser.add_subparsers(title="dataset setting", dest="subcommand")
 

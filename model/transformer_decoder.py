@@ -137,9 +137,51 @@ class TransformerDecoder(nn.Module):
         """
         return self.forward(memory, tgt, memory_key_padding_mask=memory_key_padding_mask)
     
-    def greedy_decode(self, memory, sos_token_id, eos_token_id, max_len=None, memory_key_padding_mask=None):
+    def nucleus_sampling(self, logits, top_p=0.9, temperature=1.0):
         """
-        Greedy decoding for inference.
+        Nucleus (top-p) sampling for more diverse generation.
+        
+        Args:
+            logits: [B, vocab_size]
+            top_p: Cumulative probability threshold
+            temperature: Temperature for sampling
+        
+        Returns:
+            tokens: [B] sampled tokens
+        """
+        # Apply temperature
+        logits = logits / temperature
+        
+        # Convert to probabilities
+        probs = F.softmax(logits, dim=-1)
+        
+        # Sort probabilities
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+        
+        # Calculate cumulative probabilities
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        
+        # Create mask for nucleus
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+        sorted_indices_to_remove[:, 0] = 0
+        
+        # Set probabilities outside nucleus to 0
+        for batch_idx in range(logits.size(0)):
+            indices_to_remove = sorted_indices[batch_idx][sorted_indices_to_remove[batch_idx]]
+            probs[batch_idx, indices_to_remove] = 0
+        
+        # Renormalize
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        
+        # Sample from the filtered distribution
+        tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        
+        return tokens
+
+    def greedy_decode(self, memory, sos_token_id, eos_token_id, max_len=None, memory_key_padding_mask=None, temperature=1.0, repetition_penalty=1.1):
+        """
+        Greedy decoding for inference with repetition penalty.
         
         Args:
             memory: Encoder output [L, B, D]
@@ -147,6 +189,8 @@ class TransformerDecoder(nn.Module):
             eos_token_id: End of sequence token ID
             max_len: Maximum generation length
             memory_key_padding_mask: Padding mask for encoder output [L, B]
+            temperature: Temperature for sampling (1.0 = no change)
+            repetition_penalty: Penalty for repeated tokens (>1.0 = discourage repetition)
         
         Returns:
             sequences: [B, max_decoded_len] - decoded sequences
@@ -163,12 +207,114 @@ class TransformerDecoder(nn.Module):
         # Track which sequences are finished
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
         
-        for _ in range(max_len - 1):
+        for step in range(max_len - 1):
             # Get logits for current sequence
             logits = self.decode_step(memory, decoded, memory_key_padding_mask)
             
-            # Get next token (greedy)
-            next_token = logits[-1].argmax(dim=-1)  # [B]
+            # Apply temperature
+            logits_temp = logits[-1] / temperature  # [B, vocab_size]
+            
+            # Apply repetition penalty
+            if repetition_penalty != 1.0 and step > 0:
+                # Get tokens that have been generated so far
+                generated_tokens = decoded.transpose(0, 1)  # [B, T]
+                
+                for batch_idx in range(batch_size):
+                    if not finished[batch_idx]:
+                        # Get unique tokens in this sequence
+                        unique_tokens = torch.unique(generated_tokens[batch_idx])
+                        
+                        # Apply penalty to repeated tokens
+                        for token in unique_tokens:
+                            if token != sos_token_id:  # Don't penalize SOS token
+                                if logits_temp[batch_idx, token] > 0:
+                                    logits_temp[batch_idx, token] /= repetition_penalty
+                                else:
+                                    logits_temp[batch_idx, token] *= repetition_penalty
+            
+            # Prevent generating consecutive identical tokens
+            if step > 0:
+                prev_token = decoded[-1]  # [B]
+                for batch_idx in range(batch_size):
+                    if not finished[batch_idx]:
+                        # Strongly discourage repeating the exact same token
+                        logits_temp[batch_idx, prev_token[batch_idx]] -= 5.0
+            
+            # Get next token (greedy from modified logits)
+            next_token = logits_temp.argmax(dim=-1)  # [B]
+            
+            # Append next token
+            decoded = torch.cat([decoded, next_token.unsqueeze(0)], dim=0)
+            
+            # Check for EOS tokens
+            finished = finished | (next_token == eos_token_id)
+            
+            # If all sequences are finished, break
+            if finished.all():
+                break
+        
+        return decoded.transpose(0, 1)  # [B, T]
+    
+    def nucleus_decode(self, memory, sos_token_id, eos_token_id, max_len=None, memory_key_padding_mask=None, temperature=0.8, top_p=0.9, repetition_penalty=1.1):
+        """
+        Nucleus sampling decoding for more diverse generation.
+        
+        Args:
+            memory: Encoder output [L, B, D]
+            sos_token_id: Start of sequence token ID
+            eos_token_id: End of sequence token ID
+            max_len: Maximum generation length
+            memory_key_padding_mask: Padding mask for encoder output [L, B]
+            temperature: Temperature for sampling
+            top_p: Nucleus sampling threshold
+            repetition_penalty: Penalty for repeated tokens
+        
+        Returns:
+            sequences: [B, max_decoded_len] - decoded sequences
+        """
+        if max_len is None:
+            max_len = self.max_seq_len
+        
+        batch_size = memory.size(1)
+        device = memory.device
+        
+        # Initialize with SOS token
+        decoded = torch.full((1, batch_size), sos_token_id, dtype=torch.long, device=device)
+        
+        # Track which sequences are finished
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        for step in range(max_len - 1):
+            # Get logits for current sequence
+            logits = self.decode_step(memory, decoded, memory_key_padding_mask)
+            
+            # Current step logits
+            current_logits = logits[-1]  # [B, vocab_size]
+            
+            # Apply repetition penalty
+            if repetition_penalty != 1.0 and step > 0:
+                generated_tokens = decoded.transpose(0, 1)  # [B, T]
+                
+                for batch_idx in range(batch_size):
+                    if not finished[batch_idx]:
+                        unique_tokens = torch.unique(generated_tokens[batch_idx])
+                        
+                        for token in unique_tokens:
+                            if token != sos_token_id:
+                                if current_logits[batch_idx, token] > 0:
+                                    current_logits[batch_idx, token] /= repetition_penalty
+                                else:
+                                    current_logits[batch_idx, token] *= repetition_penalty
+            
+            # Prevent consecutive identical tokens
+            if step > 0:
+                prev_token = decoded[-1]  # [B]
+                for batch_idx in range(batch_size):
+                    if not finished[batch_idx]:
+                        current_logits[batch_idx, prev_token[batch_idx]] -= 3.0
+            
+            # Use nucleus sampling
+            next_token = self.nucleus_sampling(current_logits, top_p=top_p, temperature=temperature)
             
             # Append next token
             decoded = torch.cat([decoded, next_token.unsqueeze(0)], dim=0)

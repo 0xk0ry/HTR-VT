@@ -66,7 +66,7 @@ def load_model_and_tokenizer(checkpoint_path, device='cuda'):
     return model, tokenizer, train_args
 
 
-def test_single_image(model, tokenizer, image_path, device='cuda', max_length=256, method='beam_search'):
+def test_single_image(model, tokenizer, image_path, device='cuda', max_length=256, args=None):
     """
     Test model on a single image.
     
@@ -76,7 +76,7 @@ def test_single_image(model, tokenizer, image_path, device='cuda', max_length=25
         image_path: Path to image file
         device: Device for computation
         max_length: Maximum generation length
-        method: Decoding method ('greedy' or 'beam_search')
+        args: Arguments containing generation parameters
     
     Returns:
         predicted_text: Predicted text string
@@ -97,14 +97,14 @@ def test_single_image(model, tokenizer, image_path, device='cuda', max_length=25
     image_tensor = transform(image).unsqueeze(0).to(device)  # [1, 1, 64, 512]
     
     with torch.no_grad():
-        if method == 'beam_search':
+        if args.method == 'beam_search':
             sequences, scores = model.generate(
                 image_tensor,
                 sos_token_id=tokenizer.sos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 max_len=max_length,
                 method='beam_search',
-                beam_size=5
+                beam_size=args.beam_size
             )
             # Take best beam
             best_sequence = sequences[0:1]
@@ -115,7 +115,10 @@ def test_single_image(model, tokenizer, image_path, device='cuda', max_length=25
                 sos_token_id=tokenizer.sos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 max_len=max_length,
-                method='greedy'
+                method=args.method,
+                temperature=args.generation_temperature,
+                repetition_penalty=args.repetition_penalty,
+                top_p=args.top_p
             )
             best_sequence = sequences
             best_score = 0.0
@@ -127,7 +130,7 @@ def test_single_image(model, tokenizer, image_path, device='cuda', max_length=25
     return predicted_text, best_score
 
 
-def test_dataset(model, tokenizer, test_loader, device='cuda', max_length=256):
+def test_dataset(model, tokenizer, test_loader, device='cuda', max_length=256, args=None):
     """
     Test model on a dataset.
     
@@ -137,6 +140,7 @@ def test_dataset(model, tokenizer, test_loader, device='cuda', max_length=256):
         test_loader: DataLoader for test set
         device: Device for computation
         max_length: Maximum generation length
+        args: Arguments containing generation parameters
     
     Returns:
         results: Dictionary with evaluation metrics
@@ -158,9 +162,9 @@ def test_dataset(model, tokenizer, test_loader, device='cuda', max_length=256):
             images = images.to(device)
             batch_size = images.size(0)
             
-            # Generate predictions
-            if batch_size == 1:
-                # Use beam search for single samples
+            # Generate predictions using configured method
+            if batch_size == 1 and args and args.method == 'beam_search':
+                # Use beam search for single samples if specified
                 try:
                     pred_sequences, _ = model.generate(
                         images,
@@ -168,26 +172,32 @@ def test_dataset(model, tokenizer, test_loader, device='cuda', max_length=256):
                         eos_token_id=tokenizer.eos_token_id,
                         max_len=max_length,
                         method='beam_search',
-                        beam_size=5
+                        beam_size=args.beam_size if args else 5
                     )
                     pred_sequences = pred_sequences[0:1]
                 except:
-                    # Fallback to greedy
+                    # Fallback to configured method if beam search fails
                     pred_sequences, _ = model.generate(
                         images,
                         sos_token_id=tokenizer.sos_token_id,
                         eos_token_id=tokenizer.eos_token_id,
                         max_len=max_length,
-                        method='greedy'
+                        method=args.method if args else 'greedy',
+                        temperature=args.generation_temperature if args else 1.0,
+                        repetition_penalty=args.repetition_penalty if args else 1.0,
+                        top_p=args.top_p if args else 0.9
                     )
             else:
-                # Use greedy for batches
+                # Use configured generation method
                 pred_sequences, _ = model.generate(
                     images,
                     sos_token_id=tokenizer.sos_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                     max_len=max_length,
-                    method='greedy'
+                    method=args.method if args else 'greedy',
+                    temperature=args.generation_temperature if args else 1.0,
+                    repetition_penalty=args.repetition_penalty if args else 1.0,
+                    top_p=args.top_p if args else 0.9
                 )
             
             # Decode predictions
@@ -242,9 +252,17 @@ def main():
                        help='Maximum generation length')
     parser.add_argument('--batch-size', type=int, default=1,
                        help='Batch size for testing')
-    parser.add_argument('--method', type=str, default='beam_search',
-                       choices=['greedy', 'beam_search'],
+    parser.add_argument('--method', type=str, default='nucleus',
+                       choices=['greedy', 'nucleus', 'beam_search'],
                        help='Decoding method')
+    parser.add_argument('--generation-temperature', default=0.7, type=float,
+                       help='Temperature for sampling-based generation')
+    parser.add_argument('--repetition-penalty', default=1.3, type=float,
+                       help='Penalty for repeated tokens during generation')
+    parser.add_argument('--top-p', default=0.9, type=float,
+                       help='Top-p (nucleus) sampling threshold')
+    parser.add_argument('--beam-size', default=5, type=int,
+                       help='Beam size for beam search decoding')
     
     # Single image testing
     parser.add_argument('--single-image', type=str, default=None,
@@ -270,7 +288,7 @@ def main():
     if args.single_image:
         print(f'\nTesting single image: {args.single_image}')
         predicted_text, confidence = test_single_image(
-            model, tokenizer, args.single_image, device, args.max_length, args.method
+            model, tokenizer, args.single_image, device, args.max_length, args
         )
         print(f'Predicted text: "{predicted_text}"')
         if args.method == 'beam_search':
@@ -304,7 +322,7 @@ def main():
     print(f'Test dataset size: {len(test_dataset)}')
     
     # Run evaluation
-    results = test_dataset(model, tokenizer, test_loader, device, args.max_length)
+    results = test_dataset(model, tokenizer, test_loader, device, args.max_length, args)
     
     # Print results
     print(f'\nTest Results:')

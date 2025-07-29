@@ -172,7 +172,7 @@ class HTR_EncoderDecoder(nn.Module):
         
         return logits
     
-    def generate(self, x, sos_token_id, eos_token_id, max_len=None, method='greedy', beam_size=5):
+    def generate(self, x, sos_token_id, eos_token_id, max_len=None, method='greedy', beam_size=5, temperature=1.0, repetition_penalty=1.1, top_p=0.9):
         """
         Generate text from image using different decoding strategies.
         
@@ -181,8 +181,11 @@ class HTR_EncoderDecoder(nn.Module):
             sos_token_id: Start of sequence token ID
             eos_token_id: End of sequence token ID
             max_len: Maximum generation length
-            method: 'greedy' or 'beam_search'
+            method: 'greedy', 'nucleus', or 'beam_search'
             beam_size: Beam size for beam search
+            temperature: Temperature for sampling
+            repetition_penalty: Penalty for repeated tokens
+            top_p: Nucleus sampling threshold
         
         Returns:
             sequences: Generated token sequences
@@ -199,7 +202,21 @@ class HTR_EncoderDecoder(nn.Module):
                 memory=memory,
                 sos_token_id=sos_token_id,
                 eos_token_id=eos_token_id,
-                max_len=max_len
+                max_len=max_len,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty
+            )
+            return sequences, None
+        
+        elif method == 'nucleus':
+            sequences = self.decoder.nucleus_decode(
+                memory=memory,
+                sos_token_id=sos_token_id,
+                eos_token_id=eos_token_id,
+                max_len=max_len,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty
             )
             return sequences, None
         
