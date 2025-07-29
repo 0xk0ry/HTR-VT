@@ -93,8 +93,8 @@ class TransformerDecoder(nn.Module):
             memory: Encoder output [L, B, D] where L is sequence length from encoder
             tgt: Target tokens [T, B] where T is target sequence length
             tgt_mask: Subsequent mask for target sequence [T, T]
-            tgt_key_padding_mask: Padding mask for target [T, B]
-            memory_key_padding_mask: Padding mask for encoder output [L, B]
+            tgt_key_padding_mask: Padding mask for target [B, T]
+            memory_key_padding_mask: Padding mask for encoder output [B, L]
         
         Returns:
             logits: [T, B, vocab_size]

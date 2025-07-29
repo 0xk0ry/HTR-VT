@@ -139,14 +139,14 @@ class EncoderDecoderTokenizer(object):
             pad_token_id: Padding token ID (if None, use self.pad_token_id)
         
         Returns:
-            mask: [T, B] boolean mask (True for padding positions)
+            mask: [B, T] boolean mask (True for padding positions)
         """
         if pad_token_id is None:
             pad_token_id = self.pad_token_id
         
         # Create mask: True for padding tokens
         mask = (sequences == pad_token_id)  # [B, T]
-        return mask.transpose(0, 1)  # [T, B]
+        return mask  # Keep as [B, T] for PyTorch transformer
     
     def get_vocab_info(self):
         """Get vocabulary information."""

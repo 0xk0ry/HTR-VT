@@ -128,8 +128,8 @@ class HTR_EncoderDecoder(nn.Module):
             memory: Encoder output [L, B, D]
             tgt: Target tokens [T, B]
             tgt_mask: Causal mask for target sequence
-            tgt_key_padding_mask: Padding mask for target
-            memory_key_padding_mask: Padding mask for encoder output
+            tgt_key_padding_mask: Padding mask for target [B, T]
+            memory_key_padding_mask: Padding mask for encoder output [B, L]
         
         Returns:
             logits: [T, B, vocab_size]
@@ -150,7 +150,7 @@ class HTR_EncoderDecoder(nn.Module):
             x: Input image [B, C, H, W]
             tgt: Target tokens [T, B] for teacher forcing
             tgt_mask: Causal mask for target sequence
-            tgt_key_padding_mask: Padding mask for target
+            tgt_key_padding_mask: Padding mask for target [B, T]
         
         Returns:
             logits: [T, B, vocab_size] if tgt is provided, else memory [L, B, D]
