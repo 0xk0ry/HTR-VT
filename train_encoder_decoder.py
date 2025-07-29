@@ -22,22 +22,81 @@ from functools import partial
 
 
 def get_alphabet_from_data(data_list, data_path):
-    """Extract alphabet from dataset files."""
+    """Extract alphabet from ground truth .txt files."""
     alphabet = set()
     
-    with open(data_list, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
+    print(f"DEBUG: Reading image list from: {data_list}")
+    print(f"DEBUG: Looking for .txt files in: {data_path}")
     
-    for line in lines:
-        parts = line.strip().split('\t')
-        if len(parts) >= 2:
-            text = parts[1]
-            alphabet.update(text)
-    
-    # Sort to ensure consistent ordering
-    alphabet_str = ''.join(sorted(alphabet))
-    print(f"DEBUG: Extracted alphabet ({len(alphabet_str)} chars): {alphabet_str[:100]}...")
-    return alphabet_str
+    try:
+        with open(data_list, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        print(f"DEBUG: Found {len(lines)} image entries in .ln file")
+        
+        # Debug first few lines
+        for i, line in enumerate(lines[:3]):
+            print(f"DEBUG: Line {i}: {repr(line.strip())}")
+        
+        processed_count = 0
+        error_count = 0
+        
+        for line_num, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Extract image filename (remove .png extension, add .txt)
+            # Handle both "image.png" and "image.png\ttext" formats
+            parts = line.split('\t')
+            image_filename = parts[0].strip()
+            
+            # Convert image filename to txt filename
+            if image_filename.endswith('.png'):
+                txt_filename = image_filename[:-4] + '.txt'
+            else:
+                txt_filename = image_filename + '.txt'
+            
+            txt_path = os.path.join(data_path, txt_filename)
+            
+            try:
+                # Read ground truth text from .txt file
+                with open(txt_path, 'r', encoding='utf-8') as txt_file:
+                    ground_truth_text = txt_file.read().strip()
+                    alphabet.update(ground_truth_text)
+                    processed_count += 1
+                    
+                    if line_num < 3:  # Debug first few
+                        print(f"DEBUG: {image_filename} -> {txt_filename}: '{ground_truth_text}'")
+                        
+            except FileNotFoundError:
+                error_count += 1
+                if error_count <= 5:  # Show first few errors
+                    print(f"DEBUG: Missing txt file: {txt_path}")
+            except Exception as e:
+                error_count += 1
+                if error_count <= 5:
+                    print(f"DEBUG: Error reading {txt_path}: {e}")
+        
+        print(f"DEBUG: Processed {processed_count} files, {error_count} errors")
+        
+        # Sort to ensure consistent ordering
+        alphabet_str = ''.join(sorted(alphabet))
+        print(f"DEBUG: Extracted alphabet ({len(alphabet_str)} chars): {alphabet_str[:100]}...")
+        
+        if len(alphabet_str) == 0:
+            print("ERROR: No alphabet extracted! Check data paths and file structure")
+            print(f"Expected structure: {data_path}/image_name.txt containing ground truth text")
+            raise ValueError(f"No characters found in ground truth files")
+        
+        return alphabet_str
+        
+    except FileNotFoundError:
+        print(f"ERROR: List file not found: {data_list}")
+        raise
+    except Exception as e:
+        print(f"ERROR: Failed to extract alphabet: {e}")
+        raise
 
 
 def validation_encoder_decoder(model, criterion, evaluation_loader, tokenizer, device, max_length=None):
