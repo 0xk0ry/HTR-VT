@@ -1,0 +1,4 @@
+data/iam/lines/
+__pycache__/
+*.pth
+*.zip

@@ -35,12 +35,12 @@
 import os
 import shutil
 import xml.etree.ElementTree as ET
-import tarfile, zipfile
+import tarfile
+import zipfile
 import pickle
 import json
 import numpy as np
 from PIL import Image
-
 
 def format_IAM_line():
     """
@@ -48,7 +48,7 @@ def format_IAM_line():
     """
     source_folder = "./iam"
     target_folder = "./iam/lines"
-    tar_filename = "lines.tgz"
+    tar_filename = "./lines.tgz"
     line_folder_path = os.path.join(target_folder, "lines")
 
     tar_path = os.path.join(source_folder, tar_filename)
@@ -61,7 +61,13 @@ def format_IAM_line():
     tar.extractall(line_folder_path)
     tar.close()
 
-    set_names = ["train", "valid", "test"]
+    # Map .ln files to set names
+    ln_files = {
+        "train": "train.ln",
+        "valid": "val.ln",
+        "test": "test.ln"
+    }
+
     gt = {
         "train": dict(),
         "valid": dict(),
@@ -69,33 +75,86 @@ def format_IAM_line():
     }
     charset = set()
 
-    for set_name in set_names:
+    for set_name, ln_file in ln_files.items():
         id = 0
         current_folder = os.path.join(target_folder, set_name)
         os.makedirs(current_folder, exist_ok=True)
-        xml_path = os.path.join(source_folder, "{}.xml".format(set_name))
-        xml_root = ET.parse(xml_path).getroot()
-        for page in xml_root:
-            name = page.attrib.get("FileName").split("/")[-1].split(".")[0]
-            img_fold_path = os.path.join(line_folder_path, name.split("-")[0], name)
-            img_paths = [os.path.join(img_fold_path, p) for p in sorted(os.listdir(img_fold_path))]
-            for i, line in enumerate(page[2]):
-                label = line.attrib.get("Value")
-                img_name = "{}_{}.png".format(set_name, id)
-                gt[set_name][img_name] = {
-                    "text": label,
-                }
-                charset = charset.union(set(label))
-                new_path = os.path.join(current_folder, img_name)
-                os.replace(img_paths[i], new_path)
-                id += 1
+
+        # Read the .ln file to get list of line files for this set
+        ln_path = os.path.join(source_folder, ln_file)
+        if not os.path.isfile(ln_path):
+            print("error - {} not found".format(ln_path))
+            continue
+
+        with open(ln_path, 'r') as f:
+            line_files = [line.strip() for line in f.readlines()]
+
+        for line_file in line_files:
+            # Parse line file name: e.g., "a01-087-04.png"
+            line_id = line_file.replace('.png', '')
+            parts = line_id.split('-')
+            if len(parts) < 3:
+                print("warning - invalid line file format: {}".format(line_file))
+                continue
+
+            # Extract form name and line number
+            form_prefix = parts[0]  # e.g., "a01"
+            form_suffix = parts[1]  # e.g., "087"
+            line_num = parts[2]     # e.g., "04"
+            form_name = f"{form_prefix}-{form_suffix}"  # e.g., "a01-087"
+
+            # Find corresponding XML file
+            xml_path = os.path.join(source_folder, "xml", form_name + ".xml")
+            if not os.path.isfile(xml_path):
+                assert False, "warning - XML file {} not found".format(xml_path)
+
+            # Find the line image file
+            img_fold_path = os.path.join(
+                line_folder_path, form_prefix, form_name)
+            line_img_path = os.path.join(img_fold_path, line_file)
+
+            if not os.path.isfile(line_img_path):
+                assert False, "warning - image file {} not found".format(line_img_path)
+
+            # Parse XML to get the text for this specific line
+            xml_root = ET.parse(xml_path).getroot()
+            line_text = None
+
+            # Look for the handwritten part
+            handwritten_part = xml_root.find('handwritten-part')
+            if handwritten_part is not None:
+                # Find the line with matching ID
+                line_id_full = f"{form_name}-{line_num}"
+                for line_elem in handwritten_part.findall('line'):
+                    if line_elem.get('id') == line_id_full:
+                        line_text = line_elem.get('text')
+                        # Clean HTML entities
+                        if line_text:
+                            line_text = line_text.replace('&quot;', '"')
+                        break
+
+            if line_text is None:
+                print("warning - no text found for line {}".format(line_id))
+                continue
+
+            # Create new image name and copy file
+            img_name = "{}_{}.png".format(form_name, id)
+            gt[set_name][img_name] = {
+                "text": line_text,
+            }
+            charset = charset.union(set(line_text))
+            new_path = os.path.join(current_folder, img_name)
+
+            if os.path.isfile(line_img_path):
+                shutil.copy2(line_img_path, new_path)
+            id += 1
 
     shutil.rmtree(line_folder_path)
     with open(os.path.join(target_folder, "labels.pkl"), "wb") as f:
-         pickle.dump({
-             "ground_truth": gt,
-             "charset": sorted(list(charset)),
-         }, f)
+        pickle.dump({
+            "ground_truth": gt,
+            "charset": sorted(list(charset)),
+        }, f)
 
 
 def format_READ2016_line():
@@ -118,15 +177,20 @@ def format_READ2016_line():
         tar.extractall(target_folder)
         tar.close()
 
-    os.rename(os.path.join(target_folder, "PublicData", "Training"), os.path.join(target_folder, "train"))
-    os.rename(os.path.join(target_folder, "PublicData", "Validation"), os.path.join(target_folder, "valid"))
-    os.rename(os.path.join(target_folder, "Test-ICFHR-2016"), os.path.join(target_folder, "test"))
+    os.rename(os.path.join(target_folder, "PublicData", "Training"),
+              os.path.join(target_folder, "train"))
+    os.rename(os.path.join(target_folder, "PublicData", "Validation"),
+              os.path.join(target_folder, "valid"))
+    os.rename(os.path.join(target_folder, "Test-ICFHR-2016"),
+              os.path.join(target_folder, "test"))
     os.rmdir(os.path.join(target_folder, "PublicData"))
     for set_name in ["train", "valid", ]:
         for filename in os.listdir(os.path.join(target_folder, set_name, "Images")):
-            filepath = os.path.join(target_folder, set_name, "Images", filename)
+            filepath = os.path.join(
+                target_folder, set_name, "Images", filename)
             if os.path.isfile(filepath):
-                os.rename(filepath, os.path.join(target_folder, set_name, filename))
+                os.rename(filepath, os.path.join(
+                    target_folder, set_name, filename))
         os.rmdir(os.path.join(target_folder, set_name, "Images"))
 
     gt = {
@@ -163,9 +227,13 @@ def format_READ2016_line():
                                 x_points.append(int(p.split(",")[0]))
                         elif sub.tag.split("}")[-1] == "TextEquiv":
                             line_label = sub[0].text
+                            # Clean HTML entities
+                            if line_label:
+                                line_label = line_label.replace('&quot;', '"')
                     if line_label is None:
                         continue
-                    top, bottom, left, right = np.min(y_points), np.max(y_points), np.min(x_points), np.max(x_points)
+                    top, bottom, left, right = np.min(y_points), np.max(
+                        y_points), np.min(x_points), np.max(x_points)
                     new_img_name = "{}_{}.jpeg".format(set_name, i)
                     new_img_path = os.path.join(img_fold_path, new_img_name)
                     curr_img = img[top:bottom + 1, left:right + 1]
@@ -184,21 +252,24 @@ def format_READ2016_line():
         }, f)
 
 
-
 def pkl2txt(dataset_name):
     for i in ['train', 'valid', 'test']:
         with open((f"./{dataset_name}/lines/labels.pkl"), "rb") as f:
             a = pickle.load(f)
+            set_folder = f'./{dataset_name}/lines/{i}'
+            os.makedirs(set_folder, exist_ok=True)
             for k, v in a['ground_truth'][i].items():
                 head = k.split('.')[0]
-                text = v['text'].replace('¬', '')
-                with open(f'./read2016/lines/{head}.txt', 'a') as t: t.write(text)
+                text = v['text'].replace('¬', '').replace('&quot;', '"')
+                txt_path = os.path.join(set_folder, f'{head}.txt')
+                with open(txt_path, 'w') as t:
+                    t.write(text)
 
 
 def move_files_and_delete_folders(parent_folder):
     """
     Move all files from train, valid, and test folders to the parent folder and delete the empty folders.
-
+wwww
     Args:
     parent_folder (str): The directory containing the train, valid, and test folders.
     """
@@ -226,15 +297,14 @@ def move_files_and_delete_folders(parent_folder):
         print(f"Moved all files from {folder} and deleted the folder.")
 
 
-
 if __name__ == "__main__":
 
-    format_READ2016_line()
-    pkl2txt('read2016')
-    move_files_and_delete_folders("./read2016/lines")
+    # format_READ2016_line()
+    # pkl2txt('read2016')
+    # move_files_and_delete_folders("./read2016/lines")
 
-    #format_IAM_line()
-    #pkl2txt('iam')
-    #move_files_and_delete_folders("./iam/lines")
+    # format_IAM_line()
+    # pkl2txt('iam')
+    move_files_and_delete_folders("./iam/lines")
 
-    # format_LAM_line()
+    # format_IAM_line()

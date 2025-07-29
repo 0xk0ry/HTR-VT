@@ -64,6 +64,20 @@ def get_args_parser():
     parser.add_argument('--ema-decay', default=0.9999, type=float, help='Exponential Moving Average (EMA) decay')
     parser.add_argument('--alpha', default=0, type=float, help='kld loss ratio')
 
+    # Encoder-Decoder specific arguments
+    parser.add_argument('--model-type', default='ctc', type=str, choices=['ctc', 'encoder_decoder'],
+                       help='Model type: ctc (original) or encoder_decoder (new)')
+    parser.add_argument('--decoder-layers', default=6, type=int, 
+                       help='Number of transformer decoder layers')
+    parser.add_argument('--decoder-heads', default=8, type=int,
+                       help='Number of attention heads in decoder')
+    parser.add_argument('--max-seq-len', default=256, type=int,
+                       help='Maximum sequence length for decoder')
+    parser.add_argument('--label-smoothing', default=0.1, type=float,
+                       help='Label smoothing factor for cross-entropy loss')
+    parser.add_argument('--beam-size', default=5, type=int,
+                       help='Beam size for beam search decoding')
+
     subparsers = parser.add_subparsers(title="dataset setting", dest="subcommand")
 
     IAM = subparsers.add_parser("IAM",
