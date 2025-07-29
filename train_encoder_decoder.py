@@ -25,7 +25,7 @@ def get_alphabet_from_data(data_list, data_path):
     """Extract alphabet from dataset files."""
     alphabet = set()
     
-    with open(data_list, 'r') as f:
+    with open(data_list, 'r', encoding='utf-8') as f:
         lines = f.readlines()
     
     for line in lines:
@@ -35,7 +35,9 @@ def get_alphabet_from_data(data_list, data_path):
             alphabet.update(text)
     
     # Sort to ensure consistent ordering
-    return ''.join(sorted(alphabet))
+    alphabet_str = ''.join(sorted(alphabet))
+    print(f"DEBUG: Extracted alphabet ({len(alphabet_str)} chars): {alphabet_str[:100]}...")
+    return alphabet_str
 
 
 def validation_encoder_decoder(model, criterion, evaluation_loader, tokenizer, device, max_length=None):
@@ -137,6 +139,14 @@ def main():
     tokenizer = EncoderDecoderTokenizer(alphabet)
     vocab_info = tokenizer.get_vocab_info()
     logger.info(f'Vocabulary size: {vocab_info["vocab_size"]}')
+    logger.info(f'First 10 characters: {vocab_info["character"][:10]}')
+    
+    # Debug: Test encoding/decoding
+    test_text = ["hello world", "test"]
+    test_input, test_output, test_lengths = tokenizer.encode_for_training(test_text)
+    test_decoded = tokenizer.decode(test_output)
+    logger.info(f'Tokenizer test - Original: {test_text}')
+    logger.info(f'Tokenizer test - Decoded: {test_decoded}')
     
     # Save tokenizer info
     with open(os.path.join(args.save_dir, 'tokenizer_info.json'), 'w') as f:
@@ -148,6 +158,14 @@ def main():
         img_size=args.img_size[::-1],
         max_seq_len=256
     )
+
+    # Verify model vocab size matches tokenizer
+    model_vocab_size = model.decoder.output_projection.out_features
+    logger.info(f'Model vocab size: {model_vocab_size}')
+    logger.info(f'Tokenizer vocab size: {vocab_info["vocab_size"]}')
+    if model_vocab_size != vocab_info['vocab_size']:
+        logger.error(f'MISMATCH: Model vocab size ({model_vocab_size}) != Tokenizer vocab size ({vocab_info["vocab_size"]})')
+        raise ValueError("Vocabulary size mismatch!")
 
     total_param = sum(p.numel() for p in model.parameters())
     logger.info(f'Total parameters: {total_param}')

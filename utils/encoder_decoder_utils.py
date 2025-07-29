@@ -41,14 +41,20 @@ def compute_encoder_decoder_loss(model, image, texts, tokenizer, max_length=None
     T, B, vocab_size = logits.shape
     
     # Flatten for loss computation
-    logits_flat = logits.view(-1, vocab_size)  # [T*B, vocab_size]
-    targets_flat = tgt_output_t.view(-1)  # [T*B]
+    logits_flat = logits.reshape(-1, vocab_size)  # [T*B, vocab_size]
+    targets_flat = tgt_output_t.reshape(-1)  # [T*B]
     
     # Create loss function
     criterion = nn.CrossEntropyLoss(
         ignore_index=tokenizer.pad_token_id,
         label_smoothing=label_smoothing
     )
+    
+    # Debug: Check target distribution
+    unique_targets, target_counts = torch.unique(targets_flat, return_counts=True)
+    if len(unique_targets) <= 5:  # Very few unique targets
+        print(f"DEBUG: Target distribution: {dict(zip(unique_targets.cpu().numpy(), target_counts.cpu().numpy()))}")
+        print(f"DEBUG: PAD token ID: {tokenizer.pad_token_id}, UNK token ID: {tokenizer.unk_token_id}")
     
     # Compute loss
     loss = criterion(logits_flat, targets_flat)

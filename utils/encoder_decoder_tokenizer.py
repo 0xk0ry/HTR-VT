@@ -36,6 +36,11 @@ class EncoderDecoderTokenizer(object):
         
         self.vocab_size = len(dict_character)
         self.character = dict_character
+        
+        # Debug information
+        print(f"DEBUG: Tokenizer created with {self.vocab_size} tokens")
+        print(f"DEBUG: Character vocab sample: {character[:50]}...")
+        print(f"DEBUG: Special token IDs - PAD:{self.pad_token_id}, SOS:{self.sos_token_id}, EOS:{self.eos_token_id}, UNK:{self.unk_token_id}")
     
     def encode_for_training(self, texts, max_length=None):
         """
@@ -58,6 +63,11 @@ class EncoderDecoderTokenizer(object):
         for text in texts:
             tokens = [self.char_to_idx.get(char, self.unk_token_id) for char in text]
             encoded_texts.append(tokens)
+            
+            # Debug: Check for unknown characters
+            unk_chars = [char for char in text if char not in self.char_to_idx]
+            if unk_chars:
+                print(f"DEBUG: Unknown characters in '{text[:20]}...': {set(unk_chars)}")
         
         # Determine max length
         if max_length is None:
@@ -111,8 +121,9 @@ class EncoderDecoderTokenizer(object):
             token_sequences = token_sequences.cpu().numpy()
         
         texts = []
-        for tokens in token_sequences:
+        for seq_idx, tokens in enumerate(token_sequences):
             text_chars = []
+            unk_count = 0
             for token_id in tokens:
                 # Skip special tokens in output
                 if token_id == self.pad_token_id:
@@ -121,10 +132,19 @@ class EncoderDecoderTokenizer(object):
                     break  # Stop at EOS
                 elif token_id == self.sos_token_id:
                     continue  # Skip SOS in output
+                elif token_id == self.unk_token_id:
+                    text_chars.append(self.UNK_TOKEN)
+                    unk_count += 1
                 elif token_id in self.idx_to_char:
                     text_chars.append(self.idx_to_char[token_id])
                 else:
                     text_chars.append(self.UNK_TOKEN)  # Unknown token
+                    unk_count += 1
+            
+            # Debug: warn if too many UNK tokens
+            if unk_count > len(text_chars) * 0.5:  # More than 50% UNK
+                print(f"DEBUG: Sequence {seq_idx} has {unk_count}/{len(text_chars)} UNK tokens")
+                print(f"DEBUG: Token IDs: {tokens[:20]}...")
             
             texts.append(''.join(text_chars))
         
