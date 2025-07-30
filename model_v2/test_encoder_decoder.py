@@ -10,7 +10,7 @@ import editdistance
 from utils import utils
 from utils.encoder_decoder_tokenizer import EncoderDecoderTokenizer
 from data import dataset
-from model.HTR_EncoderDecoder import create_encoder_decoder_model
+from HTR_EncoderDecoder import create_encoder_decoder_model
 
 
 def load_model_and_tokenizer(checkpoint_path, device='cuda'):

@@ -17,7 +17,7 @@ from utils.encoder_decoder_utils import (
     update_learning_rate
 )
 from data import dataset
-from model.HTR_EncoderDecoder import create_encoder_decoder_model
+from HTR_EncoderDecoder import create_encoder_decoder_model
 from functools import partial
 
 
@@ -106,7 +106,7 @@ def get_alphabet_from_data(data_list, data_path):
 def load_checkpoint(checkpoint_path, model, optimizer=None, model_ema=None, tokenizer=None, strict=True, encoder_only=False):
     """
     Load checkpoint with support for different loading modes.
-    
+
     Args:
         checkpoint_path: Path to checkpoint file
         model: Model to load weights into
@@ -115,47 +115,53 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, model_ema=None, toke
         tokenizer: Tokenizer to validate against (optional)
         strict: Whether to use strict loading
         encoder_only: Whether to only load encoder weights
-    
+
     Returns:
         Dictionary with loaded information (iteration, best metrics, etc.)
     """
     print(f"Loading checkpoint from: {checkpoint_path}")
-    
+
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    
+
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    
+
     # Check if tokenizer is compatible
     if tokenizer is not None and 'tokenizer_info' in checkpoint:
         checkpoint_vocab_size = checkpoint['tokenizer_info']['vocab_size']
         current_vocab_size = tokenizer.get_vocab_info()['vocab_size']
-        
+
         if checkpoint_vocab_size != current_vocab_size:
             print(f"WARNING: Vocabulary size mismatch!")
             print(f"  Checkpoint vocab size: {checkpoint_vocab_size}")
             print(f"  Current vocab size: {current_vocab_size}")
             if strict:
-                raise ValueError("Vocabulary size mismatch! Use --strict-loading false to ignore.")
-    
+                raise ValueError(
+                    "Vocabulary size mismatch! Use --strict-loading false to ignore.")
+
     # Load model weights
     if encoder_only:
         # Only load encoder weights for transfer learning
         print("Loading encoder weights only...")
-        model_state_dict = checkpoint.get('state_dict_ema', checkpoint.get('model', {}))
-        
+        model_state_dict = checkpoint.get(
+            'state_dict_ema', checkpoint.get('model', {}))
+
         # Filter encoder weights
-        encoder_weights = {k: v for k, v in model_state_dict.items() if k.startswith('encoder.')}
-        
+        encoder_weights = {
+            k: v for k, v in model_state_dict.items() if k.startswith('encoder.')}
+
         # Load with strict=False since we're only loading partial weights
-        missing_keys, unexpected_keys = model.load_state_dict(encoder_weights, strict=False)
-        print(f"Loaded encoder weights. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
-        
+        missing_keys, unexpected_keys = model.load_state_dict(
+            encoder_weights, strict=False)
+        print(
+            f"Loaded encoder weights. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+
     else:
         # Load full model
         print("Loading full model weights...")
-        model_state_dict = checkpoint.get('state_dict_ema', checkpoint.get('model', {}))
-        
+        model_state_dict = checkpoint.get(
+            'state_dict_ema', checkpoint.get('model', {}))
+
         try:
             model.load_state_dict(model_state_dict, strict=strict)
             print("Successfully loaded model weights!")
@@ -165,17 +171,20 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, model_ema=None, toke
                 print("Try using --strict-loading false")
                 raise
             else:
-                missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False)
-                print(f"Loaded with strict=False. Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
-    
+                missing_keys, unexpected_keys = model.load_state_dict(
+                    model_state_dict, strict=False)
+                print(
+                    f"Loaded with strict=False. Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
+
     # Load EMA model if available
     if model_ema is not None and 'state_dict_ema' in checkpoint:
         try:
-            model_ema.ema.load_state_dict(checkpoint['state_dict_ema'], strict=strict)
+            model_ema.ema.load_state_dict(
+                checkpoint['state_dict_ema'], strict=strict)
             print("Successfully loaded EMA model weights!")
         except Exception as e:
             print(f"Warning: Could not load EMA weights: {e}")
-    
+
     # Load optimizer state if resuming training
     if optimizer is not None and 'optimizer' in checkpoint:
         try:
@@ -183,7 +192,7 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, model_ema=None, toke
             print("Successfully loaded optimizer state!")
         except Exception as e:
             print(f"Warning: Could not load optimizer state: {e}")
-    
+
     # Extract training information
     info = {
         'start_iter': checkpoint.get('iteration', 0),
@@ -192,12 +201,12 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, model_ema=None, toke
         'args': checkpoint.get('args', {}),
         'tokenizer_info': checkpoint.get('tokenizer_info', {})
     }
-    
+
     print(f"Checkpoint info:")
     print(f"  Iteration: {info['start_iter']}")
     print(f"  Best CER: {info['best_cer']:.4f}")
     print(f"  Best WER: {info['best_wer']:.4f}")
-    
+
     return info
 
 
@@ -365,14 +374,14 @@ def main():
     if args.resume:
         logger.info(f"Resuming training from: {args.resume}")
         checkpoint_info = load_checkpoint(
-            args.resume, model, optimizer, model_ema, tokenizer, 
+            args.resume, model, optimizer, model_ema, tokenizer,
             strict=args.strict_loading, encoder_only=False
         )
         start_iter = checkpoint_info['start_iter']
         best_cer = checkpoint_info['best_cer']
         best_wer = checkpoint_info['best_wer']
         logger.info(f"Resuming from iteration {start_iter}")
-        
+
     elif args.load_model:
         logger.info(f"Loading pre-trained model from: {args.load_model}")
         checkpoint_info = load_checkpoint(
@@ -441,24 +450,26 @@ def main():
         # First forward-backward pass
         optimizer.zero_grad()
         loss, _, _ = compute_encoder_decoder_loss(
-            model, image, texts, tokenizer, max_length=256, label_smoothing=0.15  # Increased label smoothing
+            # Increased label smoothing
+            model, image, texts, tokenizer, max_length=256, label_smoothing=0.15
         )
         loss.backward()
-        
+
         # Gradient clipping to prevent exploding gradients
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
+
         optimizer.first_step(zero_grad=True)
 
         # Second forward-backward pass (SAM)
         loss2, _, _ = compute_encoder_decoder_loss(
-            model, image, texts, tokenizer, max_length=256, label_smoothing=0.15  # Increased label smoothing
+            # Increased label smoothing
+            model, image, texts, tokenizer, max_length=256, label_smoothing=0.15
         )
         loss2.backward()
-        
+
         # Gradient clipping for second pass too
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
+
         optimizer.second_step(zero_grad=True)
 
         # Update EMA

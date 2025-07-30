@@ -4,9 +4,9 @@ import torch.nn.functional as F
 from functools import partial
 import numpy as np
 
-from model import resnet18
-from model.transformer_decoder import TransformerDecoder
-from model.HTR_VT import get_2d_sincos_pos_embed, LayerNorm, Block
+import resnet18
+from transformer_decoder import TransformerDecoder
+from HTR_VT import get_2d_sincos_pos_embed, LayerNorm, Block
 
 
 class HTR_EncoderDecoder(nn.Module):
