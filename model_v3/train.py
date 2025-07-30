@@ -5,6 +5,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import os
 import json
+import wandb
 import valid
 from utils import utils
 from utils import sam
@@ -38,6 +39,9 @@ def main():
     logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
     writer = SummaryWriter(args.save_dir)
 
+    # Initialize wandb
+    wandb.init(project="HTR-VT", name=args.exp_name, config=vars(args), dir=args.save_dir)
+
     model = HTR_VT.create_model(nb_cls=args.nb_cls, img_size=args.img_size[::-1])
 
     total_param = sum(p.numel() for p in model.parameters())
@@ -66,6 +70,8 @@ def main():
                                              pin_memory=True,
                                              num_workers=args.num_workers)
 
+
+    logger.info('Initializing optimizer, criterion and converter...')
     optimizer = sam.SAM(model.parameters(), torch.optim.AdamW, lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
     converter = utils.CTCLabelConverter(train_dataset.ralph.values())
@@ -74,9 +80,8 @@ def main():
     train_loss = 0.0
 
     #### ---- train & eval ---- ####
-
+    logger.info('Start training...')
     for nb_iter in range(1, args.total_iter):
-
         optimizer, current_lr = utils.update_lr_cos(nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer)
 
         optimizer.zero_grad()
@@ -100,6 +105,8 @@ def main():
 
             writer.add_scalar('./Train/lr', current_lr, nb_iter)
             writer.add_scalar('./Train/train_loss', train_loss_avg, nb_iter)
+            # wandb log
+            wandb.log({"train/lr": current_lr, "train/loss": train_loss_avg, "iter": nb_iter})
             train_loss = 0.0
 
         if nb_iter % args.eval_iter == 0:
@@ -138,6 +145,15 @@ def main():
                 writer.add_scalar('./VAL/bestCER', best_cer, nb_iter)
                 writer.add_scalar('./VAL/bestWER', best_wer, nb_iter)
                 writer.add_scalar('./VAL/val_loss', val_loss, nb_iter)
+                # wandb log
+                wandb.log({
+                    "val/loss": val_loss,
+                    "val/CER": val_cer,
+                    "val/WER": val_wer,
+                    "val/best_CER": best_cer,
+                    "val/best_WER": best_wer,
+                    "iter": nb_iter
+                })
                 model.train()
 
 
