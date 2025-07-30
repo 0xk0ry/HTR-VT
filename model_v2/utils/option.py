@@ -64,6 +64,39 @@ def get_args_parser():
     parser.add_argument('--ema-decay', default=0.9999, type=float, help='Exponential Moving Average (EMA) decay')
     parser.add_argument('--alpha', default=0, type=float, help='kld loss ratio')
 
+    # Encoder-Decoder specific arguments
+    parser.add_argument('--model-type', default='ctc', type=str, choices=['ctc', 'encoder_decoder'],
+                       help='Model type: ctc (original) or encoder_decoder (new)')
+    parser.add_argument('--decoder-layers', default=6, type=int, 
+                       help='Number of transformer decoder layers')
+    parser.add_argument('--decoder-heads', default=8, type=int,
+                       help='Number of attention heads in decoder')
+    parser.add_argument('--max-seq-len', default=256, type=int,
+                       help='Maximum sequence length for decoder')
+    parser.add_argument('--label-smoothing', default=0.1, type=float,
+                       help='Label smoothing factor for cross-entropy loss')
+    parser.add_argument('--beam-size', default=5, type=int,
+                       help='Beam size for beam search decoding')
+    parser.add_argument('--generation-method', default='nucleus', type=str,
+                       choices=['greedy', 'nucleus', 'beam_search'],
+                       help='Generation method for inference')
+    parser.add_argument('--generation-temperature', default=0.7, type=float,
+                       help='Temperature for sampling-based generation')
+    parser.add_argument('--repetition-penalty', default=1.3, type=float,
+                       help='Penalty for repeated tokens during generation')
+    parser.add_argument('--top-p', default=0.9, type=float,
+                       help='Top-p (nucleus) sampling threshold')
+
+    # Model loading/saving arguments
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint to resume training from')
+    parser.add_argument('--load-model', type=str, default=None,
+                       help='Path to pre-trained model to load (for fine-tuning)')
+    parser.add_argument('--load-encoder-only', action='store_true', default=False,
+                       help='Only load encoder weights (useful for transfer learning)')
+    parser.add_argument('--strict-loading', action='store_true', default=True,
+                       help='Use strict loading for model weights')
+
     subparsers = parser.add_subparsers(title="dataset setting", dest="subcommand")
 
     IAM = subparsers.add_parser("IAM",
