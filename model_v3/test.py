@@ -7,7 +7,7 @@ import valid
 from utils import utils
 from utils import option
 from data import dataset
-import HTR_VT
+from model import HTR_VT
 from collections import OrderedDict
 
 
