@@ -87,6 +87,16 @@ def get_args_parser():
     parser.add_argument('--top-p', default=0.9, type=float,
                        help='Top-p (nucleus) sampling threshold')
 
+    # Model loading/saving arguments
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint to resume training from')
+    parser.add_argument('--load-model', type=str, default=None,
+                       help='Path to pre-trained model to load (for fine-tuning)')
+    parser.add_argument('--load-encoder-only', action='store_true', default=False,
+                       help='Only load encoder weights (useful for transfer learning)')
+    parser.add_argument('--strict-loading', action='store_true', default=True,
+                       help='Use strict loading for model weights')
+
     subparsers = parser.add_subparsers(title="dataset setting", dest="subcommand")
 
     IAM = subparsers.add_parser("IAM",
