@@ -6,30 +6,26 @@ import itertools
 from PIL import Image
 from torch.utils.data import Dataset
 from utils import utils
-import transform as transform
+from data import transform as transform
 from torchvision.transforms import ColorJitter
 
 
 def SameTrCollate(batch, args):
 
     images, labels = zip(*batch)
-    images = [Image.fromarray(np.uint8(images[i][0] * 255))
-              for i in range(len(images))]
+    images = [Image.fromarray(np.uint8(images[i][0] * 255)) for i in range(len(images))]
 
     # Apply data augmentations with 90% probability
     if np.random.rand() < 0.5:
-        images = [transform.RandomTransform(
-            args.proj)(image) for image in images]
+        images = [transform.RandomTransform(args.proj)(image) for image in images]
 
     if np.random.rand() < 0.5:
         kernel_h = utils.randint(1, args.dila_ero_max_kernel + 1)
         kernel_w = utils.randint(1, args.dila_ero_max_kernel + 1)
         if utils.randint(0, 2) == 0:
-            images = [transform.Erosion((kernel_w, kernel_h), args.dila_ero_iter)(
-                image) for image in images]
+            images = [transform.Erosion((kernel_w, kernel_h), args.dila_ero_iter)(image) for image in images]
         else:
-            images = [transform.Dilation((kernel_w, kernel_h), args.dila_ero_iter)(
-                image) for image in images]
+            images = [transform.Dilation((kernel_w, kernel_h), args.dila_ero_iter)(image) for image in images]
 
     if np.random.rand() < 0.5:
         images = [ColorJitter(args.jitter_brightness, args.jitter_contrast, args.jitter_saturation,
@@ -37,8 +33,7 @@ def SameTrCollate(batch, args):
 
     # Convert images to tensors
 
-    image_tensors = [torch.from_numpy(
-        np.array(image, copy=True)) for image in images]
+    image_tensors = [torch.from_numpy(np.array(image, copy=True)) for image in images]
     image_tensors = torch.cat([t.unsqueeze(0) for t in image_tensors], 0)
     image_tensors = image_tensors.unsqueeze(1).float()
     image_tensors = image_tensors / 255.
@@ -58,32 +53,8 @@ class myLoadDS(Dataset):
         else:
             self.ralph = ralph
 
-        self.ralph = {
-            char: idx for idx, char in enumerate(
-                'abcdefghijklmnopqrstuvwxyz'
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-                '0123456789'
-                '.,!?;: "#&\'()*+-/'
-                'àáảãạăằắẳẵặâầấẩẫậ'
-                'èéẻẽẹêềếểễệ'
-                'ìíỉĩị'
-                'òóỏõọôồốổỗộơờớởỡợ'
-                'ùúủũụưừứửữự'
-                'ỳýỷỹỵ'
-                'đ'
-                'ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬ'
-                'ÈÉẺẼẸÊỀẾỂỄỆ'
-                'ÌÍỈĨỊ'
-                'ÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ'
-                'ÙÚỦŨỤƯỪỨỬỮỰ'
-                'ỲÝỶỸỴ'
-                'Đ'
-            )
-        }
-
         if mln != None:
-            filt = [len(x) <= mln if fmin else len(x)
-                    >= mln for x in self.tlbls]
+            filt = [len(x) <= mln if fmin else len(x) >= mln for x in self.tlbls]
             self.tlbls = np.asarray(self.tlbls)[filt].tolist()
             self.fns = np.asarray(self.fns)[filt].tolist()
 
@@ -141,8 +112,7 @@ def get_labels(fnames):
     labels = []
     for id, image_file in enumerate(fnames):
         fn = os.path.splitext(image_file)[0] + '.txt'
-        with open(fn, 'r', encoding='utf-8') as file:
-            lbl = file.read()
+        lbl = open(fn, 'r').read()
         lbl = ' '.join(lbl.split())  # remove linebreaks if present
 
         labels.append(lbl)
@@ -174,17 +144,3 @@ def cycle_data(iterable):
         for x in iterable:
             yield x
 
-
-if __name__ == '__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Test dataset loading')
-    parser.add_argument('--file_list', type=str,
-                        required=True, help='Path to file list')
-    parser.add_argument('--data_path', type=str,
-                        required=True, help='Path to data directory')
-    args = parser.parse_args()
-
-    dataset = myLoadDS(args.file_list, args.data_path)
-    print(
-        f'Loaded {len(dataset)} samples from {args.file_list} characters {len(dataset.ralph)}: {dataset.ralph}')

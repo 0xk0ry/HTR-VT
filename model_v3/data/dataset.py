@@ -52,7 +52,28 @@ class myLoadDS(Dataset):
             self.alph = alph
         else:
             self.ralph = ralph
-
+        self.ralph = {
+            char: idx for idx, char in enumerate(
+                'abcdefghijklmnopqrstuvwxyz'
+                'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+                '0123456789'
+                '.,!?;: "#&\'()*+-/'
+                'àáảãạăằắẳẵặâầấẩẫậ'
+                'èéẻẽẹêềếểễệ'
+                'ìíỉĩị'
+                'òóỏõọôồốổỗộơờớởỡợ'
+                'ùúủũụưừứửữự'
+                'ỳýỷỹỵ'
+                'đ'
+                'ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬ'
+                'ÈÉẺẼẸÊỀẾỂỄỆ'
+                'ÌÍỈĨỊ'
+                'ÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ'
+                'ÙÚỦŨỤƯỪỨỬỮỰ'
+                'ỲÝỶỸỴ'
+                'Đ'
+            )
+        }
         if mln != None:
             filt = [len(x) <= mln if fmin else len(x) >= mln for x in self.tlbls]
             self.tlbls = np.asarray(self.tlbls)[filt].tolist()
