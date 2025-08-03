@@ -1,31 +1,35 @@
-import numpy as np
-import torch
-import skimage
-import os
-import itertools
-from PIL import Image
-from torch.utils.data import Dataset
-from utils import utils
-from data import transform as transform
 from torchvision.transforms import ColorJitter
+from data import transform as transform
+from utils import utils
+from torch.utils.data import Dataset
+from PIL import Image
+import itertools
+import os
+import skimage
+import torch
+import numpy as np
 
 
 def SameTrCollate(batch, args):
 
     images, labels = zip(*batch)
-    images = [Image.fromarray(np.uint8(images[i][0] * 255)) for i in range(len(images))]
+    images = [Image.fromarray(np.uint8(images[i][0] * 255))
+              for i in range(len(images))]
 
     # Apply data augmentations with 90% probability
     if np.random.rand() < 0.5:
-        images = [transform.RandomTransform(args.proj)(image) for image in images]
+        images = [transform.RandomTransform(
+            args.proj)(image) for image in images]
 
     if np.random.rand() < 0.5:
         kernel_h = utils.randint(1, args.dila_ero_max_kernel + 1)
         kernel_w = utils.randint(1, args.dila_ero_max_kernel + 1)
         if utils.randint(0, 2) == 0:
-            images = [transform.Erosion((kernel_w, kernel_h), args.dila_ero_iter)(image) for image in images]
+            images = [transform.Erosion((kernel_w, kernel_h), args.dila_ero_iter)(
+                image) for image in images]
         else:
-            images = [transform.Dilation((kernel_w, kernel_h), args.dila_ero_iter)(image) for image in images]
+            images = [transform.Dilation((kernel_w, kernel_h), args.dila_ero_iter)(
+                image) for image in images]
 
     if np.random.rand() < 0.5:
         images = [ColorJitter(args.jitter_brightness, args.jitter_contrast, args.jitter_saturation,
@@ -33,7 +37,8 @@ def SameTrCollate(batch, args):
 
     # Convert images to tensors
 
-    image_tensors = [torch.from_numpy(np.array(image, copy=True)) for image in images]
+    image_tensors = [torch.from_numpy(
+        np.array(image, copy=True)) for image in images]
     image_tensors = torch.cat([t.unsqueeze(0) for t in image_tensors], 0)
     image_tensors = image_tensors.unsqueeze(1).float()
     image_tensors = image_tensors / 255.
@@ -53,11 +58,11 @@ class myLoadDS(Dataset):
         else:
             self.ralph = ralph
         self.ralph = {
-            char: idx for idx, char in enumerate(
+            idx: char for idx, char in enumerate(
                 'abcdefghijklmnopqrstuvwxyz'
                 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
                 '0123456789'
-                '.,!?;: "#&\'()*+-/'
+                '.,!?;: "#&\'()*+-/%=<>@[]^_`{|}~'
                 'àáảãạăằắẳẵặâầấẩẫậ'
                 'èéẻẽẹêềếểễệ'
                 'ìíỉĩị'
@@ -75,7 +80,8 @@ class myLoadDS(Dataset):
             )
         }
         if mln != None:
-            filt = [len(x) <= mln if fmin else len(x) >= mln for x in self.tlbls]
+            filt = [len(x) <= mln if fmin else len(x)
+                    >= mln for x in self.tlbls]
             self.tlbls = np.asarray(self.tlbls)[filt].tolist()
             self.fns = np.asarray(self.fns)[filt].tolist()
 
@@ -164,4 +170,3 @@ def cycle_data(iterable):
     while True:
         for x in iterable:
             yield x
-

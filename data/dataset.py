@@ -1,13 +1,13 @@
-import numpy as np
-import torch
-import skimage
-import os
-import itertools
-from PIL import Image
-from torch.utils.data import Dataset
-from utils import utils
-import transform as transform
 from torchvision.transforms import ColorJitter
+from data import transform as transform
+from utils import utils
+from torch.utils.data import Dataset
+from PIL import Image
+import itertools
+import os
+import skimage
+import torch
+import numpy as np
 
 
 def SameTrCollate(batch, args):
@@ -57,13 +57,12 @@ class myLoadDS(Dataset):
             self.alph = alph
         else:
             self.ralph = ralph
-
         self.ralph = {
-            char: idx for idx, char in enumerate(
+            idx: char for idx, char in enumerate(
                 'abcdefghijklmnopqrstuvwxyz'
                 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
                 '0123456789'
-                '.,!?;: "#&\'()*+-/'
+                '.,!?;: "#&\'()*+-/%=<>@[]^_`{|}~'
                 'àáảãạăằắẳẵặâầấẩẫậ'
                 'èéẻẽẹêềếểễệ'
                 'ìíỉĩị'
@@ -80,7 +79,6 @@ class myLoadDS(Dataset):
                 'Đ'
             )
         }
-
         if mln != None:
             filt = [len(x) <= mln if fmin else len(x)
                     >= mln for x in self.tlbls]
@@ -141,8 +139,7 @@ def get_labels(fnames):
     labels = []
     for id, image_file in enumerate(fnames):
         fn = os.path.splitext(image_file)[0] + '.txt'
-        with open(fn, 'r', encoding='utf-8') as file:
-            lbl = file.read()
+        lbl = open(fn, 'r').read()
         lbl = ' '.join(lbl.split())  # remove linebreaks if present
 
         labels.append(lbl)
@@ -173,18 +170,3 @@ def cycle_data(iterable):
     while True:
         for x in iterable:
             yield x
-
-
-if __name__ == '__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Test dataset loading')
-    parser.add_argument('--file_list', type=str,
-                        required=True, help='Path to file list')
-    parser.add_argument('--data_path', type=str,
-                        required=True, help='Path to data directory')
-    args = parser.parse_args()
-
-    dataset = myLoadDS(args.file_list, args.data_path)
-    print(
-        f'Loaded {len(dataset)} samples from {args.file_list} characters {len(dataset.ralph)}: {dataset.ralph}')
