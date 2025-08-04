@@ -33,13 +33,6 @@ def compute_loss(args, model, image, batch_size, criterion, text, length):
 def main():
 
     args = option.get_args_parser()
-    # Add resume_checkpoint argument
-    import argparse
-    if not hasattr(args, 'resume_checkpoint'):
-        parser = argparse.ArgumentParser()
-        parser.add_argument('--resume_checkpoint', type=str, default=None,
-                            help='Path to checkpoint_{cer}_{wer}_{iter}.pth to resume from')
-        args = parser.parse_args(namespace=args)
 
     torch.manual_seed(args.seed)
 
