@@ -175,18 +175,27 @@ def main():
                 writer.add_scalar('./VAL/bestWER', best_wer, nb_iter)
                 writer.add_scalar('./VAL/val_loss', val_loss, nb_iter)
                 # wandb log
-                example_count = min(5, len(preds))  # log up to 5 examples
+                example_count = min(5, batch[0].size(0))  # log up to 5 examples from current batch
                 example_images = []
+                # Get model predictions for current batch
+                model.eval()
+                with torch.no_grad():
+                    image = batch[0].cuda()
+                    preds = model(image)
+                    if isinstance(preds, (list, tuple)):
+                        preds = preds[0]
+                    preds = preds.float()
+                    batch_size = image.size(0)
+                    preds_size = torch.IntTensor([preds.size(1)] * batch_size)
+                    preds = preds.permute(1, 0, 2).log_softmax(2)
+                    _, preds_index = preds.max(2)
+                    preds_index = preds_index.transpose(1, 0).contiguous().view(-1)
+                    preds_str = converter.decode(preds_index.data, preds_size.data)
+
                 for i in range(example_count):
                     img_tensor = batch[0][i].cpu()
-                    # Get prediction indices for this sample
-                    # preds: [T, N, C] after permute and log_softmax
-                    # preds_index: [T, N]
-                    _, preds_index = preds.max(2)  # preds: [T, N, C] -> preds_index: [T, N]
-                    preds_index = preds_index[:, i]  # get indices for i-th sample, shape [T]
-                    preds_size = torch.IntTensor([preds.size(0)])  # T
-                    pred_text = converter.decode(preds_index.data, preds_size.data)
-                    true_text = batch[1][i]  # ground truth string
+                    pred_text = preds_str[i]
+                    true_text = batch[1][i]
                     is_correct = pred_text == true_text
                     img_with_text = overlay_text_on_image(img_tensor, pred_text, true_text, is_correct)
                     caption = f"Pred: {pred_text} | GT: {true_text} | {'✅' if is_correct else '❌'}"
