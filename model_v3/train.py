@@ -179,8 +179,14 @@ def main():
                 example_images = []
                 for i in range(example_count):
                     img_tensor = batch[0][i].cpu()
-                    pred_text = converter.decode([preds[i]])
-                    true_text = converter.decode([labels[i]])
+                    # Get prediction indices for this sample
+                    # preds: [T, N, C] after permute and log_softmax
+                    # preds_index: [T, N]
+                    _, preds_index = preds.max(2)  # preds: [T, N, C] -> preds_index: [T, N]
+                    preds_index = preds_index[:, i]  # get indices for i-th sample, shape [T]
+                    preds_size = torch.IntTensor([preds.size(0)])  # T
+                    pred_text = converter.decode(preds_index.data, preds_size.data)
+                    true_text = batch[1][i]  # ground truth string
                     is_correct = pred_text == true_text
                     img_with_text = overlay_text_on_image(img_tensor, pred_text, true_text, is_correct)
                     caption = f"Pred: {pred_text} | GT: {true_text} | {'✅' if is_correct else '❌'}"
