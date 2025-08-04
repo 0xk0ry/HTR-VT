@@ -110,8 +110,15 @@ def main():
     converter = utils.CTCLabelConverter(train_dataset.ralph.values())
 
     train_loss = 0.0
+    train_loss_count = 0
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
+    # Restore train_loss and train_loss_count if present in checkpoint
+    if args.resume_checkpoint is not None and os.path.isfile(args.resume_checkpoint):
+        if 'train_loss' in checkpoint:
+            train_loss = checkpoint['train_loss']
+        if 'train_loss_count' in checkpoint:
+            train_loss_count = checkpoint['train_loss_count']
 
     # --- Helper for overlaying text on image ---
     import torchvision.transforms as T
@@ -150,9 +157,10 @@ def main():
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
         train_loss += loss.item()
+        train_loss_count += 1
 
         if nb_iter % args.print_iter == 0:
-            train_loss_avg = train_loss / args.print_iter
+            train_loss_avg = train_loss / train_loss_count if train_loss_count > 0 else 0.0
 
             logger.info(
                 f'Iter : {nb_iter} \t LR : {current_lr:0.5f} \t training loss : {train_loss_avg:0.5f} \t ')
@@ -163,6 +171,7 @@ def main():
             wandb.log({"train/lr": current_lr,
                       "train/loss": train_loss_avg, "iter": nb_iter})
             train_loss = 0.0
+            train_loss_count = 0
 
         if nb_iter % args.eval_iter == 0:
             model.eval()
@@ -188,6 +197,8 @@ def main():
                         'numpy_state': np.random.get_state(),
                         'torch_state': torch.get_rng_state(),
                         'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                        'train_loss': train_loss,
+                        'train_loss_count': train_loss_count,
                     }
                     torch.save(checkpoint, os.path.join(
                         args.save_dir, 'best_CER.pth'))
@@ -208,6 +219,8 @@ def main():
                         'numpy_state': np.random.get_state(),
                         'torch_state': torch.get_rng_state(),
                         'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                        'train_loss': train_loss,
+                        'train_loss_count': train_loss_count,
                     }
                     torch.save(checkpoint, os.path.join(
                         args.save_dir, 'best_WER.pth'))
