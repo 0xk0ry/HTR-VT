@@ -197,9 +197,8 @@ def main():
                     pred_text = preds_str[i]
                     true_text = batch[1][i]
                     is_correct = pred_text == true_text
-                    img_with_text = overlay_text_on_image(img_tensor, pred_text, true_text, is_correct)
                     caption = f"Pred: {pred_text} | GT: {true_text} | {'✅' if is_correct else '❌'}"
-                    example_images.append(wandb.Image(img_with_text, caption=caption))
+                    example_images.append(wandb.Image(img_tensor, caption=caption))
 
                 wandb.log({
                     "val/loss": val_loss,
