@@ -13,6 +13,8 @@ from utils import option
 from data import dataset
 from model import HTR_VT
 from functools import partial
+import random
+import numpy as np
 
 
 def compute_loss(args, model, image, batch_size, criterion, text, length):
@@ -30,13 +32,13 @@ def compute_loss(args, model, image, batch_size, criterion, text, length):
 
 def main():
 
-
     args = option.get_args_parser()
     # Add resume_checkpoint argument
     import argparse
     if not hasattr(args, 'resume_checkpoint'):
         parser = argparse.ArgumentParser()
-        parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to checkpoint_{cer}_{wer}_{iter}.pth to resume from')
+        parser.add_argument('--resume_checkpoint', type=str, default=None,
+                            help='Path to checkpoint_{cer}_{wer}_{iter}.pth to resume from')
         args = parser.parse_args(namespace=args)
 
     torch.manual_seed(args.seed)
@@ -77,12 +79,14 @@ def main():
             optimizer_state = None
         # Parse CER, WER, iter from filename
         import re
-        m = re.search(r'checkpoint_(?P<cer>[\d\.]+)_(?P<wer>[\d\.]+)_(?P<iter>\d+)\.pth', args.resume_checkpoint)
+        m = re.search(
+            r'checkpoint_(?P<cer>[\d\.]+)_(?P<wer>[\d\.]+)_(?P<iter>\d+)\.pth', args.resume_checkpoint)
         if m:
             best_cer = float(m.group('cer'))
             best_wer = float(m.group('wer'))
             start_iter = int(m.group('iter')) + 1
-        logger.info(f"Resumed best_cer={best_cer}, best_wer={best_wer}, start_iter={start_iter}")
+        logger.info(
+            f"Resumed best_cer={best_cer}, best_wer={best_wer}, start_iter={start_iter}")
     else:
         optimizer_state = None
 
@@ -119,6 +123,7 @@ def main():
     # --- Helper for overlaying text on image ---
     import torchvision.transforms as T
     from PIL import Image, ImageDraw, ImageFont
+
     def overlay_text_on_image(img_tensor, pred_text, true_text, is_correct):
         img = T.ToPILImage()(img_tensor)
         draw = ImageDraw.Draw(img)
@@ -182,6 +187,14 @@ def main():
                         'model': model.state_dict(),
                         'state_dict_ema': model_ema.ema.state_dict(),
                         'optimizer': optimizer.state_dict(),
+                        'nb_iter': nb_iter,
+                        'best_cer': best_cer,
+                        'best_wer': best_wer,
+                        'args': vars(args),
+                        'random_state': random.getstate(),
+                        'numpy_state': np.random.get_state(),
+                        'torch_state': torch.get_rng_state(),
+                        'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
                     }
                     torch.save(checkpoint, os.path.join(
                         args.save_dir, 'best_CER.pth'))
@@ -194,6 +207,14 @@ def main():
                         'model': model.state_dict(),
                         'state_dict_ema': model_ema.ema.state_dict(),
                         'optimizer': optimizer.state_dict(),
+                        'nb_iter': nb_iter,
+                        'best_cer': best_cer,
+                        'best_wer': best_wer,
+                        'args': vars(args),
+                        'random_state': random.getstate(),
+                        'numpy_state': np.random.get_state(),
+                        'torch_state': torch.get_rng_state(),
+                        'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
                     }
                     torch.save(checkpoint, os.path.join(
                         args.save_dir, 'best_WER.pth'))
@@ -207,7 +228,8 @@ def main():
                 writer.add_scalar('./VAL/bestWER', best_wer, nb_iter)
                 writer.add_scalar('./VAL/val_loss', val_loss, nb_iter)
                 # wandb log
-                example_count = min(5, batch[0].size(0))  # log up to 5 examples from current batch
+                # log up to 5 examples from current batch
+                example_count = min(5, batch[0].size(0))
                 example_images = []
                 # Get model predictions for current batch
                 model.eval()
@@ -221,8 +243,10 @@ def main():
                     preds_size = torch.IntTensor([preds.size(1)] * batch_size)
                     preds = preds.permute(1, 0, 2).log_softmax(2)
                     _, preds_index = preds.max(2)
-                    preds_index = preds_index.transpose(1, 0).contiguous().view(-1)
-                    preds_str = converter.decode(preds_index.data, preds_size.data)
+                    preds_index = preds_index.transpose(
+                        1, 0).contiguous().view(-1)
+                    preds_str = converter.decode(
+                        preds_index.data, preds_size.data)
 
                 for i in range(example_count):
                     img_tensor = batch[0][i].cpu()
@@ -230,7 +254,8 @@ def main():
                     true_text = batch[1][i]
                     is_correct = pred_text == true_text
                     caption = f"Pred: {pred_text} | GT: {true_text} | {'✅' if is_correct else '❌'}"
-                    example_images.append(wandb.Image(img_tensor, caption=caption))
+                    example_images.append(wandb.Image(
+                        img_tensor, caption=caption))
 
                 wandb.log({
                     "val/loss": val_loss,
