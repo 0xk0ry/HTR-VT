@@ -30,7 +30,15 @@ def compute_loss(args, model, image, batch_size, criterion, text, length):
 
 def main():
 
+
     args = option.get_args_parser()
+    # Add resume_checkpoint argument
+    import argparse
+    if not hasattr(args, 'resume_checkpoint'):
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to checkpoint_{cer}_{wer}_{iter}.pth to resume from')
+        args = parser.parse_args(namespace=args)
+
     torch.manual_seed(args.seed)
 
     args.save_dir = os.path.join(args.out_dir, args.exp_name)
@@ -54,6 +62,29 @@ def main():
     model = model.cuda()
     model_ema = utils.ModelEma(model, args.ema_decay)
     model.zero_grad()
+
+    # Resume from checkpoint if specified
+    best_cer, best_wer, start_iter = 1e+6, 1e+6, 1
+    if args.resume_checkpoint is not None and os.path.isfile(args.resume_checkpoint):
+        logger.info(f"Resuming from checkpoint: {args.resume_checkpoint}")
+        checkpoint = torch.load(args.resume_checkpoint)
+        model.load_state_dict(checkpoint['model'])
+        if 'state_dict_ema' in checkpoint:
+            model_ema.ema.load_state_dict(checkpoint['state_dict_ema'])
+        if 'optimizer' in checkpoint:
+            optimizer_state = checkpoint['optimizer']
+        else:
+            optimizer_state = None
+        # Parse CER, WER, iter from filename
+        import re
+        m = re.search(r'checkpoint_(?P<cer>[\d\.]+)_(?P<wer>[\d\.]+)_(?P<iter>\d+)\.pth', args.resume_checkpoint)
+        if m:
+            best_cer = float(m.group('cer'))
+            best_wer = float(m.group('wer'))
+            start_iter = int(m.group('iter')) + 1
+        logger.info(f"Resumed best_cer={best_cer}, best_wer={best_wer}, start_iter={start_iter}")
+    else:
+        optimizer_state = None
 
     logger.info('Loading train loader...')
     train_dataset = dataset.myLoadDS(
@@ -81,8 +112,9 @@ def main():
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
     converter = utils.CTCLabelConverter(train_dataset.ralph.values())
 
-    best_cer, best_wer = 1e+6, 1e+6
     train_loss = 0.0
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
 
     # --- Helper for overlaying text on image ---
     import torchvision.transforms as T
@@ -101,7 +133,7 @@ def main():
 
     #### ---- train & eval ---- ####
     logger.info('Start training...')
-    for nb_iter in range(1, args.total_iter):
+    for nb_iter in range(start_iter, args.total_iter):
         optimizer, current_lr = utils.update_lr_cos(
             nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer)
 

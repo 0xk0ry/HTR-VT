@@ -63,6 +63,7 @@ def get_args_parser():
 
     parser.add_argument('--ema-decay', default=0.9999, type=float, help='Exponential Moving Average (EMA) decay')
     parser.add_argument('--alpha', default=0, type=float, help='kld loss ratio')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume training from (checkpoint_{CER}_{WER}_iter.pth format)')
 
     # Encoder-Decoder specific arguments
     parser.add_argument('--model-type', default='ctc', type=str, choices=['ctc', 'encoder_decoder'],
