@@ -60,32 +60,78 @@ def main():
 
     # Helper to load checkpoint (consistent with test.py)
     def load_checkpoint(model, model_ema, optimizer, checkpoint_path):
+        from collections import OrderedDict
+        import re
+        
         best_cer, best_wer, start_iter = 1e+6, 1e+6, 1
         train_loss, train_loss_count = 0.0, 0
         optimizer_state = None
         if checkpoint_path is not None and os.path.isfile(checkpoint_path):
             logger.info(f"Resuming from checkpoint: {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path)
-            model.load_state_dict(checkpoint['model'])
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            
+            # Load model state dict (handle module prefix like in test.py)
+            model_dict = OrderedDict()
+            pattern = re.compile('module.')
+            
+            # Try loading from state_dict_ema first (preferred), then from model
             if 'state_dict_ema' in checkpoint:
-                model_ema.ema.load_state_dict(checkpoint['state_dict_ema'])
+                source_dict = checkpoint['state_dict_ema']
+                logger.info("Loading from state_dict_ema")
+            elif 'model' in checkpoint:
+                source_dict = checkpoint['model']
+                logger.info("Loading from model state dict")
+            else:
+                raise KeyError("Neither 'state_dict_ema' nor 'model' found in checkpoint")
+            
+            for k, v in source_dict.items():
+                if re.search("module", k):
+                    model_dict[re.sub(pattern, '', k)] = v
+                else:
+                    model_dict[k] = v
+            
+            model.load_state_dict(model_dict, strict=True)
+            
+            # Load EMA state dict if available
+            if 'state_dict_ema' in checkpoint:
+                ema_dict = OrderedDict()
+                for k, v in checkpoint['state_dict_ema'].items():
+                    if re.search("module", k):
+                        ema_dict[re.sub(pattern, '', k)] = v
+                    else:
+                        ema_dict[k] = v
+                model_ema.ema.load_state_dict(ema_dict, strict=True)
+            
+            # Load optimizer state
             if 'optimizer' in checkpoint:
                 optimizer_state = checkpoint['optimizer']
-            # Parse CER, WER, iter from filename
-            import re
-            m = re.search(r'checkpoint_(?P<cer>[\d\.]+)_(?P<wer>[\d\.]+)_(?P<iter>\d+)\.pth', checkpoint_path)
-            if m:
+                
+            # Load metrics from checkpoint if available
+            if 'best_cer' in checkpoint:
+                best_cer = checkpoint['best_cer']
+            if 'best_wer' in checkpoint:
+                best_wer = checkpoint['best_wer']
+            if 'nb_iter' in checkpoint:
+                start_iter = checkpoint['nb_iter'] + 1
+                
+            # Parse CER, WER, iter from filename as fallback
+            m = re.search(
+                r'checkpoint_(?P<cer>[\d\.]+)_(?P<wer>[\d\.]+)_(?P<iter>\d+)\.pth', checkpoint_path)
+            if m and 'best_cer' not in checkpoint:
                 best_cer = float(m.group('cer'))
                 best_wer = float(m.group('wer'))
                 start_iter = int(m.group('iter')) + 1
+                
             if 'train_loss' in checkpoint:
                 train_loss = checkpoint['train_loss']
             if 'train_loss_count' in checkpoint:
                 train_loss_count = checkpoint['train_loss_count']
-            logger.info(f"Resumed best_cer={best_cer}, best_wer={best_wer}, start_iter={start_iter}")
+            logger.info(
+                f"Resumed best_cer={best_cer}, best_wer={best_wer}, start_iter={start_iter}")
         return best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count
 
-    best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count = load_checkpoint(model, model_ema, None, getattr(args, 'resume_checkpoint', None))
+    best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count = load_checkpoint(
+        model, model_ema, None, getattr(args, 'resume_checkpoint', None))
 
     logger.info('Loading train loader...')
     train_dataset = dataset.myLoadDS(
@@ -256,12 +302,8 @@ def main():
                     true_text = batch[1][i]
                     is_correct = pred_text == true_text
                     caption = f"Pred: {pred_text} | GT: {true_text} | {'✅' if is_correct else '❌'}"
-                    example_images.append({
-                        wandb.Image(
-                        img_tensor, caption=caption),
-                        "pred_text": pred_text,
-                        "true_text": true_text,
-                    })
+                    example_images.append(wandb.Image(
+                        img_tensor, caption=caption))
 
                 wandb.log({
                     "val/loss": val_loss,
