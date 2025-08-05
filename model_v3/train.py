@@ -58,30 +58,34 @@ def main():
     model_ema = utils.ModelEma(model, args.ema_decay)
     model.zero_grad()
 
-    # Resume from checkpoint if specified
-    best_cer, best_wer, start_iter = 1e+6, 1e+6, 1
-    if args.resume_checkpoint is not None and os.path.isfile(args.resume_checkpoint):
-        logger.info(f"Resuming from checkpoint: {args.resume_checkpoint}")
-        checkpoint = torch.load(args.resume_checkpoint)
-        model.load_state_dict(checkpoint['model'])
-        if 'state_dict_ema' in checkpoint:
-            model_ema.ema.load_state_dict(checkpoint['state_dict_ema'])
-        if 'optimizer' in checkpoint:
-            optimizer_state = checkpoint['optimizer']
-        else:
-            optimizer_state = None
-        # Parse CER, WER, iter from filename
-        import re
-        m = re.search(
-            r'checkpoint_(?P<cer>[\d\.]+)_(?P<wer>[\d\.]+)_(?P<iter>\d+)\.pth', args.resume_checkpoint)
-        if m:
-            best_cer = float(m.group('cer'))
-            best_wer = float(m.group('wer'))
-            start_iter = int(m.group('iter')) + 1
-        logger.info(
-            f"Resumed best_cer={best_cer}, best_wer={best_wer}, start_iter={start_iter}")
-    else:
+    # Helper to load checkpoint (consistent with test.py)
+    def load_checkpoint(model, model_ema, optimizer, checkpoint_path):
+        best_cer, best_wer, start_iter = 1e+6, 1e+6, 1
+        train_loss, train_loss_count = 0.0, 0
         optimizer_state = None
+        if checkpoint_path is not None and os.path.isfile(checkpoint_path):
+            logger.info(f"Resuming from checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path)
+            model.load_state_dict(checkpoint['model'])
+            if 'state_dict_ema' in checkpoint:
+                model_ema.ema.load_state_dict(checkpoint['state_dict_ema'])
+            if 'optimizer' in checkpoint:
+                optimizer_state = checkpoint['optimizer']
+            # Parse CER, WER, iter from filename
+            import re
+            m = re.search(r'checkpoint_(?P<cer>[\d\.]+)_(?P<wer>[\d\.]+)_(?P<iter>\d+)\.pth', checkpoint_path)
+            if m:
+                best_cer = float(m.group('cer'))
+                best_wer = float(m.group('wer'))
+                start_iter = int(m.group('iter')) + 1
+            if 'train_loss' in checkpoint:
+                train_loss = checkpoint['train_loss']
+            if 'train_loss_count' in checkpoint:
+                train_loss_count = checkpoint['train_loss_count']
+            logger.info(f"Resumed best_cer={best_cer}, best_wer={best_wer}, start_iter={start_iter}")
+        return best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count
+
+    best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count = load_checkpoint(model, model_ema, None, getattr(args, 'resume_checkpoint', None))
 
     logger.info('Loading train loader...')
     train_dataset = dataset.myLoadDS(
@@ -109,16 +113,8 @@ def main():
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
     converter = utils.CTCLabelConverter(train_dataset.ralph.values())
 
-    train_loss = 0.0
-    train_loss_count = 0
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
-    # Restore train_loss and train_loss_count if present in checkpoint
-    if args.resume_checkpoint is not None and os.path.isfile(args.resume_checkpoint):
-        if 'train_loss' in checkpoint:
-            train_loss = checkpoint['train_loss']
-        if 'train_loss_count' in checkpoint:
-            train_loss_count = checkpoint['train_loss_count']
 
     # --- Helper for overlaying text on image ---
     import torchvision.transforms as T
