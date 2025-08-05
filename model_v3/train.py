@@ -71,7 +71,7 @@ def main():
         optimizer_state = None
         if checkpoint_path is not None and os.path.isfile(checkpoint_path):
             logger.info(f"Resuming from checkpoint: {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
             
             # Load model state dict (handle module prefix like in test.py)
             model_dict = OrderedDict()
