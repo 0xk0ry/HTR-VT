@@ -35,6 +35,16 @@ def get_args_parser():
     parser.add_argument('--seed', default=123, type=int,
                         help='seed for initializing training. ')
 
+    # RoBERTa LLM correction arguments
+    parser.add_argument('--roberta-model-name', type=str, default='roberta-large',
+                        help='RoBERTa model name for text correction')
+    parser.add_argument('--roberta-confidence-threshold', type=float, default=0.5,
+                        help='Confidence threshold for RoBERTa corrections')
+    parser.add_argument('--enable-llm-correction', action='store_true', default=False,
+                        help='Enable LLM-based text correction using RoBERTa')
+    parser.add_argument('--max-correction-iterations', type=int, default=3,
+                        help='Maximum number of iterative correction passes')
+
     parser.add_argument(
         '--img-size', default=[512, 64], type=int, nargs='+', help='image size')
     parser.add_argument('--attn-mask-ratio', default=0.,
