@@ -256,8 +256,12 @@ def main():
                     true_text = batch[1][i]
                     is_correct = pred_text == true_text
                     caption = f"Pred: {pred_text} | GT: {true_text} | {'✅' if is_correct else '❌'}"
-                    example_images.append(wandb.Image(
-                        img_tensor, caption=caption))
+                    example_images.append({
+                        wandb.Image(
+                        img_tensor, caption=caption),
+                        "pred_text": pred_text,
+                        "true_text": true_text,
+                    })
 
                 wandb.log({
                     "val/loss": val_loss,
