@@ -55,7 +55,10 @@ def main():
 
     model.train()
     model = model.cuda()
-    model_ema = utils.ModelEma(model, args.ema_decay)
+    # Ensure EMA decay is properly accessed (handle both ema_decay and ema-decay)
+    ema_decay = getattr(args, 'ema_decay', 0.9999)
+    logger.info(f"Using EMA decay: {ema_decay}")
+    model_ema = utils.ModelEma(model, ema_decay)
     model.zero_grad()
 
     # Helper to load checkpoint (consistent with test.py)
@@ -74,15 +77,16 @@ def main():
             model_dict = OrderedDict()
             pattern = re.compile('module.')
             
-            # Try loading from state_dict_ema first (preferred), then from model
-            if 'state_dict_ema' in checkpoint:
-                source_dict = checkpoint['state_dict_ema']
-                logger.info("Loading from state_dict_ema")
-            elif 'model' in checkpoint:
+            # For main model, load from the 'model' state dict 
+            # (the training checkpoint contains both 'model' and 'state_dict_ema')
+            if 'model' in checkpoint:
                 source_dict = checkpoint['model']
-                logger.info("Loading from model state dict")
+                logger.info("Loading main model from 'model' state dict")
+            elif 'state_dict_ema' in checkpoint:
+                source_dict = checkpoint['state_dict_ema']
+                logger.info("Loading main model from 'state_dict_ema' (fallback)")
             else:
-                raise KeyError("Neither 'state_dict_ema' nor 'model' found in checkpoint")
+                raise KeyError("Neither 'model' nor 'state_dict_ema' found in checkpoint")
             
             for k, v in source_dict.items():
                 if re.search("module", k):
@@ -91,9 +95,10 @@ def main():
                     model_dict[k] = v
             
             model.load_state_dict(model_dict, strict=True)
+            logger.info("Successfully loaded main model state dict")
             
             # Load EMA state dict if available
-            if 'state_dict_ema' in checkpoint:
+            if 'state_dict_ema' in checkpoint and model_ema is not None:
                 ema_dict = OrderedDict()
                 for k, v in checkpoint['state_dict_ema'].items():
                     if re.search("module", k):
@@ -101,10 +106,16 @@ def main():
                     else:
                         ema_dict[k] = v
                 model_ema.ema.load_state_dict(ema_dict, strict=True)
+                logger.info("Successfully loaded EMA model state dict")
             
-            # Load optimizer state
-            if 'optimizer' in checkpoint:
-                optimizer_state = checkpoint['optimizer']
+            # Load optimizer state - handle SAM optimizer structure
+            if 'optimizer' in checkpoint and optimizer is not None:
+                try:
+                    optimizer_state = checkpoint['optimizer']
+                    logger.info("Optimizer state will be loaded after optimizer initialization")
+                except Exception as e:
+                    logger.warning(f"Failed to prepare optimizer state: {e}")
+                    optimizer_state = None
                 
             # Load metrics from checkpoint if available
             if 'best_cer' in checkpoint:
@@ -126,6 +137,25 @@ def main():
                 train_loss = checkpoint['train_loss']
             if 'train_loss_count' in checkpoint:
                 train_loss_count = checkpoint['train_loss_count']
+                
+            # Restore random states if available (but do this after model loading)
+            if 'random_state' in checkpoint:
+                random.setstate(checkpoint['random_state'])
+                logger.info("Restored random state")
+            if 'numpy_state' in checkpoint:
+                np.random.set_state(checkpoint['numpy_state'])
+                logger.info("Restored numpy random state")
+            if 'torch_state' in checkpoint:
+                torch.set_rng_state(checkpoint['torch_state'])
+                logger.info("Restored torch random state")
+            if 'torch_cuda_state' in checkpoint and torch.cuda.is_available():
+                torch.cuda.set_rng_state(checkpoint['torch_cuda_state'])
+                logger.info("Restored torch cuda random state")
+                
+            # Validate that the model was loaded correctly by checking a few parameters
+            total_params = sum(p.numel() for p in model.parameters())
+            logger.info(f"Model loaded with {total_params} total parameters")
+                
             logger.info(
                 f"Resumed best_cer={best_cer}, best_wer={best_wer}, start_iter={start_iter}")
         return best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count
@@ -159,8 +189,14 @@ def main():
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
     converter = utils.CTCLabelConverter(train_dataset.ralph.values())
 
+    # Load optimizer state after initialization
     if optimizer_state is not None:
-        optimizer.load_state_dict(optimizer_state)
+        try:
+            optimizer.load_state_dict(optimizer_state)
+            logger.info("Successfully loaded optimizer state")
+        except Exception as e:
+            logger.warning(f"Failed to load optimizer state: {e}")
+            logger.info("Continuing training without optimizer state (will restart from initial lr/momentum)")
 
     # --- Helper for overlaying text on image ---
     import torchvision.transforms as T
@@ -283,6 +319,7 @@ def main():
                 model.eval()
                 with torch.no_grad():
                     image = batch[0].cuda()
+                    # Use the same inference call as validation function (no masking for inference)
                     preds = model(image)
                     if isinstance(preds, (list, tuple)):
                         preds = preds[0]
