@@ -10,10 +10,12 @@ def get_args_parser():
                         default='./output', help='output directory')
     parser.add_argument('--resume_checkpoint', type=str, default=None,
                         help='Path to checkpoint_{cer}_{wer}_{iter}.pth to resume from')
-    args.add_argument('--alpha-ctc', default=0.5, type=float,
+    parser.add_argument('--alpha-ctc', default=0.5, type=float,
                     help='weight for CTC in hybrid loss')
-    args.add_argument('--diac-window', default=5, type=int,
+    parser.add_argument('--diac-window', default=5, type=int,
                     help='window size for majority vote in diacritics prediction')
+    parser.add_argument('--max-target-len', action='store_true', default=False,
+                    help='whether to use max target length')
     parser.add_argument('--train-bs', default=8,
                         type=int, help='train batch size')
     parser.add_argument('--val-bs', default=1, type=int,
