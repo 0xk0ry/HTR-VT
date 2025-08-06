@@ -14,7 +14,7 @@ def get_args_parser():
                     help='weight for CTC in hybrid loss')
     parser.add_argument('--diac-window', default=5, type=int,
                     help='window size for majority vote in diacritics prediction')
-    parser.add_argument('--max-target-len', action='store_true', default=False,
+    parser.add_argument('--max-target-len', action='store_true', default=100,
                     help='whether to use max target length')
     parser.add_argument('--train-bs', default=8,
                         type=int, help='train batch size')
