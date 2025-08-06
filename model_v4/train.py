@@ -103,8 +103,33 @@ def main():
                 else:
                     model_dict[k] = v
             
-            model.load_state_dict(model_dict, strict=True)
-            logger.info("Successfully loaded main model state dict")
+            # Handle checkpoint compatibility between old single-task and new multi-task models
+            try:
+                model.load_state_dict(model_dict, strict=True)
+                logger.info("Successfully loaded main model state dict (exact match)")
+            except RuntimeError as e:
+                if "Missing key(s)" in str(e) and ("base_head" in str(e) or "diacritic_head" in str(e)):
+                    logger.warning("Checkpoint appears to be from old single-task model. Attempting partial loading...")
+                    
+                    # Try to convert old head to new base_head
+                    if 'head.weight' in model_dict and 'head.bias' in model_dict:
+                        model_dict['base_head.weight'] = model_dict.pop('head.weight')
+                        model_dict['base_head.bias'] = model_dict.pop('head.bias')
+                        logger.info("Converted old 'head' to 'base_head'")
+                    
+                    # Initialize diacritic_head randomly if not present
+                    current_state = model.state_dict()
+                    if 'diacritic_head.weight' not in model_dict:
+                        model_dict['diacritic_head.weight'] = current_state['diacritic_head.weight']
+                        model_dict['diacritic_head.bias'] = current_state['diacritic_head.bias']
+                        logger.info("Initialized diacritic_head with random weights")
+                    
+                    # Try loading again
+                    model.load_state_dict(model_dict, strict=True)
+                    logger.info("Successfully loaded converted model state dict")
+                else:
+                    # Re-raise if it's a different error
+                    raise e
             
             # Load EMA state dict if available
             if 'state_dict_ema' in checkpoint and model_ema is not None:
