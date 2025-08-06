@@ -53,7 +53,7 @@ def main():
     writer = SummaryWriter(args.save_dir)
 
     # Initialize wandb
-    wandb.init(project="HTR-VT", name=args.exp_name+"diacritic",
+    wandb.init(project="HTR-VT", name=args.exp_name,
                config=vars(args), dir=args.save_dir)
 
     model = HTR_VT.create_model(

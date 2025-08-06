@@ -40,10 +40,21 @@ def MultiTaskCollate(batch):
     """
     images, base_labels, diacritic_labels = zip(*batch)
     
-    # Convert images to tensors
-    image_tensors = [torch.from_numpy(np.array(img, copy=True)) for img in images]
-    image_tensors = torch.cat([t.unsqueeze(0) for t in image_tensors], 0)
-    image_tensors = image_tensors.unsqueeze(1).float()
+    # Convert images to tensors properly - ensure 4D shape [B, C, H, W]
+    image_tensors = []
+    for img in images:
+        # img is already in (C, H, W) format from __getitem__
+        if isinstance(img, tuple):
+            img = img[0]  # Extract image from tuple if needed
+        
+        # Convert to tensor
+        img_tensor = torch.from_numpy(img.copy()).float()
+        
+        # img_tensor should now be [C, H, W], we just need to add batch dimension
+        image_tensors.append(img_tensor)
+    
+    # Stack into batch: [B, C, H, W]
+    image_tensors = torch.stack(image_tensors, dim=0)
     
     # Pad diacritic sequences to same length as base sequences
     max_len = max(len(seq) for seq in diacritic_labels)
@@ -125,12 +136,12 @@ class myLoadDS(Dataset):
             '\u0323': 5, # dot-below
         }
 
-        if ralph is None:
-            alph = get_alphabet(self.tlbls)
-            self.ralph = dict(zip(alph.values(), alph.keys()))
-            self.alph = alph
-        else:
-            self.ralph = ralph
+        # if ralph is None:
+        #     alph = get_alphabet(self.tlbls)
+        #     self.ralph = dict(zip(alph.values(), alph.keys()))
+        #     self.alph = alph
+        # else:
+        #     self.ralph = ralph
         self.ralph = {
             idx: char for idx, char in enumerate(
                 self.base_alphabet
