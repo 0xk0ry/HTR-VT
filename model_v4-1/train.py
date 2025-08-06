@@ -17,48 +17,17 @@ import random
 import numpy as np
 
 
-def compute_loss(args, model, image, batch_size, criterion, text, length, diacritic_targets):
-    base_logits, diacritic_logits = model(image, args.mask_ratio,
-                                          args.max_span_length, use_masking=True)
-    # base_logits: (B, T, nb_cls), diacritic_logits: (B, T, 6)
-    # CTC loss for base chars
-    base_logits = base_logits.float()
-    preds_size = torch.IntTensor([base_logits.size(1)] * batch_size).cuda()
-    base_logits_ctc = base_logits.permute(1, 0, 2).log_softmax(2)
+def compute_loss(args, model, image, batch_size, criterion, text, length):
+    preds = model(image, args.mask_ratio,
+                  args.max_span_length, use_masking=True)
+    preds = preds.float()
+    preds_size = torch.IntTensor([preds.size(1)] * batch_size).cuda()
+    preds = preds.permute(1, 0, 2).log_softmax(2)
+
     torch.backends.cudnn.enabled = False
-    loss_ctc = criterion(base_logits_ctc, text.cuda(),
-                         preds_size, length.cuda()).mean()
+    loss = criterion(preds, text.cuda(), preds_size, length.cuda()).mean()
     torch.backends.cudnn.enabled = True
-
-    # Cross-entropy loss for diacritics - need to align sequence lengths
-    B, T_model, _ = diacritic_logits.shape
-    B_target, T_target = diacritic_targets.shape
-
-    # Align sequence lengths
-    if T_model != T_target:
-        if T_model > T_target:
-            # Pad diacritic_targets to match model output length
-            pad_length = T_model - T_target
-            diacritic_targets_padded = torch.cat([
-                diacritic_targets,
-                torch.zeros(B_target, pad_length, dtype=diacritic_targets.dtype,
-                            device=diacritic_targets.device)
-            ], dim=1)
-        else:
-            # Truncate diacritic_targets to match model output length
-            diacritic_targets_padded = diacritic_targets[:, :T_model]
-    else:
-        diacritic_targets_padded = diacritic_targets
-
-    # Now flatten for cross-entropy loss
-    diacritic_logits_flat = diacritic_logits.view(-1, 6)
-    diacritic_targets_flat = diacritic_targets_padded.contiguous().view(-1).cuda()
-    loss_diac = torch.nn.functional.cross_entropy(
-        diacritic_logits_flat, diacritic_targets_flat)
-
-    # Hybrid loss
-    loss = args.alpha_ctc * loss_ctc + args.alpha_diac * loss_diac
-    return loss, loss_ctc.item(), loss_diac.item()
+    return loss
 
 
 def main():
@@ -74,9 +43,10 @@ def main():
     logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
     writer = SummaryWriter(args.save_dir)
 
-    # Initialize wandb
-    wandb.init(project="HTR-VT", name=args.exp_name,
-               config=vars(args), dir=args.save_dir)
+    # Initialize wandb only if requested
+    if getattr(args, 'use_wandb', False):
+        wandb.init(project="HTR-VT", name=args.exp_name,
+                   config=vars(args), dir=args.save_dir)
 
     model = HTR_VT.create_model(
         nb_cls=args.nb_cls, img_size=args.img_size[::-1])
@@ -128,39 +98,8 @@ def main():
                 else:
                     model_dict[k] = v
 
-            # Handle checkpoint compatibility between old single-task and new multi-task models
-            try:
-                model.load_state_dict(model_dict, strict=True)
-                logger.info(
-                    "Successfully loaded main model state dict (exact match)")
-            except RuntimeError as e:
-                if "Missing key(s)" in str(e) and ("base_head" in str(e) or "diacritic_head" in str(e)):
-                    logger.warning(
-                        "Checkpoint appears to be from old single-task model. Attempting partial loading...")
-
-                    # Try to convert old head to new base_head
-                    if 'head.weight' in model_dict and 'head.bias' in model_dict:
-                        model_dict['base_head.weight'] = model_dict.pop(
-                            'head.weight')
-                        model_dict['base_head.bias'] = model_dict.pop(
-                            'head.bias')
-                        logger.info("Converted old 'head' to 'base_head'")
-
-                    # Initialize diacritic_head randomly if not present
-                    current_state = model.state_dict()
-                    if 'diacritic_head.weight' not in model_dict:
-                        model_dict['diacritic_head.weight'] = current_state['diacritic_head.weight']
-                        model_dict['diacritic_head.bias'] = current_state['diacritic_head.bias']
-                        logger.info(
-                            "Initialized diacritic_head with random weights")
-
-                    # Try loading again
-                    model.load_state_dict(model_dict, strict=True)
-                    logger.info(
-                        "Successfully loaded converted model state dict")
-                else:
-                    # Re-raise if it's a different error
-                    raise e
+            model.load_state_dict(model_dict, strict=True)
+            logger.info("Successfully loaded main model state dict")
 
             # Load EMA state dict if available
             if 'state_dict_ema' in checkpoint and model_ema is not None:
@@ -237,7 +176,7 @@ def main():
                                                shuffle=True,
                                                pin_memory=True,
                                                num_workers=args.num_workers,
-                                               collate_fn=dataset.MultiTaskCollate)
+                                               collate_fn=partial(dataset.SameTrCollate, args=args))
     train_iter = dataset.cycle_data(train_loader)
 
     logger.info('Loading val loader...')
@@ -247,8 +186,7 @@ def main():
                                              batch_size=args.val_bs,
                                              shuffle=False,
                                              pin_memory=True,
-                                             num_workers=args.num_workers,
-                                             collate_fn=dataset.MultiTaskCollate)
+                                             num_workers=args.num_workers)
 
     logger.info('Initializing optimizer, criterion and converter...')
     optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
@@ -291,17 +229,14 @@ def main():
         optimizer.zero_grad()
         batch = next(train_iter)
         image = batch[0].cuda()
-        base_texts = batch[1]
-        diacritic_targets = torch.tensor(batch[2], dtype=torch.long)  # (B, T)
-        text, length = converter.encode(base_texts)
+        text, length = converter.encode(batch[1])
         batch_size = image.size(0)
-        loss, loss_ctc, loss_diac = compute_loss(args, model, image, batch_size,
-                                                 criterion, text, length, diacritic_targets)
+        loss = compute_loss(args, model, image, batch_size,
+                            criterion, text, length)
         loss.backward()
         optimizer.first_step(zero_grad=True)
-        loss_second, _, _ = compute_loss(args, model, image, batch_size,
-                                         criterion, text, length, diacritic_targets)
-        loss_second.backward()
+        compute_loss(args, model, image, batch_size,
+                     criterion, text, length).backward()
         optimizer.second_step(zero_grad=True)
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
@@ -309,83 +244,122 @@ def main():
         train_loss_count += 1
 
         if nb_iter % args.print_iter == 0:
-            logger.info(f'Iter {nb_iter:6d} | Loss: {train_loss/train_loss_count:.4f} | '
-                        f'CTC Loss: {loss_ctc:.4f} | Diac Loss: {loss_diac:.4f} | LR: {current_lr:.6f}')
-            # Log to wandb/tensorboard
-            if args.use_wandb:
-                wandb.log({
-                    'train/loss': train_loss/train_loss_count,
-                    'train/loss_ctc': loss_ctc,
-                    'train/loss_diac': loss_diac,
-                    'train/lr': current_lr
-                }, step=nb_iter)
-            else:
-                writer.add_scalar('train/loss', train_loss /
-                                  train_loss_count, nb_iter)
-                writer.add_scalar('train/loss_ctc', loss_ctc, nb_iter)
-                writer.add_scalar('train/loss_diac', loss_diac, nb_iter)
-                writer.add_scalar('train/lr', current_lr, nb_iter)
+            train_loss_avg = train_loss / train_loss_count if train_loss_count > 0 else 0.0
+
+            logger.info(
+                f'Iter : {nb_iter} \t LR : {current_lr:0.5f} \t training loss : {train_loss_avg:0.5f} \t ')
+
+            writer.add_scalar('./Train/lr', current_lr, nb_iter)
+            writer.add_scalar('./Train/train_loss', train_loss_avg, nb_iter)
+            # wandb log
+            if getattr(args, 'use_wandb', False):
+                wandb.log({"train/lr": current_lr,
+                          "train/loss": train_loss_avg, "iter": nb_iter})
+            train_loss = 0.0
+            train_loss_count = 0
 
         if nb_iter % args.eval_iter == 0:
             model.eval()
-            model_ema.ema.eval()
-
             with torch.no_grad():
-                val_loss, val_cer, val_wer, _, _, val_diac_acc = valid.validation(model_ema.ema,
-                                                                                  criterion,
-                                                                                  val_loader,
-                                                                                  converter)
+                val_loss, val_cer, val_wer, preds, labels = valid.validation(model_ema.ema,
+                                                                             criterion,
+                                                                             val_loader,
+                                                                             converter)
 
-            logger.info(f'Validation | Loss: {val_loss:.4f} | CER: {val_cer:.4f} | '
-                        f'WER: {val_wer:.4f} | Diac Acc: {val_diac_acc:.4f}')
+                if val_cer < best_cer:
+                    logger.info(
+                        f'CER improved from {best_cer:.4f} to {val_cer:.4f}!!!')
+                    best_cer = val_cer
+                    checkpoint = {
+                        'model': model.state_dict(),
+                        'state_dict_ema': model_ema.ema.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'nb_iter': nb_iter,
+                        'best_cer': best_cer,
+                        'best_wer': best_wer,
+                        'args': vars(args),
+                        'random_state': random.getstate(),
+                        'numpy_state': np.random.get_state(),
+                        'torch_state': torch.get_rng_state(),
+                        'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                        'train_loss': train_loss,
+                        'train_loss_count': train_loss_count,
+                    }
+                    torch.save(checkpoint, os.path.join(
+                        args.save_dir, 'best_CER.pth'))
 
-            # Log validation metrics
-            if args.use_wandb:
-                wandb.log({
-                    'val/loss': val_loss,
-                    'val/cer': val_cer,
-                    'val/wer': val_wer,
-                    'val/diacritic_acc': val_diac_acc
-                }, step=nb_iter)
-            else:
-                writer.add_scalar('val/loss', val_loss, nb_iter)
-                writer.add_scalar('val/cer', val_cer, nb_iter)
-                writer.add_scalar('val/wer', val_wer, nb_iter)
-                writer.add_scalar('val/diacritic_acc', val_diac_acc, nb_iter)
+                if val_wer < best_wer:
+                    logger.info(
+                        f'WER improved from {best_wer:.4f} to {val_wer:.4f}!!!')
+                    best_wer = val_wer
+                    checkpoint = {
+                        'model': model.state_dict(),
+                        'state_dict_ema': model_ema.ema.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'nb_iter': nb_iter,
+                        'best_cer': best_cer,
+                        'best_wer': best_wer,
+                        'args': vars(args),
+                        'random_state': random.getstate(),
+                        'numpy_state': np.random.get_state(),
+                        'torch_state': torch.get_rng_state(),
+                        'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                        'train_loss': train_loss,
+                        'train_loss_count': train_loss_count,
+                    }
+                    torch.save(checkpoint, os.path.join(
+                        args.save_dir, 'best_WER.pth'))
 
-            # Save best model based on CER
-            if val_cer < best_cer:
-                best_cer = val_cer
-                best_wer = val_wer
                 logger.info(
-                    f'New best CER: {best_cer:.4f}, WER: {best_wer:.4f}, Diac Acc: {val_diac_acc:.4f}')
+                    f'Val. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} \t ')
 
-                # Save checkpoint
-                torch.save({
-                    'model': model.state_dict(),
-                    'state_dict_ema': model_ema.ema.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'best_cer': best_cer,
-                    'best_wer': best_wer,
-                    'best_diac_acc': val_diac_acc,
-                    'iter': nb_iter,
-                    'args': args
-                }, os.path.join(args.save_dir, 'best_CER.pth'))
+                writer.add_scalar('./VAL/CER', val_cer, nb_iter)
+                writer.add_scalar('./VAL/WER', val_wer, nb_iter)
+                writer.add_scalar('./VAL/bestCER', best_cer, nb_iter)
+                writer.add_scalar('./VAL/bestWER', best_wer, nb_iter)
+                writer.add_scalar('./VAL/val_loss', val_loss, nb_iter)
+                # wandb log
+                # log up to 5 examples from current batch
+                example_count = min(5, batch[0].size(0))
+                example_images = []
+                # Get model predictions for current batch
+                model.eval()
+                with torch.no_grad():
+                    image = batch[0].cuda()
+                    # Use the same inference call as validation function (no masking for inference)
+                    preds = model(image)
+                    if isinstance(preds, (list, tuple)):
+                        preds = preds[0]
+                    preds = preds.float()
+                    batch_size = image.size(0)
+                    preds_size = torch.IntTensor([preds.size(1)] * batch_size)
+                    preds = preds.permute(1, 0, 2).log_softmax(2)
+                    _, preds_index = preds.max(2)
+                    preds_index = preds_index.transpose(
+                        1, 0).contiguous().view(-1)
+                    preds_str = converter.decode(
+                        preds_index.data, preds_size.data)
 
-                # Also save with iteration info
-                torch.save({
-                    'model': model.state_dict(),
-                    'state_dict_ema': model_ema.ema.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'best_cer': best_cer,
-                    'best_wer': best_wer,
-                    'best_diac_acc': val_diac_acc,
-                    'iter': nb_iter,
-                    'args': args
-                }, os.path.join(args.save_dir, f'checkpoint_{best_cer:.4f}_{best_wer:.4f}_{nb_iter}.pth'))
+                for i in range(example_count):
+                    img_tensor = batch[0][i].cpu()
+                    pred_text = preds_str[i]
+                    true_text = batch[1][i]
+                    is_correct = pred_text == true_text
+                    caption = f"Pred: {pred_text} | GT: {true_text} | {'✅' if is_correct else '❌'}"
+                    example_images.append(wandb.Image(
+                        img_tensor, caption=caption))
 
-            model.train()
-            train_loss, train_loss_count = 0.0, 0
+                if getattr(args, 'use_wandb', False):
+                    wandb.log({
+                        "val/loss": val_loss,
+                        "val/CER": val_cer,
+                        "val/WER": val_wer,
+                        "val/best_CER": best_cer,
+                        "val/best_WER": best_wer,
+                        "val/examples": example_images,
+                        "iter": nb_iter
+                    })
+                model.train()
 
 
 if __name__ == '__main__':
