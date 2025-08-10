@@ -172,6 +172,7 @@ def main():
     args = option.get_args_parser()
 
     torch.manual_seed(args.seed)
+    torch.backends.cudnn.benchmark = True  # Enable cuDNN auto-tuner for variable input sizes
 
     args.save_dir = os.path.join(args.out_dir, args.exp_name)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -214,7 +215,8 @@ def main():
                                                batch_size=args.train_bs,
                                                shuffle=True,
                                                pin_memory=True,
-                                               num_workers=args.num_workers,
+                                               num_workers=max(4, args.num_workers),
+                                               persistent_workers=True,
                                                collate_fn=partial(dataset.SameTrCollate, args=args))
     train_iter = dataset.cycle_data(train_loader)
 
@@ -225,7 +227,8 @@ def main():
                                              batch_size=args.val_bs,
                                              shuffle=False,
                                              pin_memory=True,
-                                             num_workers=args.num_workers)
+                                             num_workers=max(2, args.num_workers),
+                                             persistent_workers=True)
 
     logger.info('Initializing optimizer, criterion and converter...')
     optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
@@ -252,6 +255,8 @@ def main():
     leakage_running = 0.0
     tone_count = 0
 
+    scaler = torch.amp.GradScaler('cuda')  # For mixed precision
+
     for nb_iter in range(start_iter, args.total_iter):
         optimizer, current_lr = utils.update_lr_cos(
             nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer)
@@ -261,45 +266,53 @@ def main():
         image = batch[0].cuda()
         text, length = converter.encode(batch[1])
         batch_size = image.size(0)
-        loss, loss_logs = compute_loss(
-            args,
-            model,
-            image,
-            batch_size,
-            criterion,
-            text,
-            length,
-            batch[1],  # labels
-            converter,
-            args.tau_v,
-            args.lambda_tone,
-            args.tone_loss,
-            args.focal_gamma,
-            args.lang_weight,
-            nb_iter,
-            use_masking=True,
-        )
-        loss.backward()
+
+        # Mixed precision training
+        with torch.amp.autocast('cuda'):
+            loss, loss_logs = compute_loss(
+                args,
+                model,
+                image,
+                batch_size,
+                criterion,
+                text,
+                length,
+                batch[1],  # labels
+                converter,
+                args.tau_v,
+                args.lambda_tone,
+                args.tone_loss,
+                args.focal_gamma,
+                args.lang_weight,
+                nb_iter,
+                use_masking=True,
+            )
+        scaler.scale(loss).backward()
         optimizer.first_step(zero_grad=True)
-        compute_loss(
-            args,
-            model,
-            image,
-            batch_size,
-            criterion,
-            text,
-            length,
-            batch[1],
-            converter,
-            args.tau_v,
-            args.lambda_tone,
-            args.tone_loss,
-            args.focal_gamma,
-            args.lang_weight,
-            nb_iter,
-            use_masking=False,
-        )[0].backward()
+
+        with torch.cuda.amp.autocast('cuda'):
+            loss2, _ = compute_loss(
+                args,
+                model,
+                image,
+                batch_size,
+                criterion,
+                text,
+                length,
+                batch[1],
+                converter,
+                args.tau_v,
+                args.lambda_tone,
+                args.tone_loss,
+                args.focal_gamma,
+                args.lang_weight,
+                nb_iter,
+                use_masking=False,
+            )
+        scaler.scale(loss2).backward()
         optimizer.second_step(zero_grad=True)
+        scaler.step(optimizer)
+        scaler.update()
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
 
