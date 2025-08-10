@@ -36,7 +36,8 @@ def compute_loss(
     use_masking: bool = True,
 ):
     # Forward model: get base and tone logits
-    outputs = model(image, args.mask_ratio, args.max_span_length, use_masking=use_masking)
+    outputs = model(image, args.mask_ratio,
+                    args.max_span_length, use_masking=use_masking)
     if isinstance(outputs, (list, tuple)):
         base_logits, tone_logits = outputs
     else:
@@ -48,7 +49,8 @@ def compute_loss(
     preds_size = torch.IntTensor([base_logits.size(1)] * batch_size).cuda()
     log_probs_tbc = base_logits.permute(1, 0, 2).log_softmax(2)
     torch.backends.cudnn.enabled = False
-    ctc_loss = criterion(log_probs_tbc, text.cuda(), preds_size, length.cuda()).mean()
+    ctc_loss = criterion(log_probs_tbc, text.cuda(),
+                         preds_size, length.cuda()).mean()
     torch.backends.cudnn.enabled = True
 
     logs = {
@@ -75,7 +77,8 @@ def compute_loss(
     if global_step < args.tone_warmup_iters:
         lambda_eff = 0.0
     elif global_step < args.tone_warmup_iters + args.tone_ramp_iters:
-        ratio = (global_step - args.tone_warmup_iters) / max(1, args.tone_ramp_iters)
+        ratio = (global_step - args.tone_warmup_iters) / \
+            max(1, args.tone_ramp_iters)
         lambda_eff = lambda_tone * float(ratio)
     else:
         lambda_eff = lambda_tone
@@ -97,10 +100,13 @@ def compute_loss(
         # Vowel indices from converter
         vowel_idxs = utils.vowel_indices_from_converter(converter)
         if len(vowel_idxs) > 0:
-            vowel_mask = torch.zeros(base_probs.size(-1), device=base_probs.device)
-            vowel_mask.scatter_(0, torch.tensor(vowel_idxs, device=base_probs.device, dtype=torch.long), 1.0)
+            vowel_mask = torch.zeros(
+                base_probs.size(-1), device=base_probs.device)
+            vowel_mask.scatter_(0, torch.tensor(
+                vowel_idxs, device=base_probs.device, dtype=torch.long), 1.0)
             # Gate per-frame
-            v_score = (base_probs * vowel_mask.view(1, 1, -1)).sum(dim=-1)  # (B, T)
+            v_score = (base_probs * vowel_mask.view(1, 1, -1)
+                       ).sum(dim=-1)  # (B, T)
             m_t = (v_score >= tau_v).float().detach()  # (B, T)
         else:
             m_t = torch.ones(base_probs.shape[:2], device=base_probs.device)
@@ -124,7 +130,8 @@ def compute_loss(
         # Masking spans/ratio (approximate from args and sequence length)
         T_len = base_logits.size(1)
         total_mask = int(T_len * getattr(args, 'mask_ratio', 0.0))
-        span_hits = max(1, total_mask // max(1, getattr(args, 'max_span_length', 1))) if total_mask > 0 else 0
+        span_hits = max(1, total_mask // max(1, getattr(args,
+                        'max_span_length', 1))) if total_mask > 0 else 0
         logs['mask_span_hits'] = float(span_hits)
         # Alignment T/U stats
         t_over_u_list = []
@@ -135,7 +142,8 @@ def compute_loss(
             y_b = text[cursor:cursor + U_b]
             cursor += U_b
             # posteriors gamma: (T, U_b)
-            gamma_b = utils.ctc_posteriors(log_probs_base[b], y_b, blank=0).detach()
+            gamma_b = utils.ctc_posteriors(
+                log_probs_base[b], y_b, blank=0).detach()
             # Tone targets per label position j
             label_b = labels[b]
             # Derive tone id per original character (length U_b)
@@ -152,7 +160,8 @@ def compute_loss(
             target_t = torch.zeros(T_b, 6, device=base_logits.device)
             if U_b > 0:
                 one_hot = torch.zeros(U_b, 6, device=base_logits.device)
-                one_hot[torch.arange(U_b, device=base_logits.device), torch.tensor(tones_j, device=base_logits.device)] = 1.0
+                one_hot[torch.arange(U_b, device=base_logits.device), torch.tensor(
+                    tones_j, device=base_logits.device)] = 1.0
                 target_t = gamma_b @ one_hot  # (T, 6)
 
             # Apply language weight
@@ -162,7 +171,8 @@ def compute_loss(
             if lambda_eff > 0.0:
                 if tone_loss_type == 'focal':
                     pt = tone_probs[b]  # (T, 6)
-                    loss_b = - (target_t * ((1 - pt) ** focal_gamma) * tone_log_probs[b]).sum(dim=-1)
+                    loss_b = - (target_t * ((1 - pt) ** focal_gamma)
+                                * tone_log_probs[b]).sum(dim=-1)
                 else:
                     # Soft CE
                     loss_b = - (target_t * tone_log_probs[b]).sum(dim=-1)
@@ -257,25 +267,33 @@ def compute_loss(
 
         # Finalize diagnostics
         if len(frames_per_vowel_list) > 0:
-            logs['frames_per_vowel'] = float(torch.tensor(frames_per_vowel_list, device=base_logits.device).mean().item())
+            logs['frames_per_vowel'] = float(torch.tensor(
+                frames_per_vowel_list, device=base_logits.device).mean().item())
         if total_vowel_spans > 0:
-            logs['tone_none_rate_on_vowel'] = float(none_on_vowel) / float(total_vowel_spans)
+            logs['tone_none_rate_on_vowel'] = float(
+                none_on_vowel) / float(total_vowel_spans)
             if len(conf_margins) > 0:
-                logs['tone_conf_margin'] = float(torch.tensor(conf_margins, device=base_logits.device).mean().item())
+                logs['tone_conf_margin'] = float(torch.tensor(
+                    conf_margins, device=base_logits.device).mean().item())
             # Normalize class support to fractions
             support_total = float(class_support_counts.sum().item())
             if support_total > 0:
-                frac = (class_support_counts / support_total).detach().cpu().tolist()
+                frac = (class_support_counts /
+                        support_total).detach().cpu().tolist()
                 logs['tone_class_support'] = {
                     'NONE': frac[0], 'ACUTE': frac[1], 'GRAVE': frac[2], 'HOOK': frac[3], 'TILDE': frac[4], 'DOT': frac[5]
                 }
         if len(t_over_u_list) > 0:
-            t_over_u_tensor = torch.tensor(t_over_u_list, device=base_logits.device)
+            t_over_u_tensor = torch.tensor(
+                t_over_u_list, device=base_logits.device)
             logs['T_over_U_mean'] = float(t_over_u_tensor.mean().item())
-            logs['T_over_U_p05'] = float(t_over_u_tensor.kthvalue(max(1, int(0.05 * len(t_over_u_list)))).values.item()) if len(t_over_u_list) > 1 else float(t_over_u_tensor.item())
-            logs['pct_T_over_U_lt_1p5'] = float((t_over_u_tensor < 1.5).float().mean().item())
+            logs['T_over_U_p05'] = float(t_over_u_tensor.kthvalue(max(1, int(
+                0.05 * len(t_over_u_list)))).values.item()) if len(t_over_u_list) > 1 else float(t_over_u_tensor.item())
+            logs['pct_T_over_U_lt_1p5'] = float(
+                (t_over_u_tensor < 1.5).float().mean().item())
 
-    total_loss = ctc_loss + lambda_eff * tone_loss_total + float(getattr(args, 'lambda_guard', 0.0)) * guard_loss_total
+    total_loss = ctc_loss + lambda_eff * tone_loss_total + \
+        float(getattr(args, 'lambda_guard', 0.0)) * guard_loss_total
     return total_loss, logs
 
 
@@ -320,38 +338,41 @@ def main():
     def load_checkpoint(model, model_ema, optimizer, checkpoint_path):
         from collections import OrderedDict
         import re
-        
+
         best_cer, best_wer, start_iter = 1e+6, 1e+6, 1
         train_loss, train_loss_count = 0.0, 0
         optimizer_state = None
         if checkpoint_path is not None and os.path.isfile(checkpoint_path):
             logger.info(f"Resuming from checkpoint: {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-            
+            checkpoint = torch.load(
+                checkpoint_path, map_location='cpu', weights_only=False)
+
             # Load model state dict (handle module prefix like in test.py)
             model_dict = OrderedDict()
             pattern = re.compile('module.')
-            
-            # For main model, load from the 'model' state dict 
+
+            # For main model, load from the 'model' state dict
             # (the training checkpoint contains both 'model' and 'state_dict_ema')
             if 'model' in checkpoint:
                 source_dict = checkpoint['model']
                 logger.info("Loading main model from 'model' state dict")
             elif 'state_dict_ema' in checkpoint:
                 source_dict = checkpoint['state_dict_ema']
-                logger.info("Loading main model from 'state_dict_ema' (fallback)")
+                logger.info(
+                    "Loading main model from 'state_dict_ema' (fallback)")
             else:
-                raise KeyError("Neither 'model' nor 'state_dict_ema' found in checkpoint")
-            
+                raise KeyError(
+                    "Neither 'model' nor 'state_dict_ema' found in checkpoint")
+
             for k, v in source_dict.items():
                 if re.search("module", k):
                     model_dict[re.sub(pattern, '', k)] = v
                 else:
                     model_dict[k] = v
-            
+
             model.load_state_dict(model_dict, strict=True)
             logger.info("Successfully loaded main model state dict")
-            
+
             # Load EMA state dict if available
             if 'state_dict_ema' in checkpoint and model_ema is not None:
                 ema_dict = OrderedDict()
@@ -362,16 +383,17 @@ def main():
                         ema_dict[k] = v
                 model_ema.ema.load_state_dict(ema_dict, strict=True)
                 logger.info("Successfully loaded EMA model state dict")
-            
+
             # Load optimizer state - handle SAM optimizer structure
             if 'optimizer' in checkpoint and optimizer is not None:
                 try:
                     optimizer_state = checkpoint['optimizer']
-                    logger.info("Optimizer state will be loaded after optimizer initialization")
+                    logger.info(
+                        "Optimizer state will be loaded after optimizer initialization")
                 except Exception as e:
                     logger.warning(f"Failed to prepare optimizer state: {e}")
                     optimizer_state = None
-                
+
             # Load metrics from checkpoint if available
             if 'best_cer' in checkpoint:
                 best_cer = checkpoint['best_cer']
@@ -379,7 +401,7 @@ def main():
                 best_wer = checkpoint['best_wer']
             if 'nb_iter' in checkpoint:
                 start_iter = checkpoint['nb_iter'] + 1
-                
+
             # Parse CER, WER, iter from filename as fallback
             m = re.search(
                 r'checkpoint_(?P<cer>[\d\.]+)_(?P<wer>[\d\.]+)_(?P<iter>\d+)\.pth', checkpoint_path)
@@ -387,12 +409,12 @@ def main():
                 best_cer = float(m.group('cer'))
                 best_wer = float(m.group('wer'))
                 start_iter = int(m.group('iter')) + 1
-                
+
             if 'train_loss' in checkpoint:
                 train_loss = checkpoint['train_loss']
             if 'train_loss_count' in checkpoint:
                 train_loss_count = checkpoint['train_loss_count']
-                
+
             # Restore random states if available (but do this after model loading)
             if 'random_state' in checkpoint:
                 random.setstate(checkpoint['random_state'])
@@ -406,11 +428,11 @@ def main():
             if 'torch_cuda_state' in checkpoint and torch.cuda.is_available():
                 torch.cuda.set_rng_state(checkpoint['torch_cuda_state'])
                 logger.info("Restored torch cuda random state")
-                
+
             # Validate that the model was loaded correctly by checking a few parameters
             total_params = sum(p.numel() for p in model.parameters())
             logger.info(f"Model loaded with {total_params} total parameters")
-                
+
             logger.info(
                 f"Resumed best_cer={best_cer}, best_wer={best_wer}, start_iter={start_iter}")
         return best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count
@@ -465,7 +487,8 @@ def main():
             logger.info("Successfully loaded optimizer state")
         except Exception as e:
             logger.warning(f"Failed to load optimizer state: {e}")
-            logger.info("Continuing training without optimizer state (will restart from initial lr/momentum)")
+            logger.info(
+                "Continuing training without optimizer state (will restart from initial lr/momentum)")
 
     # --- Helper for overlaying text on image ---
     import torchvision.transforms as T
@@ -566,9 +589,12 @@ def main():
             writer.add_scalar('./Train/lr', current_lr, nb_iter)
             writer.add_scalar('./Train/train_loss', train_loss_avg, nb_iter)
             if tone_count > 0:
-                writer.add_scalar('./Train/tone_loss', tone_loss_running / tone_count, nb_iter)
-                writer.add_scalar('./Train/gate_hit_rate', gate_hit_running / tone_count, nb_iter)
-                writer.add_scalar('./Train/tone_leakage', leakage_running / tone_count, nb_iter)
+                writer.add_scalar('./Train/tone_loss',
+                                  tone_loss_running / tone_count, nb_iter)
+                writer.add_scalar('./Train/gate_hit_rate',
+                                  gate_hit_running / tone_count, nb_iter)
+                writer.add_scalar('./Train/tone_leakage',
+                                  leakage_running / tone_count, nb_iter)
             # Compute EMA CTC loss for gap metric
             try:
                 with torch.no_grad():
@@ -578,10 +604,12 @@ def main():
                     else:
                         ema_base = ema_out
                     ema_base = ema_base.float()
-                    preds_size_ema = torch.IntTensor([ema_base.size(1)] * batch_size).cuda()
+                    preds_size_ema = torch.IntTensor(
+                        [ema_base.size(1)] * batch_size).cuda()
                     log_probs_ema = ema_base.permute(1, 0, 2).log_softmax(2)
                     torch.backends.cudnn.enabled = False
-                    ctc_loss_ema = criterion(log_probs_ema, text, preds_size_ema, length).mean().item()
+                    ctc_loss_ema = criterion(
+                        log_probs_ema, text, preds_size_ema, length).mean().item()
                     torch.backends.cudnn.enabled = True
             except Exception:
                 ctc_loss_ema = 0.0
@@ -596,18 +624,28 @@ def main():
             metrics['opt/lr'] = float(current_lr)
             metrics['opt/grad_norm'] = float(grad_norm)
             metrics['opt/ema_gap'] = float(metrics['loss/ctc'] - ctc_loss_ema)
-            metrics['gate/hit_rate'] = float(loss_logs.get('gate_hit_rate', 0.0))
+            metrics['gate/hit_rate'] = float(
+                loss_logs.get('gate_hit_rate', 0.0))
             metrics['gate/leakage'] = float(loss_logs.get('tone_leakage', 0.0))
-            metrics['gate/frames_per_vowel'] = float(loss_logs.get('frames_per_vowel', 0.0))
-            metrics['align/T_over_U_mean'] = float(loss_logs.get('T_over_U_mean', 0.0))
-            metrics['align/T_over_U_p05'] = float(loss_logs.get('T_over_U_p05', 0.0))
-            metrics['align/pct_T_over_U_lt_1p5'] = float(loss_logs.get('pct_T_over_U_lt_1p5', 0.0))
-            metrics['base/blank_rate'] = float(loss_logs.get('blank_rate', 0.0))
-            metrics['tone/none_rate_on_vowel'] = float(loss_logs.get('tone_none_rate_on_vowel', 0.0))
-            metrics['tone/conf_margin'] = float(loss_logs.get('tone_conf_margin', 0.0))
+            metrics['gate/frames_per_vowel'] = float(
+                loss_logs.get('frames_per_vowel', 0.0))
+            metrics['align/T_over_U_mean'] = float(
+                loss_logs.get('T_over_U_mean', 0.0))
+            metrics['align/T_over_U_p05'] = float(
+                loss_logs.get('T_over_U_p05', 0.0))
+            metrics['align/pct_T_over_U_lt_1p5'] = float(
+                loss_logs.get('pct_T_over_U_lt_1p5', 0.0))
+            metrics['base/blank_rate'] = float(
+                loss_logs.get('blank_rate', 0.0))
+            metrics['tone/none_rate_on_vowel'] = float(
+                loss_logs.get('tone_none_rate_on_vowel', 0.0))
+            metrics['tone/conf_margin'] = float(
+                loss_logs.get('tone_conf_margin', 0.0))
             # Masking
-            metrics['mask/ratio_effective'] = float(loss_logs.get('mask_ratio_effective', getattr(args, 'mask_ratio', 0.0)))
-            metrics['mask/span_hits'] = float(loss_logs.get('mask_span_hits', 0.0))
+            metrics['mask/ratio_effective'] = float(loss_logs.get(
+                'mask_ratio_effective', getattr(args, 'mask_ratio', 0.0)))
+            metrics['mask/span_hits'] = float(
+                loss_logs.get('mask_span_hits', 0.0))
 
             # Quick eval on small split
             # Run quick validation
@@ -616,7 +654,8 @@ def main():
                     raise RuntimeError('quick_val_loader unavailable')
                 model.eval()
                 with torch.no_grad():
-                    q_loss, q_cer, q_wer, q_preds, q_labels = valid.validation(model_ema.ema, criterion, quick_val_loader, converter, args)
+                    q_loss, q_cer, q_wer, q_preds, q_labels = valid.validation(
+                        model_ema.ema, criterion, quick_val_loader, converter, args)
                 model.train()
                 # Vowel CER and TER + Illegal tone rate + confusion top2 + class support from quick eval
                 import editdistance
@@ -629,8 +668,10 @@ def main():
                 tone_support_eval = [0, 0, 0, 0, 0, 0]
                 for p, g in zip(q_preds, q_labels):
                     # Vowel-only strings per gt mask
-                    p_v = ''.join([p[i] for i in range(min(len(p), len(g))) if utils.is_vietnamese_vowel(g[i])])
-                    g_v = ''.join([g[i] for i in range(len(g)) if utils.is_vietnamese_vowel(g[i])])
+                    p_v = ''.join([p[i] for i in range(
+                        min(len(p), len(g))) if utils.is_vietnamese_vowel(g[i])])
+                    g_v = ''.join([g[i] for i in range(len(g))
+                                  if utils.is_vietnamese_vowel(g[i])])
                     vowel_ed_sum += editdistance.eval(p_v, g_v)
                     vowel_len_sum += max(1, len(g_v))
                     # TER
@@ -638,7 +679,8 @@ def main():
                     for i in range(L):
                         if utils.is_vietnamese_vowel(g[i]):
                             ter_total += 1
-                            pt, gt = utils.tone_of_char(p[i]), utils.tone_of_char(g[i])
+                            pt, gt = utils.tone_of_char(
+                                p[i]), utils.tone_of_char(g[i])
                             if pt != gt:
                                 ter_err += 1
                                 key = f"{gt}->{pt}"
@@ -646,13 +688,15 @@ def main():
                             # class support from predicted tone on vowel positions
                             tone_support_eval[pt] += 1
                     # Illegal tone rate per line
+
                     def has_illegal_tone(s: str) -> bool:
                         import unicodedata
                         tone_marks = {0x0301, 0x0300, 0x0309, 0x0303, 0x0323}
                         # tone on consonant
                         for ch in s:
                             d = unicodedata.normalize('NFD', ch)
-                            marks = {ord(c) for c in d if unicodedata.category(c) == 'Mn' and ord(c) in tone_marks}
+                            marks = {ord(c) for c in d if unicodedata.category(
+                                c) == 'Mn' and ord(c) in tone_marks}
                             if marks and not utils.is_vietnamese_vowel(ch):
                                 return True
                         # more than one tone in a syllable (word-level approximation split by space)
@@ -667,19 +711,24 @@ def main():
                     if has_illegal_tone(p):
                         illegal_count += 1
 
-                vowel_cer = float(vowel_ed_sum) / float(vowel_len_sum) if vowel_len_sum > 0 else 0.0
+                vowel_cer = float(
+                    vowel_ed_sum) / float(vowel_len_sum) if vowel_len_sum > 0 else 0.0
                 ter_quick = float(ter_err) / float(max(1, ter_total))
-                illegal_rate = float(illegal_count) / float(max(1, len(q_preds)))
+                illegal_rate = float(illegal_count) / \
+                    float(max(1, len(q_preds)))
                 # confusion top2 string
-                top2 = sorted(confusion.items(), key=lambda x: x[1], reverse=True)[:2]
-                confusion_top2_str = ', '.join([f"{k}:{v}" for k, v in top2]) if top2 else ''
+                top2 = sorted(confusion.items(),
+                              key=lambda x: x[1], reverse=True)[:2]
+                confusion_top2_str = ', '.join(
+                    [f"{k}:{v}" for k, v in top2]) if top2 else ''
                 # class support fractions from eval
                 total_tone_eval = sum(tone_support_eval)
                 class_support_eval = {}
                 if total_tone_eval > 0:
                     names = ['NONE', 'ACUTE', 'GRAVE', 'HOOK', 'TILDE', 'DOT']
                     for i, name in enumerate(names):
-                        class_support_eval[name] = tone_support_eval[i] / total_tone_eval
+                        class_support_eval[name] = tone_support_eval[i] / \
+                            total_tone_eval
 
                 metrics['eval/CER'] = float(q_cer)
                 metrics['eval/WER'] = float(q_wer)
@@ -699,9 +748,11 @@ def main():
             # Additional text logs
             if 'tone_class_support' in loss_logs and isinstance(loss_logs['tone_class_support'], dict):
                 for name, frac in loss_logs['tone_class_support'].items():
-                    writer.add_scalar(f'metrics/tone/class_support/{name}', frac, nb_iter)
+                    writer.add_scalar(
+                        f'metrics/tone/class_support/{name}', frac, nb_iter)
             if 'confusion_top2_str' in locals() and confusion_top2_str:
-                writer.add_text('metrics/tone/confusion_top2', confusion_top2_str, nb_iter)
+                writer.add_text('metrics/tone/confusion_top2',
+                                confusion_top2_str, nb_iter)
 
             # wandb log
             log_dict = {"iter": nb_iter}
@@ -738,7 +789,8 @@ def main():
                 # Compute Tone Error Rate (TER) on Vietnamese subset
                 ter = 0.0
                 try:
-                    vi_pairs = [(p, g) for p, g in zip(preds, labels) if utils.contains_vietnamese(g)]
+                    vi_pairs = [(p, g) for p, g in zip(
+                        preds, labels) if utils.contains_vietnamese(g)]
                     if len(vi_pairs) > 0:
                         tone_errors = 0
                         tone_total = 0
@@ -747,7 +799,8 @@ def main():
                             for i in range(L):
                                 if utils.is_vietnamese_vowel(g[i]):
                                     tone_total += 1
-                                    tone_errors += int(utils.tone_of_char(p[i]) != utils.tone_of_char(g[i]))
+                                    tone_errors += int(utils.tone_of_char(
+                                        p[i]) != utils.tone_of_char(g[i]))
                         ter = tone_errors / max(1, tone_total)
                 except Exception:
                     ter = 0.0
@@ -798,6 +851,10 @@ def main():
 
                 logger.info(
                     f'Val. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} \t TER : {ter:0.4f}')
+                ckpt_name = f"checkpoint_{nb_iter}_{val_cer:.4f}_{val_wer:.4f}_{ter:.4f}.pth"
+                torch.save(checkpoint_regular, os.path.join(
+                    args.save_dir, ckpt_name))
+                logger.info(f'Saved checkpoint: {ckpt_name}')
 
                 writer.add_scalar('./VAL/CER', val_cer, nb_iter)
                 writer.add_scalar('./VAL/WER', val_wer, nb_iter)
@@ -822,11 +879,14 @@ def main():
                                 preds = preds[0]
                             preds = preds.float()
                             batch_size = image.size(0)
-                            preds_size = torch.IntTensor([preds.size(1)] * batch_size)
+                            preds_size = torch.IntTensor(
+                                [preds.size(1)] * batch_size)
                             preds = preds.permute(1, 0, 2).log_softmax(2)
                             _, preds_index = preds.max(2)
-                            preds_index = preds_index.transpose(1, 0).contiguous().view(-1)
-                            preds_str = converter.decode(preds_index.data, preds_size.data)
+                            preds_index = preds_index.transpose(
+                                1, 0).contiguous().view(-1)
+                            preds_str = converter.decode(
+                                preds_index.data, preds_size.data)
 
                         for i in range(example_count):
                             img_tensor = batch[0][i].cpu()
@@ -834,7 +894,8 @@ def main():
                             true_text = batch[1][i]
                             is_correct = pred_text == true_text
                             caption = f"Pred: {pred_text} | GT: {true_text} | {'✅' if is_correct else '❌'}"
-                            example_images.append(wandb.Image(img_tensor, caption=caption))
+                            example_images.append(wandb.Image(
+                                img_tensor, caption=caption))
 
                         wandb.log({
                             "val/loss": val_loss,
