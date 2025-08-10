@@ -206,7 +206,7 @@ def main():
     model.zero_grad()
 
     best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count = utils.load_checkpoint(
-        model, model_ema, None, getattr(args, 'resume_checkpoint', None), logger)
+        model, model_ema, None, getattr(args, 'resume', None), logger)
 
     logger.info('Loading train loader...')
     train_dataset = dataset.myLoadDS(
@@ -290,7 +290,7 @@ def main():
         scaler.scale(loss).backward()
         optimizer.first_step(zero_grad=True)
 
-        with torch.cuda.amp.autocast('cuda'):
+        with torch.amp.autocast('cuda'):
             loss2, _ = compute_loss(
                 args,
                 model,
