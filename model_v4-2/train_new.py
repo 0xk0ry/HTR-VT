@@ -383,7 +383,7 @@ def main():
                     best_wer = val_wer
 
                 if val_cer < best_cer:
-                    checkpoint = utils.build_checkpoint_dict(
+                    checkpoint = utils.make_checkpoint_dict(
                         model, model_ema, optimizer, nb_iter, best_cer, best_wer,
                         val_cer, val_wer, val_ter, args, train_loss, train_loss_count
                     )
@@ -391,7 +391,7 @@ def main():
                         args.save_dir, 'best_CER.pth'))
 
                 if val_wer < best_wer:
-                    checkpoint = utils.build_checkpoint_dict(
+                    checkpoint = utils.make_checkpoint_dict(
                         model, model_ema, optimizer, nb_iter, best_cer, best_wer,
                         val_cer, val_wer, val_ter, args, train_loss, train_loss_count
                     )
@@ -401,7 +401,7 @@ def main():
                 logger.info(
                     f'Val. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} \t TER : {val_ter:0.4f}')
 
-                checkpoint_regular = utils.build_checkpointe_dict(
+                checkpoint_regular = utils.make_checkpoint_dict(
                     model, model_ema, optimizer, nb_iter, best_cer, best_wer,
                     val_cer, val_wer, val_ter, args, train_loss, train_loss_count
                 )
