@@ -521,17 +521,32 @@ def main():
                 logger.info(
                     f'Val. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} \t TER : {ter:0.4f}')
 
+                checkpoint_regular = {
+                    'model': model.state_dict(),
+                    'state_dict_ema': model_ema.ema.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'nb_iter': nb_iter,
+                    'best_cer': best_cer,
+                    'best_wer': best_wer,
+                    'args': vars(args),
+                    'random_state': random.getstate(),
+                    'numpy_state': np.random.get_state(),
+                    'torch_state': torch.get_rng_state(),
+                    'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                    'train_loss': train_loss,
+                    'train_loss_count': train_loss_count,
+                }
+                ckpt_name = f"checkpoint_{nb_iter}_{val_cer:.4f}_{val_wer:.4f}_{ter:.4f}.pth"
+                torch.save(checkpoint_regular, os.path.join(
+                    args.save_dir, ckpt_name))
+                logger.info(f'Saved checkpoint: {ckpt_name}')
+
                 writer.add_scalar('./VAL/CER', val_cer, nb_iter)
                 writer.add_scalar('./VAL/WER', val_wer, nb_iter)
                 writer.add_scalar('./VAL/TER', ter, nb_iter)
                 writer.add_scalar('./VAL/bestCER', best_cer, nb_iter)
                 writer.add_scalar('./VAL/bestWER', best_wer, nb_iter)
                 writer.add_scalar('./VAL/val_loss', val_loss, nb_iter)
-                ckpt_name = f"checkpoint_{nb_iter}_{val_cer:.4f}_{val_wer:.4f}_{ter:.4f}.pth"
-                torch.save(checkpoint_regular, os.path.join(
-                    args.save_dir, ckpt_name))
-                logger.info(f'Saved checkpoint: {ckpt_name}')
-
                 # wandb log (optional)
                 if getattr(args, 'use_wandb', False):
                     try:
