@@ -458,7 +458,8 @@ def main():
                     })
                 model.train()
 
-        if nb_iter % args.print_iter == 0:
+        if args.use_wandb and nb_iter % args.print_iter == 0:
+            logger.info(f"Logging to wandb: {log_dict}")
             wandb.log(log_dict)
 
 
