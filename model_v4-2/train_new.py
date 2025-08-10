@@ -255,8 +255,6 @@ def main():
     leakage_running = 0.0
     tone_count = 0
 
-    scaler = torch.amp.GradScaler('cuda')  # For mixed precision
-
     for nb_iter in range(start_iter, args.total_iter):
         optimizer, current_lr = utils.update_lr_cos(
             nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer)
@@ -267,52 +265,46 @@ def main():
         text, length = converter.encode(batch[1])
         batch_size = image.size(0)
 
-        # Mixed precision training
-        with torch.amp.autocast('cuda'):
-            loss, loss_logs = compute_loss(
-                args,
-                model,
-                image,
-                batch_size,
-                criterion,
-                text,
-                length,
-                batch[1],  # labels
-                converter,
-                args.tau_v,
-                args.lambda_tone,
-                args.tone_loss,
-                args.focal_gamma,
-                args.lang_weight,
-                nb_iter,
-                use_masking=True,
-            )
-        scaler.scale(loss).backward()
+        loss, loss_logs = compute_loss(
+            args,
+            model,
+            image,
+            batch_size,
+            criterion,
+            text,
+            length,
+            batch[1],  # labels
+            converter,
+            args.tau_v,
+            args.lambda_tone,
+            args.tone_loss,
+            args.focal_gamma,
+            args.lang_weight,
+            nb_iter,
+            use_masking=True,
+        )
+        loss.backward()
         optimizer.first_step(zero_grad=True)
-
-        with torch.amp.autocast('cuda'):
-            loss2, _ = compute_loss(
-                args,
-                model,
-                image,
-                batch_size,
-                criterion,
-                text,
-                length,
-                batch[1],
-                converter,
-                args.tau_v,
-                args.lambda_tone,
-                args.tone_loss,
-                args.focal_gamma,
-                args.lang_weight,
-                nb_iter,
-                use_masking=False,
-            )
-        scaler.scale(loss2).backward()
+        loss2, _ = compute_loss(
+            args,
+            model,
+            image,
+            batch_size,
+            criterion,
+            text,
+            length,
+            batch[1],
+            converter,
+            args.tau_v,
+            args.lambda_tone,
+            args.tone_loss,
+            args.focal_gamma,
+            args.lang_weight,
+            nb_iter,
+            use_masking=False,
+        )
+        loss2.backward()
         optimizer.second_step(zero_grad=True)
-        scaler.step(optimizer)
-        scaler.update()
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
 
