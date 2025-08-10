@@ -54,9 +54,21 @@ def compute_loss(
     logs = {
         'ctc_loss': ctc_loss.detach().item(),
         'tone_loss': 0.0,
+        'guard_loss': 0.0,
         'gate_hit_rate': 0.0,
         'tone_leakage': 0.0,
         'lambda_tone_eff': 0.0,
+        # Diagnostics placeholders
+        'blank_rate': 0.0,
+        'frames_per_vowel': 0.0,
+        'T_over_U_mean': 0.0,
+        'T_over_U_p05': 0.0,
+        'pct_T_over_U_lt_1p5': 0.0,
+        'tone_none_rate_on_vowel': 0.0,
+        'tone_conf_margin': 0.0,
+        'tone_class_support': {},
+        'mask_ratio_effective': float(getattr(args, 'mask_ratio', 0.0)),
+        'mask_span_hits': 0.0,
     }
 
     # Curriculum: decide effective lambda for this step
@@ -70,10 +82,16 @@ def compute_loss(
     logs['lambda_tone_eff'] = float(lambda_eff)
 
     tone_loss_total = torch.tensor(0.0, device=base_logits.device)
+    guard_loss_total = torch.tensor(0.0, device=base_logits.device)
     gate_hits = []
     leakage_vals = []
+    frames_per_vowel_list = []
+    none_on_vowel = 0
+    total_vowel_spans = 0
+    conf_margins = []
+    class_support_counts = torch.zeros(6, device=base_logits.device)
 
-    if tone_logits is not None and lambda_eff > 0.0:
+    if tone_logits is not None:
         # Get base probabilities for gating
         base_probs = F.softmax(base_logits, dim=-1)  # (B, T, C)
         # Vowel indices from converter
@@ -83,7 +101,7 @@ def compute_loss(
             vowel_mask.scatter_(0, torch.tensor(vowel_idxs, device=base_probs.device, dtype=torch.long), 1.0)
             # Gate per-frame
             v_score = (base_probs * vowel_mask.view(1, 1, -1)).sum(dim=-1)  # (B, T)
-            m_t = (v_score >= tau_v).float()  # (B, T)
+            m_t = (v_score >= tau_v).float().detach()  # (B, T)
         else:
             m_t = torch.ones(base_probs.shape[:2], device=base_probs.device)
 
@@ -91,14 +109,29 @@ def compute_loss(
         tone_log_probs = F.log_softmax(tone_logits, dim=-1)  # (B, T, 6)
         tone_probs = tone_log_probs.exp()
 
-        # Build gamma using CTC posteriors per sample
+        # Build gamma using CTC posteriors per sample (detached for tone loss)
         log_probs_base = F.log_softmax(base_logits, dim=-1).detach()
 
         # Iterate over batch
         cursor = 0
         tone_losses = []
+        guard_losses = []
+        # Compute some batch-level stats independent of labels
+        # Blank rate
+        frame_labels = base_logits.argmax(dim=-1)  # (B, T)
+        blank_rate = (frame_labels == 0).float().mean().item()
+        logs['blank_rate'] = blank_rate
+        # Masking spans/ratio (approximate from args and sequence length)
+        T_len = base_logits.size(1)
+        total_mask = int(T_len * getattr(args, 'mask_ratio', 0.0))
+        span_hits = max(1, total_mask // max(1, getattr(args, 'max_span_length', 1))) if total_mask > 0 else 0
+        logs['mask_span_hits'] = float(span_hits)
+        # Alignment T/U stats
+        t_over_u_list = []
         for b in range(batch_size):
             U_b = int(length[b].item())
+            if U_b > 0:
+                t_over_u_list.append(float(T_len) / float(U_b))
             y_b = text[cursor:cursor + U_b]
             cursor += U_b
             # posteriors gamma: (T, U_b)
@@ -126,18 +159,30 @@ def compute_loss(
             lang_w = lang_weight if utils.is_english_label(label_b) else 1.0
 
             # Framewise loss
-            if tone_loss_type == 'focal':
-                pt = tone_probs[b]  # (T, 6)
-                loss_b = - (target_t * ((1 - pt) ** focal_gamma) * tone_log_probs[b]).sum(dim=-1)
-            else:
-                # Soft CE
-                loss_b = - (target_t * tone_log_probs[b]).sum(dim=-1)
+            if lambda_eff > 0.0:
+                if tone_loss_type == 'focal':
+                    pt = tone_probs[b]  # (T, 6)
+                    loss_b = - (target_t * ((1 - pt) ** focal_gamma) * tone_log_probs[b]).sum(dim=-1)
+                else:
+                    # Soft CE
+                    loss_b = - (target_t * tone_log_probs[b]).sum(dim=-1)
 
-            # Gate and average
-            gate_b = m_t[b]  # (T,)
-            denom = gate_b.sum() + 1e-6
-            loss_b = (gate_b * loss_b).sum() / denom
-            tone_losses.append(loss_b * lang_w)
+                # Gate and average
+                gate_b = m_t[b]  # (T,)
+                denom = gate_b.sum() + 1e-6
+                loss_b = (gate_b * loss_b).sum() / denom
+                tone_losses.append(loss_b * lang_w)
+            else:
+                gate_b = m_t[b]
+
+            # Guard loss: encourage NONE on non-vowel frames
+            lambda_guard = float(getattr(args, 'lambda_guard', 0.0))
+            if lambda_guard > 0.0:
+                none_logp = tone_log_probs[b, :, 0]  # (T,)
+                inv_gate = (1 - gate_b)
+                denom_g = inv_gate.sum() + 1e-6
+                guard_b = - (inv_gate * none_logp).sum() / denom_g
+                guard_losses.append(guard_b)
 
             # Metrics
             gate_hits.append(gate_b.mean().detach())
@@ -147,13 +192,90 @@ def compute_loss(
             denom_leak = (1 - gate_b).sum() + 1e-6
             leakage_vals.append(leak.sum() / denom_leak)
 
+            # Span-based stats using greedy spans over frame_labels
+            # Build spans (c_idx, start, end)
+            spans = []
+            last_c = 0
+            start_s = None
+            for t in range(T_len):
+                c = int(frame_labels[b, t].item())
+                if c == 0:
+                    if start_s is not None:
+                        spans.append((last_c, start_s, t))
+                        start_s = None
+                    last_c = 0
+                    continue
+                if start_s is None:
+                    start_s = t
+                    last_c = c
+                elif c != last_c:
+                    spans.append((last_c, start_s, t))
+                    start_s = t
+                    last_c = c
+            if start_s is not None:
+                spans.append((last_c, start_s, T_len))
+
+            # Iterate spans: only vowel chars
+            for (c_idx, s, e) in spans:
+                if c_idx <= 0 or c_idx >= len(converter.character):
+                    continue
+                ch = converter.character[c_idx]
+                if not utils.is_vietnamese_vowel(ch):
+                    continue
+                total_vowel_spans += 1
+                # frames used (by gate) in this span
+                frames_used = float(gate_b[s:e].sum().item())
+                frames_per_vowel_list.append(frames_used)
+                # Aggregate tone over span and compute margin
+                # Build gate for this span
+                g_span = gate_b[s:e]
+                probs = F.softmax(tone_logits[b, s:e, :], dim=-1)
+                denom_span = g_span.sum()
+                if float(denom_span.item()) < 1e-6:
+                    g_span = torch.ones_like(g_span)
+                    denom_span = g_span.sum()
+                avg = (probs * g_span.view(-1, 1)).sum(dim=0) / denom_span
+                best_tone = int(avg[1:].argmax().item()) + 1
+                margin = float(avg[best_tone] - avg[0])
+                kappa = float(getattr(args, 'tone_kappa', 0.3))
+                tone_id = best_tone if margin >= kappa else 0
+                if tone_id == 0:
+                    none_on_vowel += 1
+                else:
+                    conf_margins.append(margin)
+                # class support
+                class_support_counts[tone_id] += 1
+
         if tone_losses:
             tone_loss_total = torch.stack(tone_losses).mean()
             logs['tone_loss'] = tone_loss_total.detach().item()
             logs['gate_hit_rate'] = torch.stack(gate_hits).mean().item()
             logs['tone_leakage'] = torch.stack(leakage_vals).mean().item()
+        if guard_losses:
+            guard_loss_total = torch.stack(guard_losses).mean()
+            logs['guard_loss'] = guard_loss_total.detach().item()
 
-    total_loss = ctc_loss + lambda_eff * tone_loss_total
+        # Finalize diagnostics
+        if len(frames_per_vowel_list) > 0:
+            logs['frames_per_vowel'] = float(torch.tensor(frames_per_vowel_list, device=base_logits.device).mean().item())
+        if total_vowel_spans > 0:
+            logs['tone_none_rate_on_vowel'] = float(none_on_vowel) / float(total_vowel_spans)
+            if len(conf_margins) > 0:
+                logs['tone_conf_margin'] = float(torch.tensor(conf_margins, device=base_logits.device).mean().item())
+            # Normalize class support to fractions
+            support_total = float(class_support_counts.sum().item())
+            if support_total > 0:
+                frac = (class_support_counts / support_total).detach().cpu().tolist()
+                logs['tone_class_support'] = {
+                    'NONE': frac[0], 'ACUTE': frac[1], 'GRAVE': frac[2], 'HOOK': frac[3], 'TILDE': frac[4], 'DOT': frac[5]
+                }
+        if len(t_over_u_list) > 0:
+            t_over_u_tensor = torch.tensor(t_over_u_list, device=base_logits.device)
+            logs['T_over_U_mean'] = float(t_over_u_tensor.mean().item())
+            logs['T_over_U_p05'] = float(t_over_u_tensor.kthvalue(max(1, int(0.05 * len(t_over_u_list)))).values.item()) if len(t_over_u_list) > 1 else float(t_over_u_tensor.item())
+            logs['pct_T_over_U_lt_1p5'] = float((t_over_u_tensor < 1.5).float().mean().item())
+
+    total_loss = ctc_loss + lambda_eff * tone_loss_total + float(getattr(args, 'lambda_guard', 0.0)) * guard_loss_total
     return total_loss, logs
 
 
@@ -174,7 +296,7 @@ def main():
     if getattr(args, 'use_wandb', False):
         try:
             import wandb  # type: ignore
-            wandb.init(project="HTR-VT", name=args.exp_name,
+            wandb.init(project="HTR-VN", name=args.exp_name,
                        config=vars(args), dir=args.save_dir)
         except Exception as e:
             print(f"W&B initialization failed, continuing without it: {e}")
@@ -316,6 +438,20 @@ def main():
                                              pin_memory=True,
                                              num_workers=args.num_workers)
 
+    # Build a fixed small quick-eval split (first 256 lines) once
+    try:
+        from torch.utils.data import Subset
+        quick_count = min(256, len(val_dataset))
+        quick_indices = list(range(quick_count))
+        quick_subset = Subset(val_dataset, quick_indices)
+        quick_val_loader = torch.utils.data.DataLoader(quick_subset,
+                                                       batch_size=args.val_bs,
+                                                       shuffle=False,
+                                                       pin_memory=True,
+                                                       num_workers=args.num_workers)
+    except Exception:
+        quick_val_loader = None
+
     logger.info('Initializing optimizer, criterion and converter...')
     optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
                         lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
@@ -382,7 +518,14 @@ def main():
             nb_iter,
             use_masking=True,
         )
+        # Compute grad norm before first step
         loss.backward()
+        total_norm_sq = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2).item()
+                total_norm_sq += param_norm * param_norm
+        grad_norm = float(total_norm_sq ** 0.5)
         optimizer.first_step(zero_grad=True)
         compute_loss(
             args,
@@ -426,15 +569,150 @@ def main():
                 writer.add_scalar('./Train/tone_loss', tone_loss_running / tone_count, nb_iter)
                 writer.add_scalar('./Train/gate_hit_rate', gate_hit_running / tone_count, nb_iter)
                 writer.add_scalar('./Train/tone_leakage', leakage_running / tone_count, nb_iter)
+            # Compute EMA CTC loss for gap metric
+            try:
+                with torch.no_grad():
+                    ema_out = model_ema.ema(image, use_masking=False)
+                    if isinstance(ema_out, (list, tuple)):
+                        ema_base = ema_out[0]
+                    else:
+                        ema_base = ema_out
+                    ema_base = ema_base.float()
+                    preds_size_ema = torch.IntTensor([ema_base.size(1)] * batch_size).cuda()
+                    log_probs_ema = ema_base.permute(1, 0, 2).log_softmax(2)
+                    torch.backends.cudnn.enabled = False
+                    ctc_loss_ema = criterion(log_probs_ema, text, preds_size_ema, length).mean().item()
+                    torch.backends.cudnn.enabled = True
+            except Exception:
+                ctc_loss_ema = 0.0
+
+            # Build metrics dict
+            metrics = {}
+            metrics['loss/ctc'] = float(loss_logs.get('ctc_loss', 0.0))
+            metrics['loss/ctc_ema'] = float(ctc_loss_ema)
+            metrics['loss/tone'] = float(loss_logs.get('tone_loss', 0.0))
+            metrics['loss/guard'] = float(loss_logs.get('guard_loss', 0.0))
+            metrics['loss/total'] = float(loss.item())
+            metrics['opt/lr'] = float(current_lr)
+            metrics['opt/grad_norm'] = float(grad_norm)
+            metrics['opt/ema_gap'] = float(metrics['loss/ctc'] - ctc_loss_ema)
+            metrics['gate/hit_rate'] = float(loss_logs.get('gate_hit_rate', 0.0))
+            metrics['gate/leakage'] = float(loss_logs.get('tone_leakage', 0.0))
+            metrics['gate/frames_per_vowel'] = float(loss_logs.get('frames_per_vowel', 0.0))
+            metrics['align/T_over_U_mean'] = float(loss_logs.get('T_over_U_mean', 0.0))
+            metrics['align/T_over_U_p05'] = float(loss_logs.get('T_over_U_p05', 0.0))
+            metrics['align/pct_T_over_U_lt_1p5'] = float(loss_logs.get('pct_T_over_U_lt_1p5', 0.0))
+            metrics['base/blank_rate'] = float(loss_logs.get('blank_rate', 0.0))
+            metrics['tone/none_rate_on_vowel'] = float(loss_logs.get('tone_none_rate_on_vowel', 0.0))
+            metrics['tone/conf_margin'] = float(loss_logs.get('tone_conf_margin', 0.0))
+            # Masking
+            metrics['mask/ratio_effective'] = float(loss_logs.get('mask_ratio_effective', getattr(args, 'mask_ratio', 0.0)))
+            metrics['mask/span_hits'] = float(loss_logs.get('mask_span_hits', 0.0))
+
+            # Quick eval on small split
+            # Run quick validation
+            try:
+                if quick_val_loader is None:
+                    raise RuntimeError('quick_val_loader unavailable')
+                model.eval()
+                with torch.no_grad():
+                    q_loss, q_cer, q_wer, q_preds, q_labels = valid.validation(model_ema.ema, criterion, quick_val_loader, converter, args)
+                model.train()
+                # Vowel CER and TER + Illegal tone rate + confusion top2 + class support from quick eval
+                import editdistance
+                vowel_ed_sum = 0
+                vowel_len_sum = 0
+                ter_err = 0
+                ter_total = 0
+                illegal_count = 0
+                confusion = {}
+                tone_support_eval = [0, 0, 0, 0, 0, 0]
+                for p, g in zip(q_preds, q_labels):
+                    # Vowel-only strings per gt mask
+                    p_v = ''.join([p[i] for i in range(min(len(p), len(g))) if utils.is_vietnamese_vowel(g[i])])
+                    g_v = ''.join([g[i] for i in range(len(g)) if utils.is_vietnamese_vowel(g[i])])
+                    vowel_ed_sum += editdistance.eval(p_v, g_v)
+                    vowel_len_sum += max(1, len(g_v))
+                    # TER
+                    L = min(len(p), len(g))
+                    for i in range(L):
+                        if utils.is_vietnamese_vowel(g[i]):
+                            ter_total += 1
+                            pt, gt = utils.tone_of_char(p[i]), utils.tone_of_char(g[i])
+                            if pt != gt:
+                                ter_err += 1
+                                key = f"{gt}->{pt}"
+                                confusion[key] = confusion.get(key, 0) + 1
+                            # class support from predicted tone on vowel positions
+                            tone_support_eval[pt] += 1
+                    # Illegal tone rate per line
+                    def has_illegal_tone(s: str) -> bool:
+                        import unicodedata
+                        tone_marks = {0x0301, 0x0300, 0x0309, 0x0303, 0x0323}
+                        # tone on consonant
+                        for ch in s:
+                            d = unicodedata.normalize('NFD', ch)
+                            marks = {ord(c) for c in d if unicodedata.category(c) == 'Mn' and ord(c) in tone_marks}
+                            if marks and not utils.is_vietnamese_vowel(ch):
+                                return True
+                        # more than one tone in a syllable (word-level approximation split by space)
+                        for word in s.split():
+                            cnt = 0
+                            for ch in word:
+                                if utils.is_vietnamese_vowel(ch) and utils.tone_of_char(ch) != 0:
+                                    cnt += 1
+                            if cnt > 1:
+                                return True
+                        return False
+                    if has_illegal_tone(p):
+                        illegal_count += 1
+
+                vowel_cer = float(vowel_ed_sum) / float(vowel_len_sum) if vowel_len_sum > 0 else 0.0
+                ter_quick = float(ter_err) / float(max(1, ter_total))
+                illegal_rate = float(illegal_count) / float(max(1, len(q_preds)))
+                # confusion top2 string
+                top2 = sorted(confusion.items(), key=lambda x: x[1], reverse=True)[:2]
+                confusion_top2_str = ', '.join([f"{k}:{v}" for k, v in top2]) if top2 else ''
+                # class support fractions from eval
+                total_tone_eval = sum(tone_support_eval)
+                class_support_eval = {}
+                if total_tone_eval > 0:
+                    names = ['NONE', 'ACUTE', 'GRAVE', 'HOOK', 'TILDE', 'DOT']
+                    for i, name in enumerate(names):
+                        class_support_eval[name] = tone_support_eval[i] / total_tone_eval
+
+                metrics['eval/CER'] = float(q_cer)
+                metrics['eval/WER'] = float(q_wer)
+                metrics['eval/VowelCER'] = float(vowel_cer)
+                metrics['eval/TER'] = float(ter_quick)
+                metrics['eval/IllegalToneRate'] = float(illegal_rate)
+                # Log eval class support per class
+                for name, frac in class_support_eval.items():
+                    metrics[f'tone/class_support/{name}'] = float(frac)
+            except Exception:
+                pass
+
+            # Write scalars to TB
+            for k, v in metrics.items():
+                if isinstance(v, (int, float)):
+                    writer.add_scalar(f'metrics/{k}', v, nb_iter)
+            # Additional text logs
+            if 'tone_class_support' in loss_logs and isinstance(loss_logs['tone_class_support'], dict):
+                for name, frac in loss_logs['tone_class_support'].items():
+                    writer.add_scalar(f'metrics/tone/class_support/{name}', frac, nb_iter)
+            if 'confusion_top2_str' in locals() and confusion_top2_str:
+                writer.add_text('metrics/tone/confusion_top2', confusion_top2_str, nb_iter)
+
             # wandb log
-            log_dict = {"train/lr": current_lr,
-                        "train/loss": train_loss_avg, "iter": nb_iter}
-            if tone_count > 0:
-                log_dict.update({
-                    "train/tone_loss": tone_loss_running / tone_count,
-                    "train/gate_hit_rate": gate_hit_running / tone_count,
-                    "train/tone_leakage": leakage_running / tone_count,
-                })
+            log_dict = {"iter": nb_iter}
+            for k, v in metrics.items():
+                log_dict[f"metrics/{k}"] = v
+            # Also include class support if available
+            if 'tone_class_support' in loss_logs and isinstance(loss_logs['tone_class_support'], dict):
+                for name, frac in loss_logs['tone_class_support'].items():
+                    log_dict[f"metrics/tone/class_support/{name}"] = frac
+            if 'confusion_top2_str' in locals() and confusion_top2_str:
+                log_dict["metrics/tone/confusion_top2"] = confusion_top2_str
             if getattr(args, 'use_wandb', False):
                 try:
                     import wandb  # type: ignore
