@@ -460,7 +460,19 @@ def main():
                                              pin_memory=True,
                                              num_workers=args.num_workers)
 
-    # (Removed quick eval subset)
+    # Build a fixed small quick-eval split (first 256 lines) once
+    try:
+        from torch.utils.data import Subset
+        quick_count = min(256, len(val_dataset))
+        quick_indices = list(range(quick_count))
+        quick_subset = Subset(val_dataset, quick_indices)
+        quick_val_loader = torch.utils.data.DataLoader(quick_subset,
+                                                       batch_size=args.val_bs,
+                                                       shuffle=False,
+                                                       pin_memory=True,
+                                                       num_workers=args.num_workers)
+    except Exception:
+        quick_val_loader = None
 
     logger.info('Initializing optimizer, criterion and converter...')
     optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
@@ -635,7 +647,99 @@ def main():
             metrics['mask/span_hits'] = float(
                 loss_logs.get('mask_span_hits', 0.0))
 
-            # (Removed quick eval per-iter)
+            # Quick eval on small split
+            # Run quick validation
+            try:
+                if quick_val_loader is None:
+                    raise RuntimeError('quick_val_loader unavailable')
+                model.eval()
+                with torch.no_grad():
+                    q_loss, q_cer, q_wer, q_preds, q_labels = valid.validation(
+                        model_ema.ema, criterion, quick_val_loader, converter, args)
+                model.train()
+                # Vowel CER and TER + Illegal tone rate + confusion top2 + class support from quick eval
+                import editdistance
+                vowel_ed_sum = 0
+                vowel_len_sum = 0
+                ter_err = 0
+                ter_total = 0
+                illegal_count = 0
+                confusion = {}
+                tone_support_eval = [0, 0, 0, 0, 0, 0]
+                for p, g in zip(q_preds, q_labels):
+                    # Vowel-only strings per gt mask
+                    p_v = ''.join([p[i] for i in range(
+                        min(len(p), len(g))) if utils.is_vietnamese_vowel(g[i])])
+                    g_v = ''.join([g[i] for i in range(len(g))
+                                  if utils.is_vietnamese_vowel(g[i])])
+                    vowel_ed_sum += editdistance.eval(p_v, g_v)
+                    vowel_len_sum += max(1, len(g_v))
+                    # TER
+                    L = min(len(p), len(g))
+                    for i in range(L):
+                        if utils.is_vietnamese_vowel(g[i]):
+                            ter_total += 1
+                            pt, gt = utils.tone_of_char(
+                                p[i]), utils.tone_of_char(g[i])
+                            if pt != gt:
+                                ter_err += 1
+                                key = f"{gt}->{pt}"
+                                confusion[key] = confusion.get(key, 0) + 1
+                            # class support from predicted tone on vowel positions
+                            tone_support_eval[pt] += 1
+                    # Illegal tone rate per line
+
+                    def has_illegal_tone(s: str) -> bool:
+                        import unicodedata
+                        tone_marks = {0x0301, 0x0300, 0x0309, 0x0303, 0x0323}
+                        # tone on consonant
+                        for ch in s:
+                            d = unicodedata.normalize('NFD', ch)
+                            marks = {ord(c) for c in d if unicodedata.category(
+                                c) == 'Mn' and ord(c) in tone_marks}
+                            if marks and not utils.is_vietnamese_vowel(ch):
+                                return True
+                        # more than one tone in a syllable (word-level approximation split by space)
+                        for word in s.split():
+                            cnt = 0
+                            for ch in word:
+                                if utils.is_vietnamese_vowel(ch) and utils.tone_of_char(ch) != 0:
+                                    cnt += 1
+                            if cnt > 1:
+                                return True
+                        return False
+                    if has_illegal_tone(p):
+                        illegal_count += 1
+
+                vowel_cer = float(
+                    vowel_ed_sum) / float(vowel_len_sum) if vowel_len_sum > 0 else 0.0
+                ter_quick = float(ter_err) / float(max(1, ter_total))
+                illegal_rate = float(illegal_count) / \
+                    float(max(1, len(q_preds)))
+                # confusion top2 string
+                top2 = sorted(confusion.items(),
+                              key=lambda x: x[1], reverse=True)[:2]
+                confusion_top2_str = ', '.join(
+                    [f"{k}:{v}" for k, v in top2]) if top2 else ''
+                # class support fractions from eval
+                total_tone_eval = sum(tone_support_eval)
+                class_support_eval = {}
+                if total_tone_eval > 0:
+                    names = ['NONE', 'ACUTE', 'GRAVE', 'HOOK', 'TILDE', 'DOT']
+                    for i, name in enumerate(names):
+                        class_support_eval[name] = tone_support_eval[i] / \
+                            total_tone_eval
+
+                metrics['eval/CER'] = float(q_cer)
+                metrics['eval/WER'] = float(q_wer)
+                metrics['eval/VowelCER'] = float(vowel_cer)
+                metrics['eval/TER'] = float(ter_quick)
+                metrics['eval/IllegalToneRate'] = float(illegal_rate)
+                # Log eval class support per class
+                for name, frac in class_support_eval.items():
+                    metrics[f'tone/class_support/{name}'] = float(frac)
+            except Exception:
+                pass
 
             # Write scalars to TB
             for k, v in metrics.items():
@@ -646,7 +750,9 @@ def main():
                 for name, frac in loss_logs['tone_class_support'].items():
                     writer.add_scalar(
                         f'metrics/tone/class_support/{name}', frac, nb_iter)
-            # (Removed confusion_top2 text logging from quick eval)
+            if 'confusion_top2_str' in locals() and confusion_top2_str:
+                writer.add_text('metrics/tone/confusion_top2',
+                                confusion_top2_str, nb_iter)
 
             # wandb log
             log_dict = {"iter": nb_iter}
@@ -656,7 +762,8 @@ def main():
             if 'tone_class_support' in loss_logs and isinstance(loss_logs['tone_class_support'], dict):
                 for name, frac in loss_logs['tone_class_support'].items():
                     log_dict[f"metrics/tone/class_support/{name}"] = frac
-            # (Removed confusion_top2 W&B logging from quick eval)
+            if 'confusion_top2_str' in locals() and confusion_top2_str:
+                log_dict["metrics/tone/confusion_top2"] = confusion_top2_str
             if getattr(args, 'use_wandb', False):
                 try:
                     import wandb  # type: ignore
@@ -744,7 +851,6 @@ def main():
 
                 logger.info(
                     f'Val. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} \t TER : {ter:0.4f}')
-                # Save checkpoint every eval iter
                 checkpoint_regular = {
                     'model': model.state_dict(),
                     'state_dict_ema': model_ema.ema.state_dict(),

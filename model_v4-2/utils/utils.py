@@ -1,16 +1,18 @@
-import torch
-import torch.nn.functional as F
-import torch.distributed as dist
-from torch.distributions.uniform import Uniform
-
-import os
-import re
-import sys
-import math
-import logging
-from copy import deepcopy
-from collections import OrderedDict
+# --- Checkpoint dict creation utility ---
 import unicodedata
+from collections import OrderedDict
+from copy import deepcopy
+import logging
+import math
+import sys
+import re
+import os
+from torch.distributions.uniform import Uniform
+import torch.distributed as dist
+import torch.nn.functional as F
+import numpy as np
+import random
+import torch
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -45,7 +47,8 @@ def update_lr_cos(nb_iter, warm_up_iter, total_iter, max_lr, optimizer, min_lr=1
     if nb_iter < warm_up_iter:
         current_lr = max_lr * (nb_iter + 1) / (warm_up_iter + 1)
     else:
-        current_lr = min_lr + (max_lr - min_lr) * 0.5 * (1. + math.cos(math.pi * nb_iter / (total_iter - warm_up_iter)))
+        current_lr = min_lr + (max_lr - min_lr) * 0.5 * (1. +
+                                                         math.cos(math.pi * nb_iter / (total_iter - warm_up_iter)))
 
     for param_group in optimizer.param_groups:
         param_group["lr"] = current_lr
@@ -59,7 +62,8 @@ class CTCLabelConverter(object):
         self.dict = {}
         for i, char in enumerate(dict_character):
             self.dict[char] = i + 1
-        if len(self.dict) == 87:     # '[' and ']' are not in the test set but in the training and validation sets.
+        # '[' and ']' are not in the test set but in the training and validation sets.
+        if len(self.dict) == 87:
             self.dict['['], self.dict[']'] = 88, 89
         self.character = ['[blank]'] + dict_character
 
@@ -78,7 +82,7 @@ class CTCLabelConverter(object):
             t = text_index[index:index + l]
             char_list = []
             for i in range(l):
-                if t[i] != 0 and (not (i > 0 and t[i - 1] == t[i])) and t[i]<len(self.character):
+                if t[i] != 0 and (not (i > 0 and t[i - 1] == t[i])) and t[i] < len(self.character):
                     char_list.append(self.character[t[i]])
             text = ''.join(char_list)
 
@@ -141,7 +145,7 @@ class ModelEma:
             p.requires_grad_(False)
 
     def _load_checkpoint(self, checkpoint_path, mapl=None):
-        checkpoint = torch.load(checkpoint_path,map_location=mapl)
+        checkpoint = torch.load(checkpoint_path, map_location=mapl)
         assert isinstance(checkpoint, dict)
         if 'state_dict_ema' in checkpoint:
             new_state_dict = OrderedDict()
@@ -274,6 +278,103 @@ def ctc_posteriors(log_probs: torch.Tensor, y_indices: torch.Tensor, blank: int 
     return label_posts
 
 
+@torch.no_grad()
+def ctc_posteriors_fast(log_probs: torch.Tensor, y_indices: torch.Tensor, blank: int = 0) -> torch.Tensor:
+    """
+    Compute CTC state posteriors gamma[t, j] (T,U) from log_probs (T,C) and labels (U,).
+    Optimized to reduce per-step allocations and Python overhead.
+    """
+    device = log_probs.device
+    dtype = log_probs.dtype
+    T, C = log_probs.shape
+    U = int(y_indices.numel())
+    if U == 0:
+        return log_probs.new_zeros((T, 0))
+
+    # Extended label sequence with blanks interleaved: length S=2U+1
+    S = 2 * U + 1
+    ext = torch.empty(S, dtype=torch.long, device=device)
+    ext[0::2] = blank
+    ext[1::2] = y_indices
+
+    # Gather emissions e[t, k] = log_probs[t, ext[k]]
+    e = log_probs.index_select(1, ext).contiguous()  # (T,S)
+
+    neg_inf = torch.finfo(dtype).min / 4  # very negative, safe for fp16/fp32
+
+    # Precompute skip-allowed masks (don’t recompute each step)
+    not_blank = (ext != blank)
+    allow_skip_fwd = torch.zeros(S, dtype=torch.bool, device=device)
+    allow_skip_bwd = torch.zeros(S, dtype=torch.bool, device=device)
+    if S >= 3:
+        allow_skip_fwd[2:] = not_blank[2:] & (ext[2:] != ext[:-2])
+        allow_skip_bwd[:-2] = not_blank[:-2] & (ext[:-2] != ext[2:])
+
+    # Forward
+    alpha = e.new_full((T, S), neg_inf)
+    alpha[0, 0] = e[0, 0]
+    if S > 1:
+        alpha[0, 1] = e[0, 1]
+
+    # scratch buffers for shifted rows
+    shift1 = torch.empty(S, dtype=dtype, device=device)
+    shift2 = torch.empty(S, dtype=dtype, device=device)
+
+    for t in range(1, T):
+        prev = alpha[t-1]
+
+        # move1: prev shifted right by 1 (fill left with -inf)
+        shift1[0] = neg_inf
+        shift1[1:] = prev[:-1]
+
+        # move2: prev shifted right by 2 (fill first two with -inf)
+        shift2[:2] = neg_inf
+        shift2[2:] = prev[:-2]
+
+        # a = logaddexp(stay, move1)
+        a = torch.logaddexp(prev, shift1)
+        # where allowed, a = logaddexp(a, move2)
+        a = torch.where(allow_skip_fwd, torch.logaddexp(a, shift2), a)
+
+        alpha[t] = a + e[t]
+
+    # Backward
+    beta = e.new_full((T, S), neg_inf)
+    beta[T-1, S-1] = e[T-1, S-1]
+    if S > 1:
+        beta[T-1, S-2] = e[T-1, S-2]
+
+    for t in range(T - 2, -1, -1):
+        nxt = beta[t+1]
+
+        # move1: nxt shifted left by 1 (fill right with -inf)
+        shift1[-1] = neg_inf
+        shift1[:-1] = nxt[1:]
+
+        # move2: nxt shifted left by 2 (fill last two with -inf)
+        shift2[-2:] = neg_inf
+        shift2[:-2] = nxt[2:]
+
+        b = torch.logaddexp(nxt, shift1)
+        b = torch.where(allow_skip_bwd, torch.logaddexp(b, shift2), b)
+
+        beta[t] = b + e[t]
+
+    # Total log-likelihood
+    if S == 1:
+        logZ = alpha[T-1, 0]
+    else:
+        logZ = torch.logaddexp(alpha[T-1, S-1], alpha[T-1, S-2])
+
+    # Posteriors over states and then labels (odd indices)
+    post = torch.exp(alpha + beta - logZ)  # (T,S)
+    label_posts = post[:, 1::2].contiguous()  # (T,U)
+
+    # Normalize numerical drift per time
+    label_posts = label_posts / (label_posts.sum(dim=1, keepdim=True) + 1e-8)
+    return label_posts
+
+
 _VIET_BASE_VOWELS = set(list("aăâeêioôơuưyAĂÂEÊIOÔƠUƯY"))
 
 
@@ -343,9 +444,11 @@ def apply_tone_to_char(ch: str, tone_id: int) -> str:
     d = unicodedata.normalize('NFD', ch)
     # Combining marks for tones
     tone_marks = {0x0301, 0x0300, 0x0309, 0x0303, 0x0323}
-    base_plus = ''.join(c for c in d if not (unicodedata.category(c) == 'Mn' and ord(c) in tone_marks))
+    base_plus = ''.join(c for c in d if not (
+        unicodedata.category(c) == 'Mn' and ord(c) in tone_marks))
     # Add new mark if needed
-    tone_map = {1: '\u0301', 2: '\u0300', 3: '\u0309', 4: '\u0303', 5: '\u0323'}
+    tone_map = {1: '\u0301', 2: '\u0300',
+                3: '\u0309', 4: '\u0303', 5: '\u0323'}
     if tone_id in tone_map:
         base_plus = base_plus + tone_map[tone_id]
     # Recompose
@@ -390,7 +493,8 @@ def ctc_posteriors_batched(log_probs: torch.Tensor, targets: list, blank: int = 
     assert len(targets) == B, "targets list length must equal batch size"
     gammas = []
     for b in range(B):
-        gammas.append(ctc_posteriors(log_probs[b], targets[b].to(log_probs.device), blank=blank))
+        gammas.append(ctc_posteriors_fast(
+            log_probs[b], targets[b].to(log_probs.device), blank=blank))
     return gammas
 
 
@@ -423,3 +527,140 @@ def aggregate_tone_over_span(tone_logits: torch.Tensor, gate: torch.Tensor, t1: 
     best_tone = int(avg[1:].argmax().item()) + 1
     margin = float(avg[best_tone] - avg[0])
     return best_tone if margin >= margin_kappa else 0
+
+def load_checkpoint(model, model_ema, optimizer, checkpoint_path):
+    from collections import OrderedDict
+    import re
+
+    best_cer, best_wer, start_iter = 1e+6, 1e+6, 1
+    train_loss, train_loss_count = 0.0, 0
+    optimizer_state = None
+    if checkpoint_path is not None and os.path.isfile(checkpoint_path):
+        logger.info(f"Resuming from checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(
+            checkpoint_path, map_location='cpu', weights_only=False)
+
+        # Load model state dict (handle module prefix like in test.py)
+        model_dict = OrderedDict()
+        pattern = re.compile('module.')
+
+        # For main model, load from the 'model' state dict
+        # (the training checkpoint contains both 'model' and 'state_dict_ema')
+        if 'model' in checkpoint:
+            source_dict = checkpoint['model']
+            logger.info("Loading main model from 'model' state dict")
+        elif 'state_dict_ema' in checkpoint:
+            source_dict = checkpoint['state_dict_ema']
+            logger.info(
+                "Loading main model from 'state_dict_ema' (fallback)")
+        else:
+            raise KeyError(
+                "Neither 'model' nor 'state_dict_ema' found in checkpoint")
+
+        for k, v in source_dict.items():
+            if re.search("module", k):
+                model_dict[re.sub(pattern, '', k)] = v
+            else:
+                model_dict[k] = v
+
+        model.load_state_dict(model_dict, strict=True)
+        logger.info("Successfully loaded main model state dict")
+
+        # Load EMA state dict if available
+        if 'state_dict_ema' in checkpoint and model_ema is not None:
+            ema_dict = OrderedDict()
+            for k, v in checkpoint['state_dict_ema'].items():
+                if re.search("module", k):
+                    ema_dict[re.sub(pattern, '', k)] = v
+                else:
+                    ema_dict[k] = v
+            model_ema.ema.load_state_dict(ema_dict, strict=True)
+            logger.info("Successfully loaded EMA model state dict")
+
+        # Load optimizer state - handle SAM optimizer structure
+        if 'optimizer' in checkpoint and optimizer is not None:
+            try:
+                optimizer_state = checkpoint['optimizer']
+                logger.info(
+                    "Optimizer state will be loaded after optimizer initialization")
+            except Exception as e:
+                logger.warning(f"Failed to prepare optimizer state: {e}")
+                optimizer_state = None
+
+        # Load metrics from checkpoint if available
+        if 'best_cer' in checkpoint:
+            best_cer = checkpoint['best_cer']
+        if 'best_wer' in checkpoint:
+            best_wer = checkpoint['best_wer']
+        if 'nb_iter' in checkpoint:
+            start_iter = checkpoint['nb_iter'] + 1
+
+        # Parse CER, WER, iter from filename as fallback
+        m = re.search(
+            r'checkpoint_(?P<cer>[\d\.]+)_(?P<wer>[\d\.]+)_(?P<iter>\d+)\.pth', checkpoint_path)
+        if m and 'best_cer' not in checkpoint:
+            best_cer = float(m.group('cer'))
+            best_wer = float(m.group('wer'))
+            start_iter = int(m.group('iter')) + 1
+
+        if 'train_loss' in checkpoint:
+            train_loss = checkpoint['train_loss']
+        if 'train_loss_count' in checkpoint:
+            train_loss_count = checkpoint['train_loss_count']
+        if 'random_state' in checkpoint:
+            random.setstate(checkpoint['random_state'])
+            logger.info("Restored random state")
+        if 'numpy_state' in checkpoint:
+            np.random.set_state(checkpoint['numpy_state'])
+            logger.info("Restored numpy random state")
+        if 'torch_state' in checkpoint:
+            torch.set_rng_state(checkpoint['torch_state'])
+            logger.info("Restored torch random state")
+        if 'torch_cuda_state' in checkpoint and torch.cuda.is_available():
+            torch.cuda.set_rng_state(checkpoint['torch_cuda_state'])
+            logger.info("Restored torch cuda random state")
+
+        # Validate that the model was loaded correctly by checking a few parameters
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info(f"Model loaded with {total_params} total parameters")
+
+        logger.info(
+            f"Resumed best_cer={best_cer}, best_wer={best_wer}, start_iter={start_iter}")
+    return best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count
+
+def make_checkpoint_dict(
+    model,
+    model_ema=None,
+    optimizer=None,
+    nb_iter=None,
+    best_cer=None,
+    best_wer=None,
+    cer=None,
+    wer=None,
+    ter=None,
+    args=None,
+    train_loss=None,
+    train_loss_count=None,
+    extra_metrics=None
+):
+    checkpoint = {
+        'model': model.state_dict(),
+        'state_dict_ema': getattr(model_ema, 'ema', model_ema).state_dict() if model_ema is not None else None,
+        'optimizer': optimizer.state_dict() if optimizer is not None else None,
+        'nb_iter': nb_iter,
+        'best_cer': best_cer,
+        'best_wer': best_wer,
+        'cer': cer,
+        'wer': wer,
+        'ter': ter,
+        'args': vars(args) if hasattr(args, 'items') or hasattr(args, '__dict__') else args,
+        'random_state': random.getstate(),
+        'numpy_state': np.random.get_state(),
+        'torch_state': torch.get_rng_state(),
+        'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+        'train_loss': train_loss,
+        'train_loss_count': train_loss_count,
+    }
+    if extra_metrics:
+        checkpoint.update(extra_metrics)
+    return checkpoint

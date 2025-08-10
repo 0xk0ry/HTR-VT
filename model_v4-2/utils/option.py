@@ -68,7 +68,7 @@ def get_args_parser():
     # Tone head training hparams
     # Toggle tone head usage
     parser.add_argument('--use-tone-head', action=argparse.BooleanOptionalAction, default=True,
-                        help='Enable tone head outputs and loss (use --no-use-tone-head to disable)')
+                        help='Enable tone head outputs and loss')
     # Loss weighting and types
     parser.add_argument('--lambda-tone', default=0.3, type=float, help='Weight for tone loss')
     parser.add_argument('--tone-loss', default='ce', type=str, choices=['ce', 'focal'], help='Tone loss type')
