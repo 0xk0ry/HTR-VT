@@ -205,7 +205,7 @@ def main():
     model.zero_grad()
 
     best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count = utils.load_checkpoint(
-        model, model_ema, None, getattr(args, 'resume_checkpoint', None))
+        model, model_ema, None, getattr(args, 'resume_checkpoint', None), logger)
 
     logger.info('Loading train loader...')
     train_dataset = dataset.myLoadDS(
@@ -456,8 +456,10 @@ def main():
                         "val/best_WER": best_wer,
                         "val/examples_table": examples_table,
                     })
-                wandb.log(log_dict)
                 model.train()
+
+        if nb_iter % args.print_iter == 0:
+            wandb.log(log_dict)
 
 
 if __name__ == '__main__':

@@ -13,6 +13,8 @@ import torch.nn.functional as F
 import numpy as np
 import random
 import torch
+from collections import OrderedDict
+import re
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -528,10 +530,8 @@ def aggregate_tone_over_span(tone_logits: torch.Tensor, gate: torch.Tensor, t1: 
     margin = float(avg[best_tone] - avg[0])
     return best_tone if margin >= margin_kappa else 0
 
-def load_checkpoint(model, model_ema, optimizer, checkpoint_path):
-    from collections import OrderedDict
-    import re
 
+def load_checkpoint(model, model_ema, optimizer, checkpoint_path, logger):
     best_cer, best_wer, start_iter = 1e+6, 1e+6, 1
     train_loss, train_loss_count = 0.0, 0
     optimizer_state = None
@@ -627,6 +627,7 @@ def load_checkpoint(model, model_ema, optimizer, checkpoint_path):
         logger.info(
             f"Resumed best_cer={best_cer}, best_wer={best_wer}, start_iter={start_iter}")
     return best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count
+
 
 def make_checkpoint_dict(
     model,
