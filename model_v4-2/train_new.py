@@ -42,11 +42,9 @@ def compute_loss(
     if isinstance(outputs, (list, tuple)):
         base_logits, tone_logits = outputs
     else:
-        # Backward compatibility: older checkpoints without tone head
         base_logits, tone_logits = outputs, None
     base_logits = base_logits.float()
 
-    # CTC loss on base logits
     preds_size = torch.IntTensor([base_logits.size(1)] * batch_size).cuda()
     log_probs_tbc = base_logits.permute(1, 0, 2).log_softmax(2)
     torch.backends.cudnn.enabled = False
@@ -57,6 +55,7 @@ def compute_loss(
     logs = {
         'ctc_loss': ctc_loss.detach().item(),
         'tone_loss': 0.0,
+        'tone_loss_raw': 0.0,  # log raw sum
         'gate_hit_rate': 0.0,
         'tone_leakage': 0.0,
         'lambda_tone_eff': 0.0,
@@ -74,33 +73,28 @@ def compute_loss(
     logs['lambda_tone_eff'] = float(lambda_eff)
 
     tone_loss_total = torch.tensor(0.0, device=base_logits.device)
+    tone_loss_raw_total = torch.tensor(0.0, device=base_logits.device)
     gate_hits = []
     leakage_vals = []
 
     if tone_logits is not None and lambda_eff > 0.0:
-        # Get base probabilities for gating
         base_probs = F.softmax(base_logits, dim=-1)  # (B, T, C)
-        # Vowel indices from converter
         vowel_idxs = utils.vowel_indices_from_converter(converter)
         if len(vowel_idxs) > 0:
             vowel_mask = torch.zeros(
                 base_probs.size(-1), device=base_probs.device)
             vowel_mask.scatter_(0, torch.tensor(
                 vowel_idxs, device=base_probs.device, dtype=torch.long), 1.0)
-            # Gate per-frame
             v_score = (base_probs * vowel_mask.view(1, 1, -1)
                        ).sum(dim=-1)  # (B, T)
             m_t = (v_score >= tau_v).float()  # (B, T)
         else:
             m_t = torch.ones(base_probs.shape[:2], device=base_probs.device)
 
-        # Tone probabilities
         tone_log_probs = F.log_softmax(tone_logits, dim=-1)  # (B, T, 6)
         tone_probs = tone_log_probs.exp()
 
-        # Build gamma using batched CTC posteriors
         log_probs_base = F.log_softmax(base_logits, dim=-1).detach()
-        # Prepare targets for batched CTC posteriors
         targets = []
         cursor = 0
         for b in range(batch_size):
@@ -110,19 +104,16 @@ def compute_loss(
             cursor += U_b
         gammas = utils.ctc_posteriors_batched(log_probs_base, targets, blank=0)
 
-        # Iterate over batch
         tone_losses = []
+        tone_losses_raw = []
         for b in range(batch_size):
             U_b = int(length[b].item())
             gamma_b = gammas[b].detach()  # (T, U_b)
             label_b = labels[b]
-            # Derive tone id per original character (length U_b)
             tones_j = [utils.tone_of_char(ch) for ch in label_b]
             if len(tones_j) != U_b:
-                # Fallback: pad or truncate to match lengths
                 tones_j = (tones_j + [0] * U_b)[:U_b]
 
-            # Soft target over tones per frame: sum_j gamma[t,j] * one_hot(tone_j)
             T_b = gamma_b.size(0)
             target_t = torch.zeros(T_b, 6, device=base_logits.device)
             if U_b > 0:
@@ -131,27 +122,20 @@ def compute_loss(
                     tones_j, device=base_logits.device)] = 1.0
                 target_t = gamma_b @ one_hot  # (T, 6)
 
-            # Apply language weight
             lang_w = lang_weight if utils.is_english_label(label_b) else 1.0
 
-            # Framewise loss
-            if tone_loss_type == 'focal':
-                pt = tone_probs[b]  # (T, 6)
-                loss_b = - (target_t * ((1 - pt) ** focal_gamma)
-                            * tone_log_probs[b]).sum(dim=-1)
-            else:
-                # Soft CE
-                loss_b = - (target_t * tone_log_probs[b]).sum(dim=-1)
-
-            # Gate and average
+            # --- Scale-invariant tone loss ---
+            # Compute tone_ce for each frame
+            tone_ce = -(target_t * tone_log_probs[b]).sum(-1)  # (T,)
             gate_b = m_t[b]  # (T,)
-            denom = gate_b.sum() + 1e-6
-            loss_b = (gate_b * loss_b).sum() / denom
-            tone_losses.append(loss_b * lang_w)
+            denom = gate_b.sum().clamp_min(1.0)
+            L_tone = (gate_b * tone_ce).sum() / denom
+            L_tone_raw = (gate_b * tone_ce).sum()  # raw sum
 
-            # Metrics
+            tone_losses.append(L_tone * lang_w)
+            tone_losses_raw.append(L_tone_raw * lang_w)
+
             gate_hits.append(gate_b.mean().detach())
-            # Leakage: encourage NONE when gate is 0 -> measure non-NONE prob under gate=0
             none_prob = tone_probs[b, :, 0]
             leak = (1 - none_prob) * (1 - gate_b)
             denom_leak = (1 - gate_b).sum() + 1e-6
@@ -159,7 +143,9 @@ def compute_loss(
 
         if tone_losses:
             tone_loss_total = torch.stack(tone_losses).mean()
+            tone_loss_raw_total = torch.stack(tone_losses_raw).mean()
             logs['tone_loss'] = tone_loss_total.detach().item()
+            logs['tone_loss_raw'] = tone_loss_raw_total.detach().item()
             logs['gate_hit_rate'] = torch.stack(gate_hits).mean().item()
             logs['tone_leakage'] = torch.stack(leakage_vals).mean().item()
 
@@ -172,7 +158,8 @@ def main():
     args = option.get_args_parser()
 
     torch.manual_seed(args.seed)
-    torch.backends.cudnn.benchmark = True  # Enable cuDNN auto-tuner for variable input sizes
+    # Enable cuDNN auto-tuner for variable input sizes
+    torch.backends.cudnn.benchmark = True
 
     args.save_dir = os.path.join(args.out_dir, args.exp_name)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -215,7 +202,8 @@ def main():
                                                batch_size=args.train_bs,
                                                shuffle=True,
                                                pin_memory=True,
-                                               num_workers=max(4, args.num_workers),
+                                               num_workers=max(
+                                                   4, args.num_workers),
                                                persistent_workers=True,
                                                collate_fn=partial(dataset.SameTrCollate, args=args))
     train_iter = dataset.cycle_data(train_loader)
@@ -227,7 +215,8 @@ def main():
                                              batch_size=args.val_bs,
                                              shuffle=False,
                                              pin_memory=True,
-                                             num_workers=max(2, args.num_workers),
+                                             num_workers=max(
+                                                 2, args.num_workers),
                                              persistent_workers=True)
 
     logger.info('Initializing optimizer, criterion and converter...')
@@ -254,6 +243,10 @@ def main():
     gate_hit_running = 0.0
     leakage_running = 0.0
     tone_count = 0
+    tau_v = args.tau_v
+    hit_rate_target = 0.5
+    tau_update_every = 50  # update τ_v every N steps
+    tau_v_min, tau_v_max = 0.25, 0.65
 
     for nb_iter in range(start_iter, args.total_iter):
         optimizer, current_lr = utils.update_lr_cos(
@@ -275,7 +268,7 @@ def main():
             length,
             batch[1],  # labels
             converter,
-            args.tau_v,
+            tau_v,
             args.lambda_tone,
             args.tone_loss,
             args.focal_gamma,
@@ -284,6 +277,14 @@ def main():
             use_masking=True,
         )
         loss.backward()
+        for n, p in model.named_parameters():
+            if not p.requires_grad or p.grad is None:
+                continue
+            if nb_iter >= args.tone_warmup_iters and 'tone_head' in n:
+                p.grad.mul_(2.0)     # tone 2x
+            elif nb_iter >= args.tone_warmup_iters:
+                p.grad.mul_(0.5)     # base 0.5x
+
         optimizer.first_step(zero_grad=True)
         loss2, _ = compute_loss(
             args,
@@ -295,7 +296,7 @@ def main():
             length,
             batch[1],
             converter,
-            args.tau_v,
+            tau_v,
             args.lambda_tone,
             args.tone_loss,
             args.focal_gamma,
@@ -316,6 +317,13 @@ def main():
         leakage_running += loss_logs.get('tone_leakage', 0.0)
         tone_count += 1
 
+        if nb_iter % tau_update_every == 0 and nb_iter > 0:
+            current_hit_rate = loss_logs.get('gate_hit_rate', 0.0)
+            tau_v = tau_v + 0.05 * (hit_rate_target - current_hit_rate)
+            tau_v = float(np.clip(tau_v, tau_v_min, tau_v_max))
+            logger.info(
+                f"Auto-tuned tau_v to {tau_v:.3f} (hit_rate={current_hit_rate:.3f})")
+
         if nb_iter % args.print_iter == 0:
             train_loss_avg = train_loss / train_loss_count if train_loss_count > 0 else 0.0
 
@@ -327,6 +335,8 @@ def main():
             if tone_count > 0:
                 writer.add_scalar('./Train/tone_loss',
                                   tone_loss_running / tone_count, nb_iter)
+                writer.add_scalar('./Train/tone_loss_raw',
+                                  loss_logs.get('tone_loss_raw', 0.0), nb_iter)
                 writer.add_scalar('./Train/gate_hit_rate',
                                   gate_hit_running / tone_count, nb_iter)
                 writer.add_scalar('./Train/tone_leakage',
@@ -339,6 +349,7 @@ def main():
             if tone_count > 0:
                 log_dict.update({
                     "train/tone_loss": tone_loss_running / tone_count,
+                    "train/tone_loss_raw": loss_logs.get('tone_loss_raw', 0.0),
                     "train/gate_hit_rate": gate_hit_running / tone_count,
                     "train/tone_leakage": leakage_running / tone_count,
                 })
