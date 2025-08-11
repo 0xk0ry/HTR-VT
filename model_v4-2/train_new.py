@@ -172,7 +172,8 @@ def main():
     args = option.get_args_parser()
 
     torch.manual_seed(args.seed)
-    torch.backends.cudnn.benchmark = True  # Enable cuDNN auto-tuner for variable input sizes
+    # Enable cuDNN auto-tuner for variable input sizes
+    torch.backends.cudnn.benchmark = True
 
     args.save_dir = os.path.join(args.out_dir, args.exp_name)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -215,7 +216,8 @@ def main():
                                                batch_size=args.train_bs,
                                                shuffle=True,
                                                pin_memory=True,
-                                               num_workers=max(4, args.num_workers),
+                                               num_workers=max(
+                                                   4, args.num_workers),
                                                persistent_workers=True,
                                                collate_fn=partial(dataset.SameTrCollate, args=args))
     train_iter = dataset.cycle_data(train_loader)
@@ -227,7 +229,8 @@ def main():
                                              batch_size=args.val_bs,
                                              shuffle=False,
                                              pin_memory=True,
-                                             num_workers=max(2, args.num_workers),
+                                             num_workers=max(
+                                                 2, args.num_workers),
                                              persistent_workers=True)
 
     logger.info('Initializing optimizer, criterion and converter...')
@@ -382,20 +385,17 @@ def main():
                     logger.info(
                         f'CER improved from {best_cer:.4f} to {val_cer:.4f}!!!')
                     best_cer = val_cer
-                if val_wer < best_wer:
-                    logger.info(
-                        f'WER improved from {best_wer:.4f} to {val_wer:.4f}!!!')
-                    best_wer = val_wer
-
-                if val_cer < best_cer:
                     checkpoint = utils.make_checkpoint_dict(
-                        model, model_ema, optimizer, nb_iter, best_cer, best_wer,
+                        model, model_ema, optimizer, nb_iter, best_cer, best_wer if best_wer < val_wer else val_wer,
                         val_cer, val_wer, val_ter, args, train_loss, train_loss_count
                     )
                     torch.save(checkpoint, os.path.join(
                         args.save_dir, 'best_CER.pth'))
 
                 if val_wer < best_wer:
+                    logger.info(
+                        f'WER improved from {best_wer:.4f} to {val_wer:.4f}!!!')
+                    best_wer = val_wer
                     checkpoint = utils.make_checkpoint_dict(
                         model, model_ema, optimizer, nb_iter, best_cer, best_wer,
                         val_cer, val_wer, val_ter, args, train_loss, train_loss_count
