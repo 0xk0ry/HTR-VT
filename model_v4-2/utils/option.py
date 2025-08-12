@@ -23,7 +23,8 @@ def get_args_parser():
                         help='Weight decay for tone head params')
     parser.add_argument('--weight-decay', default=5e-1, type=float, help='weight decay')
     parser.add_argument('--use-wandb', action='store_true', default=False, help = 'whether use wandb, otherwise use tensorboard')
-    parser.add_argument('--exp-name',type=str, default='IAM_HTR_ORIGAMI_NET', help='experimental name (save dir will be out_dir + exp_name)')
+    parser.add_argument('--wandb-project', type=str, default='None', help='WandB project name')
+    parser.add_argument('--exp-name',type=str, default='None', help='experimental name (save dir will be out_dir + exp_name)')
     parser.add_argument('--seed', default=123, type=int, help='seed for initializing training. ')
 
     parser.add_argument('--img-size', default=[512, 64], type=int, nargs='+', help='image size')
@@ -80,14 +81,9 @@ def get_args_parser():
     parser.add_argument('--tone-loss', default='ce', type=str, choices=['ce', 'focal'], help='Tone loss type')
     parser.add_argument('--focal-gamma', default=2.0, type=float, help='Gamma for focal tone loss')
     # Gating threshold on base-vowel probability
-    parser.add_argument('--tau-v', default=0.5, type=float, help='Vowel gate threshold on base probs')
-    # Alias for clarity: --tone-tau-v maps to the same destination
-    parser.add_argument('--tone-tau-v', dest='tau_v', type=float, default=argparse.SUPPRESS,
-                        help='Alias of --tau-v (vowel gate threshold on base probs)')
+    parser.add_argument('--tone-tau-v', default=0.5, type=float, help='Vowel gate threshold on base probs')
     # Language weighting and curriculum
-    parser.add_argument('--lang-weight', default=0.0, type=float, help='Scaling for English-only labels')
-    parser.add_argument('--tone-lang-weight', dest='lang_weight', default=argparse.SUPPRESS, type=float,
-                        help='Alias of --lang-weight; downweight tone loss on EN lines')
+    parser.add_argument('--tone-lang-weight', default=0.0, type=float, help='Scaling for English-only labels')
     parser.add_argument('--tone-warmup-iters', default=10000, type=int, help='Warmup iters with pure CTC (no tone)')
     parser.add_argument('--tone-ramp-iters', default=20000, type=int, help='Ramp iters to reach full lambda-tone')
     # Optional guard penalty (disabled by default)

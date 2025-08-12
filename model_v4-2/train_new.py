@@ -192,12 +192,8 @@ def main():
 
     # Initialize wandb only if enabled
     if args.use_wandb:
-        try:
-            wandb.init(project="HTR-VN", name=args.exp_name,
-                       config=vars(args), dir=args.save_dir)
-        except Exception as e:
-            print(f"W&B initialization failed, continuing without it: {e}")
-            args.use_wandb = False
+        wandb.init(project=args.wandb_project, name=args.exp_name,
+                    config=vars(args), dir=args.save_dir)
 
     model = HTR_VT.create_model(
         nb_cls=args.nb_cls, img_size=args.img_size[::-1])
