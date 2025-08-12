@@ -18,6 +18,8 @@ import torch.nn.functional as F
 import wandb
 import torch.nn as nn
 
+import wandb  # type: ignore
+
 
 def compute_loss(
     args,
@@ -84,10 +86,13 @@ def compute_loss(
         # Vowel indices from converter
         vowel_idxs = utils.vowel_indices_from_converter(converter)
         if len(vowel_idxs) > 0:
-            vowel_mask = torch.zeros(base_probs.size(-1), device=base_probs.device)
-            vowel_mask.scatter_(0, torch.tensor(vowel_idxs, device=base_probs.device, dtype=torch.long), 1.0)
+            vowel_mask = torch.zeros(
+                base_probs.size(-1), device=base_probs.device)
+            vowel_mask.scatter_(0, torch.tensor(
+                vowel_idxs, device=base_probs.device, dtype=torch.long), 1.0)
             # Gate per-frame
-            v_score = (base_probs * vowel_mask.view(1, 1, -1)).sum(dim=-1)  # (B, T)
+            v_score = (base_probs * vowel_mask.view(1, 1, -1)
+                       ).sum(dim=-1)  # (B, T)
             m_t = (v_score >= tau_v).float().detach()  # (B, T)
         else:
             m_t = torch.ones(base_probs.shape[:2], device=base_probs.device)
@@ -126,7 +131,8 @@ def compute_loss(
             target_t = torch.zeros(T_b, 6, device=base_logits.device)
             if U_b > 0:
                 one_hot = torch.zeros(U_b, 6, device=base_logits.device)
-                one_hot[torch.arange(U_b, device=base_logits.device), torch.tensor(tones_j, device=base_logits.device)] = 1.0
+                one_hot[torch.arange(U_b, device=base_logits.device), torch.tensor(
+                    tones_j, device=base_logits.device)] = 1.0
                 target_t = gamma_b @ one_hot  # (T, 6)
 
             lang_w = lang_weight if utils.is_english_label(label_b) else 1.0
@@ -134,7 +140,8 @@ def compute_loss(
             # Framewise loss
             if tone_loss_type == 'focal':
                 pt = tone_probs[b]  # (T, 6)
-                tone_ce = - (target_t * ((1 - pt) ** focal_gamma) * tone_log_probs[b]).sum(dim=-1)  # (T,)
+                tone_ce = - (target_t * ((1 - pt) ** focal_gamma)
+                             * tone_log_probs[b]).sum(dim=-1)  # (T,)
             else:
                 tone_ce = - (target_t * tone_log_probs[b]).sum(dim=-1)  # (T,)
 
@@ -184,9 +191,8 @@ def main():
     writer = SummaryWriter(args.save_dir)
 
     # Initialize wandb only if enabled
-    if getattr(args, 'use_wandb', False):
+    if args.use_wandb:
         try:
-            import wandb  # type: ignore
             wandb.init(project="HTR-VN", name=args.exp_name,
                        config=vars(args), dir=args.save_dir)
         except Exception as e:
@@ -202,13 +208,13 @@ def main():
     model.train()
     model = model.cuda()
     # Ensure EMA decay is properly accessed (handle both ema_decay and ema-decay)
-    ema_decay = getattr(args, 'ema_decay', 0.9999)
+    ema_decay = args.ema_decay
     logger.info(f"Using EMA decay: {ema_decay}")
     model_ema = utils.ModelEma(model, ema_decay)
     model.zero_grad()
 
     best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count = utils.load_checkpoint(
-        model, model_ema, None, getattr(args, 'resume', None), logger)
+        model, model_ema, None, args.resume, logger)
 
     logger.info('Loading train loader...')
     train_dataset = dataset.myLoadDS(
@@ -260,7 +266,7 @@ def main():
     logger.info(
         f"[param groups] base={len(base_params)}, tone={len(tone_params)}, no_wd={len(no_wd_params)}")
 
-    tone_wd = getattr(args, 'tone_weight_decay', args.weight_decay)
+    tone_wd = args.tone_weight_decay
     optimizer = sam.SAM(
         [
             {"params": base_params,  "lr": 1e-7,
@@ -302,8 +308,9 @@ def main():
 
         # --- per-group LR multipliers once tone is active ---
         if nb_iter >= args.tone_warmup_iters:
-            base_mult = getattr(args, "base_lr_mult", 0.5)   # encoder + base head
-            tone_mult = getattr(args, "tone_lr_mult", 2.0)   # tone head
+            # encoder + base head
+            base_mult = args.base_lr_mult
+            tone_mult = args.tone_lr_mult   # tone head
             nowd_mult = base_mult
         else:
             base_mult = tone_mult = nowd_mult = 1.0
@@ -359,7 +366,7 @@ def main():
             args.lambda_tone,
             args.tone_loss,
             args.focal_gamma,
-            lang_weight_eff,
+            args.tone_lang_weight,
             nb_iter,
             use_masking=False,
         )
@@ -385,8 +392,10 @@ def main():
             writer.add_scalar('./Train/lr', current_lr, nb_iter)
             writer.add_scalar('./Train/train_loss', train_loss_avg, nb_iter)
             # Also log per-group LRs to TB for sanity
-            writer.add_scalar('./Train/lr_base', next(g['lr'] for g in optimizer.param_groups if g.get('name')=='base'), nb_iter)
-            writer.add_scalar('./Train/lr_tone', next(g['lr'] for g in optimizer.param_groups if g.get('name')=='tone'), nb_iter)
+            writer.add_scalar('./Train/lr_base', next(
+                g['lr'] for g in optimizer.param_groups if g.get('name') == 'base'), nb_iter)
+            writer.add_scalar('./Train/lr_tone', next(
+                g['lr'] for g in optimizer.param_groups if g.get('name') == 'tone'), nb_iter)
             if tone_count > 0:
                 writer.add_scalar('./Train/tone_loss',
                                   tone_loss_running / tone_count, nb_iter)
@@ -503,17 +512,22 @@ def main():
                         batch_size = image.size(0)
 
                         # Greedy base decode for spans
-                        base_logp_tbc = base_logits.permute(1, 0, 2).log_softmax(2)
+                        base_logp_tbc = base_logits.permute(
+                            1, 0, 2).log_softmax(2)
                         _, preds_index = base_logp_tbc.max(2)
-                        preds_index = preds_index.transpose(1, 0).contiguous().view(-1)
-                        preds_size = torch.IntTensor([base_logits.size(1)] * batch_size)
-                        preds_str_base = converter.decode(preds_index.data, preds_size.data)
+                        preds_index = preds_index.transpose(
+                            1, 0).contiguous().view(-1)
+                        preds_size = torch.IntTensor(
+                            [base_logits.size(1)] * batch_size)
+                        preds_str_base = converter.decode(
+                            preds_index.data, preds_size.data)
 
                         # Compose tones per sample (similar to validation)
                         base_probs = F.softmax(base_logits, dim=-1)
-                        use_tone = getattr(args, 'use_tone_head', True)
-                        kappa = getattr(args, 'tone_kappa', 0.2)
-                        vowel_idxs = utils.vowel_indices_from_converter(converter)
+                        use_tone = args.use_tone_head
+                        kappa = args.tone_kappa
+                        vowel_idxs = utils.vowel_indices_from_converter(
+                            converter)
                         if tone_logits is not None and use_tone:
                             tone_probs = F.softmax(tone_logits, dim=-1)
                         else:
@@ -529,7 +543,7 @@ def main():
                             if len(vowel_idxs) > 0:
                                 v_t = base_probs[b, :, vowel_idxs].sum(dim=-1)
                                 # use the same tau_v_eff as training fallback
-                                tau_v_eval = getattr(args, 'tone_tau_v', getattr(args, 'tau_v', 0.5))
+                                tau_v_eval = args.tone_tau_v
                                 gate = (v_t >= tau_v_eval).float()
                             else:
                                 gate = torch.zeros(T, device=base_probs.device)
@@ -549,9 +563,11 @@ def main():
                                         ch = converter.character[last_c]
                                         if tone_probs is not None and utils.is_vietnamese_vowel(ch):
                                             w = gate[t0:t].mean().item()
-                                            tone_id = int(tone_probs[b, t0:t, 1:].mean(dim=0).argmax().item() + 1)
+                                            tone_id = int(tone_probs[b, t0:t, 1:].mean(
+                                                dim=0).argmax().item() + 1)
                                             if tone_probs[b, t0:t, tone_id].mean().item() - tone_probs[b, t0:t, 0].mean().item() >= kappa:
-                                                ch = utils.apply_tone_to_char(ch, tone_id)
+                                                ch = utils.apply_tone_to_char(
+                                                    ch, tone_id)
                                         composed.append(ch)
                                     last_c = c
                                     t0 = t
