@@ -16,6 +16,7 @@ import random
 import numpy as np
 import torch.nn.functional as F
 import wandb
+import torch.nn as nn
 
 
 def compute_loss(
@@ -83,14 +84,11 @@ def compute_loss(
         # Vowel indices from converter
         vowel_idxs = utils.vowel_indices_from_converter(converter)
         if len(vowel_idxs) > 0:
-            vowel_mask = torch.zeros(
-                base_probs.size(-1), device=base_probs.device)
-            vowel_mask.scatter_(0, torch.tensor(
-                vowel_idxs, device=base_probs.device, dtype=torch.long), 1.0)
+            vowel_mask = torch.zeros(base_probs.size(-1), device=base_probs.device)
+            vowel_mask.scatter_(0, torch.tensor(vowel_idxs, device=base_probs.device, dtype=torch.long), 1.0)
             # Gate per-frame
-            v_score = (base_probs * vowel_mask.view(1, 1, -1)
-                       ).sum(dim=-1)  # (B, T)
-            m_t = (v_score >= tau_v).float()  # (B, T)
+            v_score = (base_probs * vowel_mask.view(1, 1, -1)).sum(dim=-1)  # (B, T)
+            m_t = (v_score >= tau_v).float().detach()  # (B, T)
         else:
             m_t = torch.ones(base_probs.shape[:2], device=base_probs.device)
 
@@ -112,6 +110,8 @@ def compute_loss(
 
         # Iterate over batch
         tone_losses = []
+        total_supervised_sum = 0.0
+        total_raw_sum = 0.0
         for b in range(batch_size):
             U_b = int(length[b].item())
             gamma_b = gammas[b].detach()  # (T, U_b)
@@ -122,36 +122,34 @@ def compute_loss(
                 # Fallback: pad or truncate to match lengths
                 tones_j = (tones_j + [0] * U_b)[:U_b]
 
-            # Soft target over tones per frame: sum_j gamma[t,j] * one_hot(tone_j)
             T_b = gamma_b.size(0)
             target_t = torch.zeros(T_b, 6, device=base_logits.device)
             if U_b > 0:
                 one_hot = torch.zeros(U_b, 6, device=base_logits.device)
-                one_hot[torch.arange(U_b, device=base_logits.device), torch.tensor(
-                    tones_j, device=base_logits.device)] = 1.0
+                one_hot[torch.arange(U_b, device=base_logits.device), torch.tensor(tones_j, device=base_logits.device)] = 1.0
                 target_t = gamma_b @ one_hot  # (T, 6)
 
-            # Apply language weight
             lang_w = lang_weight if utils.is_english_label(label_b) else 1.0
 
             # Framewise loss
             if tone_loss_type == 'focal':
                 pt = tone_probs[b]  # (T, 6)
-                loss_b = - (target_t * ((1 - pt) ** focal_gamma)
-                            * tone_log_probs[b]).sum(dim=-1)
+                tone_ce = - (target_t * ((1 - pt) ** focal_gamma) * tone_log_probs[b]).sum(dim=-1)  # (T,)
             else:
-                # Soft CE
-                loss_b = - (target_t * tone_log_probs[b]).sum(dim=-1)
+                tone_ce = - (target_t * tone_log_probs[b]).sum(dim=-1)  # (T,)
 
-            # Gate and average
             gate_b = m_t[b]  # (T,)
-            denom = gate_b.sum() + 1e-6
-            loss_b = (gate_b * loss_b).sum() / denom
-            tone_losses.append(loss_b * lang_w)
+            supervised = gate_b.sum().clamp_min(1.0)  # number of supervised frames
+            loss_tone_raw = (gate_b * tone_ce).sum()  # for logging only
+            loss_tone = loss_tone_raw / supervised    # scale-invariant loss
+
+            tone_losses.append(loss_tone * lang_w)
+            # Aggregate raw stats per batch for smoother logging
+            total_supervised_sum += float(supervised.item())
+            total_raw_sum += float(loss_tone_raw.item())
 
             # Metrics
             gate_hits.append(gate_b.mean().detach())
-            # Leakage: encourage NONE when gate is 0 -> measure non-NONE prob under gate=0
             none_prob = tone_probs[b, :, 0]
             leak = (1 - none_prob) * (1 - gate_b)
             denom_leak = (1 - gate_b).sum() + 1e-6
@@ -159,9 +157,12 @@ def compute_loss(
 
         if tone_losses:
             tone_loss_total = torch.stack(tone_losses).mean()
-            logs['tone_loss'] = tone_loss_total.detach().item()
+            logs['train/tone_loss'] = float(tone_loss_total.item())
             logs['gate_hit_rate'] = torch.stack(gate_hits).mean().item()
             logs['tone_leakage'] = torch.stack(leakage_vals).mean().item()
+            # Optional: batch-level raw stats for visibility
+            logs['train/tone_frames'] = float(total_supervised_sum)
+            logs['train/tone_loss_raw'] = float(total_raw_sum)
 
     total_loss = ctc_loss + lambda_eff * tone_loss_total
     return total_loss, logs
@@ -234,8 +235,44 @@ def main():
                                              persistent_workers=True)
 
     logger.info('Initializing optimizer, criterion and converter...')
-    optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
-                        lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
+    # Build parameter groups: base, tone, and no-wd
+    base_params, tone_params, no_wd_params = [], [], []
+    name2mod = dict(model.named_modules())
+
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        mod = name2mod.get(n.rsplit('.', 1)[0], None)
+        if (
+            p.ndim == 1
+            or n.endswith('.bias')
+            or isinstance(mod, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d))
+            or 'pos_embed' in n.lower()
+            or 'relative_position' in n.lower()
+            or 'rel_pos' in n.lower()
+        ):
+            no_wd_params.append(p)
+        elif 'tone_head' in n:
+            tone_params.append(p)
+        else:
+            base_params.append(p)
+
+    logger.info(
+        f"[param groups] base={len(base_params)}, tone={len(tone_params)}, no_wd={len(no_wd_params)}")
+
+    tone_wd = getattr(args, 'tone_weight_decay', args.weight_decay)
+    optimizer = sam.SAM(
+        [
+            {"params": base_params,  "lr": 1e-7,
+                "weight_decay": args.weight_decay, "name": "base"},
+            {"params": tone_params,  "lr": 1e-7,
+                "weight_decay": tone_wd,           "name": "tone"},
+            {"params": no_wd_params, "lr": 1e-7,
+                "weight_decay": 0.0,              "name": "no_wd"},
+        ],
+        torch.optim.AdamW,
+        lr=1e-7, betas=(0.9, 0.99)
+    )
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
     converter = utils.CTCLabelConverter(train_dataset.ralph.values())
 
@@ -260,7 +297,25 @@ def main():
 
     for nb_iter in range(start_iter, args.total_iter):
         optimizer, current_lr = utils.update_lr_cos(
-            nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer)
+            nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer
+        )
+
+        # --- per-group LR multipliers once tone is active ---
+        if nb_iter >= args.tone_warmup_iters:
+            base_mult = getattr(args, "base_lr_mult", 0.5)   # encoder + base head
+            tone_mult = getattr(args, "tone_lr_mult", 2.0)   # tone head
+            nowd_mult = base_mult
+        else:
+            base_mult = tone_mult = nowd_mult = 1.0
+
+        for g in optimizer.param_groups:
+            name = g.get('name', '')
+            if name == 'tone':
+                g['lr'] = current_lr * tone_mult
+            elif name == 'no_wd':
+                g['lr'] = current_lr * nowd_mult
+            else:  # base
+                g['lr'] = current_lr * base_mult
 
         optimizer.zero_grad()
         batch = next(train_iter)
@@ -278,15 +333,17 @@ def main():
             length,
             batch[1],  # labels
             converter,
-            args.tau_v,
+            args.tone_tau_v,
             args.lambda_tone,
             args.tone_loss,
             args.focal_gamma,
-            args.lang_weight,
+            args.tone_lang_weight,
             nb_iter,
             use_masking=True,
         )
         loss.backward()
+        # Gradient clipping before SAM first step
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.first_step(zero_grad=True)
         loss2, _ = compute_loss(
             args,
@@ -298,11 +355,11 @@ def main():
             length,
             batch[1],
             converter,
-            args.tau_v,
+            args.tone_tau_v,
             args.lambda_tone,
             args.tone_loss,
             args.focal_gamma,
-            args.lang_weight,
+            lang_weight_eff,
             nb_iter,
             use_masking=False,
         )
@@ -327,6 +384,9 @@ def main():
 
             writer.add_scalar('./Train/lr', current_lr, nb_iter)
             writer.add_scalar('./Train/train_loss', train_loss_avg, nb_iter)
+            # Also log per-group LRs to TB for sanity
+            writer.add_scalar('./Train/lr_base', next(g['lr'] for g in optimizer.param_groups if g.get('name')=='base'), nb_iter)
+            writer.add_scalar('./Train/lr_tone', next(g['lr'] for g in optimizer.param_groups if g.get('name')=='tone'), nb_iter)
             if tone_count > 0:
                 writer.add_scalar('./Train/tone_loss',
                                   tone_loss_running / tone_count, nb_iter)
@@ -337,7 +397,11 @@ def main():
 
             # wandb log
             log_dict = {"iter": nb_iter, "train/lr": current_lr,
-                        "train/loss": train_loss_avg}
+                        "train/loss": train_loss_avg,
+                        "train/lr_base": next(g['lr'] for g in optimizer.param_groups if g.get('name') == 'base'),
+                        "train/lr_tone": next(g['lr'] for g in optimizer.param_groups if g.get('name') == 'tone'),
+                        "train/lr_nowd": next(g['lr'] for g in optimizer.param_groups if g.get('name') == 'no_wd'),
+                        }
 
             if tone_count > 0:
                 log_dict.update({
@@ -430,20 +494,68 @@ def main():
                     model.eval()
                     with torch.no_grad():
                         image = batch[0].cuda()
-
-                        preds = model(image)
-                        if isinstance(preds, (list, tuple)):
-                            preds = preds[0]
-                        preds = preds.float()
+                        outputs = model(image)
+                        if isinstance(outputs, (list, tuple)):
+                            base_logits, tone_logits = outputs
+                        else:
+                            base_logits, tone_logits = outputs, None
+                        base_logits = base_logits.float()
                         batch_size = image.size(0)
-                        preds_size = torch.IntTensor(
-                            [preds.size(1)] * batch_size)
-                        preds = preds.permute(1, 0, 2).log_softmax(2)
-                        _, preds_index = preds.max(2)
-                        preds_index = preds_index.transpose(
-                            1, 0).contiguous().view(-1)
-                        preds_str = converter.decode(
-                            preds_index.data, preds_size.data)
+
+                        # Greedy base decode for spans
+                        base_logp_tbc = base_logits.permute(1, 0, 2).log_softmax(2)
+                        _, preds_index = base_logp_tbc.max(2)
+                        preds_index = preds_index.transpose(1, 0).contiguous().view(-1)
+                        preds_size = torch.IntTensor([base_logits.size(1)] * batch_size)
+                        preds_str_base = converter.decode(preds_index.data, preds_size.data)
+
+                        # Compose tones per sample (similar to validation)
+                        base_probs = F.softmax(base_logits, dim=-1)
+                        use_tone = getattr(args, 'use_tone_head', True)
+                        kappa = getattr(args, 'tone_kappa', 0.2)
+                        vowel_idxs = utils.vowel_indices_from_converter(converter)
+                        if tone_logits is not None and use_tone:
+                            tone_probs = F.softmax(tone_logits, dim=-1)
+                        else:
+                            tone_probs = None
+
+                        preds_str = []
+                        for b in range(batch_size):
+                            pred_base = preds_str_base[b]
+                            # Build framewise argmax path
+                            frame_labels = base_probs[b].argmax(dim=-1)
+                            T = frame_labels.numel()
+                            # Gate
+                            if len(vowel_idxs) > 0:
+                                v_t = base_probs[b, :, vowel_idxs].sum(dim=-1)
+                                # use the same tau_v_eff as training fallback
+                                tau_v_eval = getattr(args, 'tone_tau_v', getattr(args, 'tau_v', 0.5))
+                                gate = (v_t >= tau_v_eval).float()
+                            else:
+                                gate = torch.zeros(T, device=base_probs.device)
+
+                            # Map spans and compose
+                            composed = []
+                            last_c = None
+                            t0 = 0
+                            for t in range(T):
+                                c = int(frame_labels[t].item())
+                                if t == 0:
+                                    last_c = c
+                                    t0 = 0
+                                    continue
+                                if c != last_c:
+                                    if last_c != 0:
+                                        ch = converter.character[last_c]
+                                        if tone_probs is not None and utils.is_vietnamese_vowel(ch):
+                                            w = gate[t0:t].mean().item()
+                                            tone_id = int(tone_probs[b, t0:t, 1:].mean(dim=0).argmax().item() + 1)
+                                            if tone_probs[b, t0:t, tone_id].mean().item() - tone_probs[b, t0:t, 0].mean().item() >= kappa:
+                                                ch = utils.apply_tone_to_char(ch, tone_id)
+                                        composed.append(ch)
+                                    last_c = c
+                                    t0 = t
+                            preds_str.append(''.join(composed))
 
                     for i in range(example_count):
                         img_tensor = batch[0][i].cpu()

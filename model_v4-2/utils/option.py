@@ -15,6 +15,12 @@ def get_args_parser():
     parser.add_argument('--warm-up-iter', default=1000, type=int, help='nb of iterations for warm-up')
     parser.add_argument('--print-iter', default=100, type=int, help='nb of total iterations to print information')
     parser.add_argument('--max-lr', default=1e-3, type=float, help='learning rate')
+    parser.add_argument('--tone-lr-mult', type=float, default=2.0,
+                    help='LR multiplier for tone head after warmup')
+    parser.add_argument('--base-lr-mult', type=float, default=0.5,
+                        help='LR multiplier for encoder+base head after warmup')
+    parser.add_argument('--tone-weight-decay', type=float, default=0.05,
+                        help='Weight decay for tone head params')
     parser.add_argument('--weight-decay', default=5e-1, type=float, help='weight decay')
     parser.add_argument('--use-wandb', action='store_true', default=False, help = 'whether use wandb, otherwise use tensorboard')
     parser.add_argument('--exp-name',type=str, default='IAM_HTR_ORIGAMI_NET', help='experimental name (save dir will be out_dir + exp_name)')
