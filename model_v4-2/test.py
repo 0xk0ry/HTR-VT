@@ -27,7 +27,7 @@ def main():
     pth_path = args.resume
     logger.info('loading HWR checkpoint from {}'.format(pth_path))
 
-    ckpt = torch.load(pth_path, map_location='cpu')
+    ckpt = torch.load(pth_path, map_location='cpu', weights_only=False)
     model_dict = OrderedDict()
     pattern = re.compile('module.')
 
