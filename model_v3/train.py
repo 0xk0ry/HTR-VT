@@ -5,7 +5,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import os
 import json
-import wandb
+import importlib
 import valid
 from utils import utils
 from utils import sam
@@ -43,9 +43,18 @@ def main():
     logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
     writer = SummaryWriter(args.save_dir)
 
-    # Initialize wandb
-    wandb.init(project="HTR-VT", name=args.exp_name,
-               config=vars(args), dir=args.save_dir)
+    # Initialize wandb (optional, model_v4-2 style)
+    if getattr(args, 'use_wandb', False):
+        try:
+            wandb = importlib.import_module('wandb')
+            wandb.init(project=getattr(args, 'wandb_project', 'HTR-VT'), name=args.exp_name,
+                       config=vars(args), dir=args.save_dir)
+            logger.info("Weights & Biases logging enabled")
+        except Exception as e:
+            logger.warning(f"Failed to initialize wandb: {e}. Continuing without wandb.")
+            wandb = None
+    else:
+        wandb = None
 
     model = HTR_VT.create_model(
         nb_cls=args.nb_cls, img_size=args.img_size[::-1])
@@ -251,8 +260,28 @@ def main():
             writer.add_scalar('./Train/lr', current_lr, nb_iter)
             writer.add_scalar('./Train/train_loss', train_loss_avg, nb_iter)
             # wandb log
-            wandb.log({"train/lr": current_lr,
-                      "train/loss": train_loss_avg, "iter": nb_iter})
+            if wandb is not None:
+                wandb.log({"train/lr": current_lr,
+                          "train/loss": train_loss_avg, "iter": nb_iter}, step=nb_iter)
+
+            # Save checkpoint every print interval
+            ckpt_name = f"checkpoint_{best_cer:.4f}_{best_wer:.4f}_{nb_iter}.pth"
+            checkpoint = {
+                'model': model.state_dict(),
+                'state_dict_ema': model_ema.ema.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'nb_iter': nb_iter,
+                'best_cer': best_cer,
+                'best_wer': best_wer,
+                'args': vars(args),
+                'random_state': random.getstate(),
+                'numpy_state': np.random.get_state(),
+                'torch_state': torch.get_rng_state(),
+                'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                'train_loss': train_loss,
+                'train_loss_count': train_loss_count,
+            }
+            torch.save(checkpoint, os.path.join(args.save_dir, ckpt_name))
             train_loss = 0.0
             train_loss_count = 0
 
@@ -316,46 +345,45 @@ def main():
                 writer.add_scalar('./VAL/bestCER', best_cer, nb_iter)
                 writer.add_scalar('./VAL/bestWER', best_wer, nb_iter)
                 writer.add_scalar('./VAL/val_loss', val_loss, nb_iter)
-                # wandb log
-                # log up to 5 examples from current batch
-                example_count = min(5, batch[0].size(0))
-                example_images = []
-                # Get model predictions for current batch
-                model.eval()
-                with torch.no_grad():
-                    image = batch[0].cuda()
-                    # Use the same inference call as validation function (no masking for inference)
-                    preds = model(image)
-                    if isinstance(preds, (list, tuple)):
-                        preds = preds[0]
-                    preds = preds.float()
-                    batch_size = image.size(0)
-                    preds_size = torch.IntTensor([preds.size(1)] * batch_size)
-                    preds = preds.permute(1, 0, 2).log_softmax(2)
-                    _, preds_index = preds.max(2)
-                    preds_index = preds_index.transpose(
-                        1, 0).contiguous().view(-1)
-                    preds_str = converter.decode(
-                        preds_index.data, preds_size.data)
+                # wandb log (optional): examples and metrics (table style)
+                if wandb is not None:
+                    # log up to 5 examples from current batch
+                    example_count = min(5, batch[0].size(0))
+                    # Get model predictions for current batch
+                    model.eval()
+                    with torch.no_grad():
+                        image = batch[0].cuda()
+                        # Use the same inference call as validation function (no masking for inference)
+                        preds = model(image)
+                        if isinstance(preds, (list, tuple)):
+                            preds = preds[0]
+                        preds = preds.float()
+                        batch_size = image.size(0)
+                        preds_size = torch.IntTensor([preds.size(1)] * batch_size)
+                        preds = preds.permute(1, 0, 2).log_softmax(2)
+                        _, preds_index = preds.max(2)
+                        preds_index = preds_index.transpose(
+                            1, 0).contiguous().view(-1)
+                        preds_str = converter.decode(
+                            preds_index.data, preds_size.data)
 
-                for i in range(example_count):
-                    img_tensor = batch[0][i].cpu()
-                    pred_text = preds_str[i]
-                    true_text = batch[1][i]
-                    is_correct = pred_text == true_text
-                    caption = f"Pred: {pred_text} | GT: {true_text} | {'✅' if is_correct else '❌'}"
-                    example_images.append(wandb.Image(
-                        img_tensor, caption=caption))
+                    examples_table = wandb.Table(columns=["iter", "index", "image", "pred", "gt", "correct"])
+                    for i in range(example_count):
+                        img_tensor = batch[0][i].cpu()
+                        pred_text = preds_str[i]
+                        true_text = batch[1][i]
+                        is_correct = pred_text == true_text
+                        examples_table.add_data(nb_iter, i, wandb.Image(img_tensor), pred_text, true_text, bool(is_correct))
 
-                wandb.log({
-                    "val/loss": val_loss,
-                    "val/CER": val_cer,
-                    "val/WER": val_wer,
-                    "val/best_CER": best_cer,
-                    "val/best_WER": best_wer,
-                    "val/examples": example_images,
-                    "iter": nb_iter
-                })
+                    wandb.log({
+                        "val/loss": val_loss,
+                        "val/CER": val_cer,
+                        "val/WER": val_wer,
+                        "val/best_CER": best_cer,
+                        "val/best_WER": best_wer,
+                        "val/examples_table": examples_table,
+                        "iter": nb_iter
+                    }, step=nb_iter)
                 model.train()
 
 

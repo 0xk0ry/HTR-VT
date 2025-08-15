@@ -19,6 +19,7 @@ def get_args_parser():
     parser.add_argument('--max-lr', default=1e-3, type=float, help='learning rate')
     parser.add_argument('--weight-decay', default=5e-1, type=float, help='weight decay')
     parser.add_argument('--use-wandb', action='store_true', default=False, help = 'wheteher use wandb, otherwise use tensorboard')
+    parser.add_argument('--wandb-project', type=str, default='None', help='WandB project name')
     parser.add_argument('--exp-name',type=str, default='IAM_HTR_ORIGAMI_NET', help='experimental name (save dir will be out_dir + exp_name)')
     parser.add_argument('--seed', default=123, type=int, help='seed for initializing training. ')
 
