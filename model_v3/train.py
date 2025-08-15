@@ -51,7 +51,8 @@ def main():
                        config=vars(args), dir=args.save_dir)
             logger.info("Weights & Biases logging enabled")
         except Exception as e:
-            logger.warning(f"Failed to initialize wandb: {e}. Continuing without wandb.")
+            logger.warning(
+                f"Failed to initialize wandb: {e}. Continuing without wandb.")
             wandb = None
     else:
         wandb = None
@@ -264,24 +265,6 @@ def main():
                 wandb.log({"train/lr": current_lr,
                           "train/loss": train_loss_avg, "iter": nb_iter}, step=nb_iter)
 
-            # Save checkpoint every print interval
-            ckpt_name = f"checkpoint_{best_cer:.4f}_{best_wer:.4f}_{nb_iter}.pth"
-            checkpoint = {
-                'model': model.state_dict(),
-                'state_dict_ema': model_ema.ema.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'nb_iter': nb_iter,
-                'best_cer': best_cer,
-                'best_wer': best_wer,
-                'args': vars(args),
-                'random_state': random.getstate(),
-                'numpy_state': np.random.get_state(),
-                'torch_state': torch.get_rng_state(),
-                'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-                'train_loss': train_loss,
-                'train_loss_count': train_loss_count,
-            }
-            torch.save(checkpoint, os.path.join(args.save_dir, ckpt_name))
             train_loss = 0.0
             train_loss_count = 0
 
@@ -340,6 +323,25 @@ def main():
                 logger.info(
                     f'Val. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} \t ')
 
+                # Save checkpoint every print interval
+                ckpt_name = f"checkpoint_{best_cer:.4f}_{best_wer:.4f}_{nb_iter}.pth"
+                checkpoint = {
+                    'model': model.state_dict(),
+                    'state_dict_ema': model_ema.ema.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'nb_iter': nb_iter,
+                    'best_cer': best_cer,
+                    'best_wer': best_wer,
+                    'args': vars(args),
+                    'random_state': random.getstate(),
+                    'numpy_state': np.random.get_state(),
+                    'torch_state': torch.get_rng_state(),
+                    'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                    'train_loss': train_loss,
+                    'train_loss_count': train_loss_count,
+                }
+                torch.save(checkpoint, os.path.join(args.save_dir, ckpt_name))
+
                 writer.add_scalar('./VAL/CER', val_cer, nb_iter)
                 writer.add_scalar('./VAL/WER', val_wer, nb_iter)
                 writer.add_scalar('./VAL/bestCER', best_cer, nb_iter)
@@ -359,7 +361,8 @@ def main():
                             preds = preds[0]
                         preds = preds.float()
                         batch_size = image.size(0)
-                        preds_size = torch.IntTensor([preds.size(1)] * batch_size)
+                        preds_size = torch.IntTensor(
+                            [preds.size(1)] * batch_size)
                         preds = preds.permute(1, 0, 2).log_softmax(2)
                         _, preds_index = preds.max(2)
                         preds_index = preds_index.transpose(
@@ -367,13 +370,15 @@ def main():
                         preds_str = converter.decode(
                             preds_index.data, preds_size.data)
 
-                    examples_table = wandb.Table(columns=["iter", "index", "image", "pred", "gt", "correct"])
+                    examples_table = wandb.Table(
+                        columns=["iter", "index", "image", "pred", "gt", "correct"])
                     for i in range(example_count):
                         img_tensor = batch[0][i].cpu()
                         pred_text = preds_str[i]
                         true_text = batch[1][i]
                         is_correct = pred_text == true_text
-                        examples_table.add_data(nb_iter, i, wandb.Image(img_tensor), pred_text, true_text, bool(is_correct))
+                        examples_table.add_data(nb_iter, i, wandb.Image(
+                            img_tensor), pred_text, true_text, bool(is_correct))
 
                     wandb.log({
                         "val/loss": val_loss,
