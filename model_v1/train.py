@@ -195,7 +195,7 @@ def main():
     best_cer, best_wer = best_cer, best_wer
     train_loss = train_loss
     train_loss_count = train_loss_count
-
+    start_iter  = 50000
     #### ---- train & eval ---- ####
     logger.info('Start training...')
     for nb_iter in range(start_iter, args.total_iter):
