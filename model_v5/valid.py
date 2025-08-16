@@ -55,7 +55,7 @@ def validation(model, criterion, evaluation_loader, converter):
 
         _, preds_index = base_logp.max(2)
         preds_index = preds_index.transpose(1, 0).contiguous().view(-1)
-        preds_str = converter.decode(preds_index.data, preds_size.data)
+        preds_str = converter.decode(preds_index, preds_size)
         valid_loss += cost.item()
         count += 1
 

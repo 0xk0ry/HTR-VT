@@ -69,8 +69,9 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
     for l in lengths_cpu:
         offs.append(offs[-1] + l)
 
-    softmax_mod = torch.nn.functional.softmax(mod_logits, dim=2)
-    softmax_tone = torch.nn.functional.softmax(tone_logits, dim=2)
+    # Use log_softmax once (faster + more stable than softmax + log)
+    logp_mod = torch.nn.functional.log_softmax(mod_logits, dim=2)
+    logp_tone = torch.nn.functional.log_softmax(tone_logits, dim=2)
 
     for b in range(batch_size):
         # Ground-truth indices for this sample (1..Cb-1); 0 is blank
@@ -122,11 +123,11 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
             if not t_idx:
                 continue
             # Aggregate probabilities over frames in this segment
-            pm = softmax_mod[b, t_idx, :].mean(dim=0)  # [4]
-            pt = softmax_tone[b, t_idx, :].mean(dim=0)  # [6]
+            lpm = logp_mod[b, t_idx, :].mean(dim=0)  # [4]
+            lpt = logp_tone[b, t_idx, :].mean(dim=0)  # [6]
             # CE = -log p[target]
-            mod_losses_u.append(-torch.log(pm[y_mod[u]].clamp_min(eps)))
-            tone_losses_u.append(-torch.log(pt[y_tone[u]].clamp_min(eps)))
+            mod_losses_u.append(-lpm[y_mod[u]].clamp_min(-60.0))
+            tone_losses_u.append(-lpt[y_tone[u]].clamp_min(-60.0))
             matched += 1
 
         if len(mod_losses_u) > 0:
@@ -148,6 +149,7 @@ def main():
 
     args = option.get_args_parser()
     torch.manual_seed(args.seed)
+    cudnn.benchmark = True
 
     args.save_dir = os.path.join(args.out_dir, args.exp_name)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -198,22 +200,30 @@ def main():
     logger.info('Loading train loader...')
     train_dataset = dataset.myLoadDS(
         args.train_data_list, args.data_path, args.img_size, ralph=utils.VIETNAMESE_CHARACTERS)
-    train_loader = torch.utils.data.DataLoader(train_dataset,
-                                               batch_size=args.train_bs,
-                                               shuffle=True,
-                                               pin_memory=True,
-                                               num_workers=args.num_workers,
-                                               collate_fn=partial(dataset.SameTrCollate, args=args))
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.train_bs,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=args.num_workers,
+        persistent_workers=True if args.num_workers and args.num_workers > 0 else False,
+        prefetch_factor=2,
+        collate_fn=partial(dataset.SameTrCollate, args=args),
+    )
     train_iter = dataset.cycle_data(train_loader)
 
     logger.info('Loading val loader...')
     val_dataset = dataset.myLoadDS(
         args.val_data_list, args.data_path, args.img_size, ralph=utils.VIETNAMESE_CHARACTERS)
-    val_loader = torch.utils.data.DataLoader(val_dataset,
-                                             batch_size=args.val_bs,
-                                             shuffle=False,
-                                             pin_memory=True,
-                                             num_workers=args.num_workers)
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=args.val_bs,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=args.num_workers,
+        persistent_workers=True if args.num_workers and args.num_workers > 0 else False,
+        prefetch_factor=2,
+    )
 
     optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
                         lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
@@ -247,7 +257,7 @@ def main():
 
         optimizer.zero_grad()
         batch = next(train_iter)
-        image = batch[0].cuda()
+        image = batch[0].cuda(non_blocking=True)
         enc = converter.encode(batch[1])
         batch_size = image.size(0)
         loss = compute_loss(args, model, image, batch_size, criterion, enc)
