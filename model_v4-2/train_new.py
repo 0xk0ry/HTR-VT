@@ -336,11 +336,11 @@ def main():
             length,
             batch[1],  # labels
             converter,
-            args.tone_tau_v,
+            args.tau_v,
             args.lambda_tone,
             args.tone_loss,
             args.focal_gamma,
-            args.tone_lang_weight,
+            args.lang_weight,
             nb_iter,
             use_masking=True,
         )
@@ -358,11 +358,11 @@ def main():
             length,
             batch[1],
             converter,
-            args.tone_tau_v,
+            args.tau_v,
             args.lambda_tone,
             args.tone_loss,
             args.focal_gamma,
-            args.tone_lang_weight,
+            args.lang_weight,
             nb_iter,
             use_masking=False,
         )
@@ -539,7 +539,7 @@ def main():
                             if len(vowel_idxs) > 0:
                                 v_t = base_probs[b, :, vowel_idxs].sum(dim=-1)
                                 # use the same tau_v_eff as training fallback
-                                tau_v_eval = args.tone_tau_v
+                                tau_v_eval = args.tau_v
                                 gate = (v_t >= tau_v_eval).float()
                             else:
                                 gate = torch.zeros(T, device=base_probs.device)
