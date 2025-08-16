@@ -21,7 +21,7 @@ def get_args_parser():
                         help='LR multiplier for encoder+base head after warmup')
     parser.add_argument('--tone-weight-decay', type=float, default=0.05,
                         help='Weight decay for tone head params')
-    parser.add_argument('--weight-decay', default=5e-1, type=float, help='weight decay')
+    parser.add_argument('--weight-decay', default=1e-1, type=float, help='weight decay')
     parser.add_argument('--use-wandb', action='store_true', default=False, help = 'whether use wandb, otherwise use tensorboard')
     parser.add_argument('--wandb-project', type=str, default='None', help='WandB project name')
     parser.add_argument('--exp-name',type=str, default='None', help='experimental name (save dir will be out_dir + exp_name)')
@@ -31,6 +31,9 @@ def get_args_parser():
     parser.add_argument('--attn-mask-ratio', default=0., type=float, help='attention drop_key mask ratio')
     parser.add_argument('--patch-size', default=[4, 32], type=int, nargs='+', help='patch size')
     parser.add_argument('--mask-ratio', default=0.3, type=float, help='mask ratio')
+    parser.add_argument('--mask-ratio-min', default=0.2, type=float, help='starting mask ratio for warm-up')
+    parser.add_argument('--mask-warmup-iters', default=3000, type=int, help='iterations to ramp mask ratio')
+    parser.add_argument('--use-masking', action=argparse.BooleanOptionalAction, default=False, help='enable span masking during training')
     parser.add_argument('--cos-temp', default=8, type=int, help='cosine similarity classifier temperature')
     parser.add_argument('--max-span-length', default=4, type=int, help='max mask length')
     parser.add_argument('--spacing', default=0, type=int, help='the spacing between two span masks')
@@ -69,6 +72,10 @@ def get_args_parser():
     parser.add_argument('--proba', default=0.5, type=float)
 
     parser.add_argument('--ema-decay', default=0.9999, type=float, help='Exponential Moving Average (EMA) decay')
+    parser.add_argument('--use-sam', action=argparse.BooleanOptionalAction, default=False, help='use SAM optimizer')
+    parser.add_argument('--grad-clip', default=1.0, type=float, help='gradient clipping max norm')
+    parser.add_argument('--bucket-by-length', action=argparse.BooleanOptionalAction, default=True, help='bucket sequences by target length for batching')
+    parser.add_argument('--sam-pre-clip', default=0.0, type=float, help='optional pre-clip max-norm before SAM first_step (0 disables)')
     parser.add_argument('--alpha', default=0, type=float, help='kld loss ratio')
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume training from (checkpoint_{CER}_{WER}_iter.pth format)')
 
@@ -81,9 +88,9 @@ def get_args_parser():
     parser.add_argument('--tone-loss', default='ce', type=str, choices=['ce', 'focal'], help='Tone loss type')
     parser.add_argument('--focal-gamma', default=2.0, type=float, help='Gamma for focal tone loss')
     # Gating threshold on base-vowel probability
-    parser.add_argument('--tone-tau-v', default=0.5, type=float, help='Vowel gate threshold on base probs')
+    parser.add_argument('--tau-v', dest='tau_v', default=0.5, type=float, help='Vowel gate threshold on base probs')
     # Language weighting and curriculum
-    parser.add_argument('--tone-lang-weight', default=0.0, type=float, help='Scaling for English-only labels')
+    parser.add_argument('--lang-weight', dest='lang_weight', default=0.0, type=float, help='Scaling for English-only labels')
     parser.add_argument('--tone-warmup-iters', default=10000, type=int, help='Warmup iters with pure CTC (no tone)')
     parser.add_argument('--tone-ramp-iters', default=20000, type=int, help='Ramp iters to reach full lambda-tone')
     # Optional guard penalty (disabled by default)

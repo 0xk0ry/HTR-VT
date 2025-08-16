@@ -15,6 +15,7 @@ from functools import partial
 import random
 import numpy as np
 import torch.nn.functional as F
+import numpy as np
 
 
 def compute_loss(
@@ -36,8 +37,14 @@ def compute_loss(
     use_masking: bool = True,
 ):
     # Forward model: get base and tone logits
-    outputs = model(image, args.mask_ratio,
-                    args.max_span_length, use_masking=use_masking)
+    # Span masking warm-up
+    if use_masking and getattr(args, 'mask_warmup_iters', 0) > 0:
+        progress = min(1.0, float(global_step) / float(max(1, args.mask_warmup_iters)))
+        mask_ratio_eff = getattr(args, 'mask_ratio_min', 0.0) + (getattr(args, 'mask_ratio', 0.0) - getattr(args, 'mask_ratio_min', 0.0)) * progress
+    else:
+        mask_ratio_eff = getattr(args, 'mask_ratio', 0.0)
+    outputs = model(image, mask_ratio_eff,
+                    args.max_span_length, use_masking=use_masking and getattr(args, 'use_masking', False))
     if isinstance(outputs, (list, tuple)):
         base_logits, tone_logits = outputs
     else:
@@ -45,13 +52,11 @@ def compute_loss(
         base_logits, tone_logits = outputs, None
     base_logits = base_logits.float()
 
-    # CTC loss on base logits
+    # CTC loss on base logits (fp32, normalized by total target lengths)
     preds_size = torch.IntTensor([base_logits.size(1)] * batch_size).cuda()
     log_probs_tbc = base_logits.permute(1, 0, 2).log_softmax(2)
-    torch.backends.cudnn.enabled = False
-    ctc_loss = criterion(log_probs_tbc, text.cuda(),
-                         preds_size, length.cuda()).mean()
-    torch.backends.cudnn.enabled = True
+    ctc_per = criterion(log_probs_tbc, text.cuda(), preds_size, length.cuda())
+    ctc_loss = ctc_per.sum() / (length.cuda().float().sum().clamp_min(1.0))
 
     logs = {
         'ctc_loss': ctc_loss.detach().item(),
@@ -69,7 +74,7 @@ def compute_loss(
         'tone_none_rate_on_vowel': 0.0,
         'tone_conf_margin': 0.0,
         'tone_class_support': {},
-        'mask_ratio_effective': float(getattr(args, 'mask_ratio', 0.0)),
+    'mask_ratio_effective': float(mask_ratio_eff),
         'mask_span_hits': 0.0,
     }
 
@@ -94,7 +99,8 @@ def compute_loss(
     conf_margins = []
     class_support_counts = torch.zeros(6, device=base_logits.device)
 
-    if tone_logits is not None:
+    lambda_guard = float(getattr(args, 'lambda_guard', 0.0))
+    if tone_logits is not None and (lambda_eff > 0.0 or lambda_guard > 0.0):
         # Get base probabilities for gating
         base_probs = F.softmax(base_logits, dim=-1)  # (B, T, C)
         # Vowel indices from converter
@@ -111,7 +117,7 @@ def compute_loss(
         else:
             m_t = torch.ones(base_probs.shape[:2], device=base_probs.device)
 
-        # Tone probabilities
+    # Tone probabilities
         tone_log_probs = F.log_softmax(tone_logits, dim=-1)  # (B, T, 6)
         tone_probs = tone_log_probs.exp()
 
@@ -186,7 +192,6 @@ def compute_loss(
                 gate_b = m_t[b]
 
             # Guard loss: encourage NONE on non-vowel frames
-            lambda_guard = float(getattr(args, 'lambda_guard', 0.0))
             if lambda_guard > 0.0:
                 none_logp = tone_log_probs[b, :, 0]  # (T,)
                 inv_gate = (1 - gate_b)
@@ -265,7 +270,7 @@ def compute_loss(
             guard_loss_total = torch.stack(guard_losses).mean()
             logs['guard_loss'] = guard_loss_total.detach().item()
 
-        # Finalize diagnostics
+    # Finalize diagnostics
         if len(frames_per_vowel_list) > 0:
             logs['frames_per_vowel'] = float(torch.tensor(
                 frames_per_vowel_list, device=base_logits.device).mean().item())
@@ -443,9 +448,46 @@ def main():
     logger.info('Loading train loader...')
     train_dataset = dataset.myLoadDS(
         args.train_data_list, args.data_path, args.img_size)
+    # Optional: bucket by target length for more stable CTC
+    sampler = None
+    shuffle_flag = True
+    if getattr(args, 'bucket_by_length', False):
+        from torch.utils.data import Sampler
+        class LengthBucketSampler(Sampler):
+            def __init__(self, lengths, batch_size, num_buckets=10, shuffle=True):
+                self.batch_size = batch_size
+                self.shuffle = shuffle
+                lengths = np.array(lengths)
+                quantiles = np.quantile(lengths, np.linspace(0, 1, num_buckets + 1))
+                self.buckets = [[] for _ in range(num_buckets)]
+                for idx, L in enumerate(lengths):
+                    b = min(num_buckets - 1, int(np.searchsorted(quantiles, L, side='right') - 1))
+                    self.buckets[b].append(idx)
+                self._regen()
+            def _regen(self):
+                indices = []
+                for bucket in self.buckets:
+                    if self.shuffle:
+                        random.shuffle(bucket)
+                    for i in range(0, len(bucket), self.batch_size):
+                        indices.extend(bucket[i:i + self.batch_size])
+                if self.shuffle:
+                    random.shuffle(indices)
+                self.flat = indices
+            def __iter__(self):
+                if self.shuffle:
+                    self._regen()
+                return iter(self.flat)
+            def __len__(self):
+                return len(self.flat)
+        label_lengths = [len(t) for t in train_dataset.tlbls]
+        nb = max(4, min(20, int(np.sqrt(max(1, len(label_lengths))))))
+        sampler = LengthBucketSampler(label_lengths, args.train_bs, num_buckets=nb, shuffle=True)
+        shuffle_flag = False
     train_loader = torch.utils.data.DataLoader(train_dataset,
                                                batch_size=args.train_bs,
-                                               shuffle=True,
+                                               shuffle=shuffle_flag if sampler is None else False,
+                                               sampler=sampler,
                                                pin_memory=True,
                                                num_workers=args.num_workers,
                                                collate_fn=partial(dataset.SameTrCollate, args=args))
@@ -475,10 +517,36 @@ def main():
         quick_val_loader = None
 
     logger.info('Initializing optimizer, criterion and converter...')
-    optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
-                        lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
+    # Keep cuDNN disabled once to avoid per-call toggles with CTCLoss
+    torch.backends.cudnn.enabled = False
     converter = utils.CTCLabelConverter(train_dataset.ralph.values())
+    # Ensure model head matches vocabulary size
+    vocab_size = len(converter.character)
+    if getattr(model.head, 'out_features', None) != vocab_size:
+        logger.warning(f"Adjusting model head from {getattr(model.head, 'out_features', 'unknown')} to vocab size {vocab_size}")
+        model.head = torch.nn.Linear(model.head.in_features, vocab_size).cuda()
+
+    # Parameter groups (3 buckets): no_wd, base_wd, tone_wd
+    no_wd, base_wd, tone_wd = [], [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if n.endswith('bias') or 'norm' in n.lower() or 'pos_embed' in n:
+            no_wd.append(p)
+        elif 'tone_head' in n:
+            tone_wd.append(p)
+        else:
+            base_wd.append(p)
+    param_groups = [
+        {'params': no_wd,  'weight_decay': 0.0,                                                     'lr': args.max_lr},
+        {'params': base_wd,'weight_decay': args.weight_decay,                                       'lr': args.max_lr},
+        {'params': tone_wd,'weight_decay': getattr(args, 'tone_weight_decay', args.weight_decay),   'lr': args.max_lr},
+    ]
+    if getattr(args, 'use_sam', False):
+        optimizer = sam.SAM(param_groups, torch.optim.AdamW, lr=args.max_lr, betas=(0.9, 0.98), weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.98), eps=1e-8)
 
     # Load optimizer state after initialization
     if optimizer_state is not None:
@@ -517,6 +585,13 @@ def main():
     for nb_iter in range(start_iter, args.total_iter):
         optimizer, current_lr = utils.update_lr_cos(
             nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer)
+        # Warmup-aware LR multipliers: during warmup use 1.0, after warmup apply base/tone multipliers
+        after_warmup = nb_iter >= args.warm_up_iter
+        base_mul = (getattr(args, 'base_lr_mult', 0.5) if after_warmup else 1.0)
+        tone_mul = (getattr(args, 'tone_lr_mult', 2.0) if after_warmup else 1.0)
+        for i, pg in enumerate(optimizer.param_groups):
+            mul = tone_mul if i == 2 else base_mul
+            pg['lr'] = current_lr * mul
 
         optimizer.zero_grad()
         batch = next(train_iter)
@@ -549,26 +624,34 @@ def main():
                 param_norm = p.grad.data.norm(2).item()
                 total_norm_sq += param_norm * param_norm
         grad_norm = float(total_norm_sq ** 0.5)
-        optimizer.first_step(zero_grad=True)
-        compute_loss(
-            args,
-            model,
-            image,
-            batch_size,
-            criterion,
-            text,
-            length,
-            batch[1],
-            converter,
-            args.tau_v,
-            args.lambda_tone,
-            args.tone_loss,
-            args.focal_gamma,
-            args.lang_weight,
-            nb_iter,
-            use_masking=False,
-        )[0].backward()
-        optimizer.second_step(zero_grad=True)
+        if getattr(args, 'use_sam', False):
+            # Optional pre-clip before first SAM step if spikes observed
+            if getattr(args, 'sam_pre_clip', 0.0) and args.sam_pre_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.sam_pre_clip))
+            optimizer.first_step(zero_grad=True)
+            compute_loss(
+                args,
+                model,
+                image,
+                batch_size,
+                criterion,
+                text,
+                length,
+                batch[1],
+                converter,
+                args.tau_v,
+                args.lambda_tone,
+                args.tone_loss,
+                args.focal_gamma,
+                args.lang_weight,
+                nb_iter,
+                use_masking=False,
+            )[0].backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=getattr(args, 'grad_clip', 1.0))
+            optimizer.second_step(zero_grad=True)
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=getattr(args, 'grad_clip', 1.0))
+            optimizer.step()
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
 
@@ -604,13 +687,10 @@ def main():
                     else:
                         ema_base = ema_out
                     ema_base = ema_base.float()
-                    preds_size_ema = torch.IntTensor(
-                        [ema_base.size(1)] * batch_size).cuda()
+                    preds_size_ema = torch.IntTensor([ema_base.size(1)] * batch_size).cuda()
                     log_probs_ema = ema_base.permute(1, 0, 2).log_softmax(2)
-                    torch.backends.cudnn.enabled = False
-                    ctc_loss_ema = criterion(
-                        log_probs_ema, text, preds_size_ema, length).mean().item()
-                    torch.backends.cudnn.enabled = True
+                    ctc_per_ema = criterion(log_probs_ema, text, preds_size_ema, length)
+                    ctc_loss_ema = (ctc_per_ema.sum() / (length.float().sum().clamp_min(1.0))).item()
             except Exception:
                 ctc_loss_ema = 0.0
 
@@ -745,6 +825,11 @@ def main():
             for k, v in metrics.items():
                 if isinstance(v, (int, float)):
                     writer.add_scalar(f'metrics/{k}', v, nb_iter)
+            # One-time guardrail warning if T/U too low frequently
+            if metrics.get('align/pct_T_over_U_lt_1p5', 0.0) > 0.2 and nb_iter >= args.warm_up_iter:
+                if not hasattr(main, '_tu_warned'):
+                    logger.warning('T/U is low for a significant fraction of samples (>20%). Consider increasing temporal resolution (e.g., reduce horizontal stride or add a 1D upsampler).')
+                    setattr(main, '_tu_warned', True)
             # Additional text logs
             if 'tone_class_support' in loss_logs and isinstance(loss_logs['tone_class_support'], dict):
                 for name, frac in loss_logs['tone_class_support'].items():
