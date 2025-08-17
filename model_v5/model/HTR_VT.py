@@ -196,13 +196,13 @@ class MaskedAutoencoderViT(nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            # we use xavier_uniform following official JAX ViT:
             torch.nn.init.xavier_uniform_(m.weight)
-            if isinstance(m, nn.Linear) and m.bias is not None:
+            if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
 
     def generate_span_mask(self, x, mask_ratio, max_span_length):
         N, L, D = x.shape  # batch, length, dim
@@ -242,14 +242,13 @@ class MaskedAutoencoderViT(nn.Module):
         # To CTC Loss
         base = self.head(x)
         if self.use_dual_head:
-            logits_mod = self.head_mod(x)
-            logits_tone = self.head_tone(x)
-            out = {'base': base, 'mod': logits_mod, 'tone': logits_tone}
-            out = {k: self.layer_norm(v) for k, v in out.items()}
-            return out
+            mod  = self.head_mod(x)
+            tone = self.head_tone(x)
+            return {'base': base, 'mod': mod, 'tone': tone}
         else:
-            base = self.layer_norm(base)
             return base
+
+
 
 
 def create_model(nb_cls, img_size, **kwargs):

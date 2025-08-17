@@ -13,8 +13,8 @@ import numpy as np
 def SameTrCollate(batch, args):
 
     images, labels = zip(*batch)
-    images = [Image.fromarray(np.uint8(images[i][0] * 255))
-              for i in range(len(images))]
+    # Pre-convert to PIL in a single pass
+    images = [Image.fromarray(np.uint8(img[0] * 255)) for img in images]
 
     # Apply data augmentations with 90% probability
     if np.random.rand() < 0.5:
@@ -38,9 +38,8 @@ def SameTrCollate(batch, args):
 
     # Convert images to tensors
 
-    image_tensors = [torch.from_numpy(
-        np.array(image, copy=True)) for image in images]
-    image_tensors = torch.cat([t.unsqueeze(0) for t in image_tensors], 0)
+    image_tensors = [torch.from_numpy(np.array(image, copy=False)) for image in images]
+    image_tensors = torch.stack([t for t in image_tensors], 0)
     image_tensors = image_tensors.unsqueeze(1).float()
     image_tensors = image_tensors / 255.
     return image_tensors, labels
@@ -126,14 +125,7 @@ def get_labels(fnames):
     labels = []
     for id, image_file in enumerate(fnames):
         fn = os.path.splitext(image_file)[0] + '.txt'
-        # Read labels as UTF-8 to handle Vietnamese text on Windows
-        try:
-            with open(fn, 'r', encoding='utf-8') as f:
-                lbl = f.read()
-        except UnicodeDecodeError:
-            # Attempt UTF-8 with BOM
-            with open(fn, 'r', encoding='utf-8-sig') as f:
-                lbl = f.read()
+        lbl = open(fn, 'r').read()
         lbl = ' '.join(lbl.split())  # remove linebreaks if present
 
         labels.append(lbl)
