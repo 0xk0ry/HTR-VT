@@ -16,6 +16,7 @@ import random
 import numpy as np
 import re
 import importlib
+from utils import vn_tags
 
 
 def compute_loss(args, model, image, batch_size, criterion, enc):
@@ -80,6 +81,13 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
         y_mod = tags_mod_list[b].detach().cpu().tolist()  # 0..3
         y_tone = tags_tone_list[b].detach().cpu().tolist()  # 0..5
 
+        # Build vowel mask from GT base indices (uses utils.build_base_charset to map indices->chars)
+        base_charset_str = utils.build_base_charset()
+        Cb = len(base_charset_str)
+        # base_chars: length U, empty string for out-of-range indices
+        base_chars = [base_charset_str[idx - 1] if 1 <= idx <= Cb else '' for idx in y]
+        vowel_mask = torch.tensor([vn_tags.is_vowel(ch) for ch in base_chars], device=base.device, dtype=torch.float32)
+
         # Build run-length segments from best-path over frames
         frames = base_argmax[b].detach().cpu().tolist()  # [T]
         # list of (cls_idx, [frame_indices]) excluding blanks (0)
@@ -108,8 +116,10 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
         # Map GT positions to matching segments in order (greedy)
         seg_ptr = 0
         matched = 0
-        mod_losses_u = []
-        tone_losses_u = []
+        # per-character CE placeholders (so we can mask by vowel positions later)
+        ce_mod_u = torch.zeros(U, device=base.device)
+        ce_tone_u = torch.zeros(U, device=base.device)
+        have_pred = torch.zeros(U, device=base.device)
         for u in range(U):
             yt = y[u]
             # advance seg_ptr to the next segment matching current GT class
@@ -126,21 +136,22 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
             lpm = logp_mod[b, t_idx, :].mean(dim=0)  # [4]
             lpt = logp_tone[b, t_idx, :].mean(dim=0)  # [6]
             # CE = -log p[target]
-            mod_losses_u.append(-lpm[y_mod[u]].clamp_min(-60.0))
-            tone_losses_u.append(-lpt[y_tone[u]].clamp_min(-60.0))
+            ce_val_mod = (-lpm[y_mod[u]].clamp_min(-60.0))
+            ce_val_tone = (-lpt[y_tone[u]].clamp_min(-60.0))
+            ce_mod_u[u] = ce_val_mod
+            ce_tone_u[u] = ce_val_tone
+            have_pred[u] = 1.0
             matched += 1
+        # Masked average over vowel positions where we had predictions
+        eps_mask = 1e-6
+        denom = (vowel_mask * have_pred).sum() + eps_mask
+        L_mod = (vowel_mask * have_pred * ce_mod_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
+        L_tone = (vowel_mask * have_pred * ce_tone_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
+        batch_mod_losses.append(L_mod)
+        batch_tone_losses.append(L_tone)
 
-        if len(mod_losses_u) > 0:
-            batch_mod_losses.append(torch.stack(mod_losses_u).mean())
-        else:
-            batch_mod_losses.append(torch.tensor(0.0, device=base.device))
-        if len(tone_losses_u) > 0:
-            batch_tone_losses.append(torch.stack(tone_losses_u).mean())
-        else:
-            batch_tone_losses.append(torch.tensor(0.0, device=base.device))
-
-    mod_loss = torch.stack(batch_mod_losses).mean()
-    tone_loss = torch.stack(batch_tone_losses).mean()
+        mod_loss = torch.stack(batch_mod_losses).mean()
+        tone_loss = torch.stack(batch_tone_losses).mean()
 
     return base_loss + args.lambda_mod * mod_loss + args.lambda_tone * tone_loss
 
