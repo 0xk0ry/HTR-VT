@@ -104,6 +104,8 @@ def get_args_parser():
                         help='Loss weight for modifier head')
     parser.add_argument('--lambda-tone', default=0.7, type=float,
                         help='Loss weight for tone head')
+    parser.add_argument('--consonant-weight', default=0.2, type=float,
+                        help='Weight for consonants in tag CE averaging (alpha). Vowels get weight 1.0')
 
     # Encoder-Decoder specific arguments
     parser.add_argument('--model-type', default='ctc', type=str, choices=['ctc', 'encoder_decoder'],

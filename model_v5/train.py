@@ -194,12 +194,14 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
         ce_mod_u = -torch.log(torch.gather(pooled_mod.clamp_min(1e-8), 1, y_mod.view(-1, 1)).squeeze(1))
         ce_tone_u = -torch.log(torch.gather(pooled_tone.clamp_min(1e-8), 1, y_tone.view(-1, 1)).squeeze(1))
 
-        # Average over vowel positions only
-        vowel_mask = vowel_lookup[y]
-        denom = vowel_mask.sum()
+        # Weighted average: vowels=1, consonants=alpha
+        vowel_mask = vowel_lookup[y]  # {0,1}
+        alpha = float(getattr(args, 'consonant_weight', 0.2))
+        weights_u = vowel_mask + alpha * (1.0 - vowel_mask)
+        denom = weights_u.sum()
         if float(denom.item()) > 0:
-            L_mod = (vowel_mask * ce_mod_u).sum() / (denom + eps)
-            L_tone = (vowel_mask * ce_tone_u).sum() / (denom + eps)
+            L_mod = (weights_u * ce_mod_u).sum() / (denom + eps)
+            L_tone = (weights_u * ce_tone_u).sum() / (denom + eps)
         else:
             L_mod = torch.tensor(0.0, device=base.device)
             L_tone = torch.tensor(0.0, device=base.device)
