@@ -96,6 +96,8 @@ def get_args_parser():
                         help='Exponential Moving Average (EMA) decay')
     parser.add_argument('--alpha', default=0, type=float,
                         help='kld loss ratio')
+    parser.add_argument('--tag-alpha', default=0.2, type=float,
+                        help='Consonant weight for tag CE averaging (vowel=1, consonant=alpha)')
 
     # Dual-head feature flag and loss weights
     parser.add_argument('--use-dual-head', action='store_true', default=False,
