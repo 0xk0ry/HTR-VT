@@ -11,12 +11,101 @@ from utils import sam
 from utils import option
 from data import dataset
 from model import HTR_VT
+from utils import vn_tags
 from functools import partial
 import random
 import numpy as np
 import re
 import importlib
-from utils import vn_tags
+
+
+def _ctc_compute_gamma_logspace(logp_t_c, y_u):
+    """
+    Compute CTC posteriors gamma_{t,u} in log-space for a single sample.
+
+    Args:
+        logp_t_c: Tensor [T, C] of log probabilities (log_softmax) over base classes, C includes blank at index 0.
+        y_u: LongTensor [U] of target class indices in 1..C-1 (no blanks).
+
+    Returns:
+        weights: Tensor [U, T] where each row u is normalized over t to sum to 1 (or 0 if degenerate).
+                 Detached (no grad) by default for stability.
+    """
+    device = logp_t_c.device
+    T, C = logp_t_c.shape
+    U = int(y_u.numel())
+    if U == 0 or T == 0:
+        return torch.zeros((0, T), device=device)
+
+    # Build extended target sequence l' with blanks inserted: [blank, y1, blank, y2, ..., blank]
+    S = 2 * U + 1
+    blank = 0
+    lprime = torch.full((S,), blank, dtype=torch.long, device=device)
+    lprime[1::2] = y_u  # odd positions are labels
+
+    # alpha and beta in log-space
+    neg_inf = -1e9
+    alpha = torch.full((T, S), neg_inf, device=device)
+    beta = torch.full((T, S), neg_inf, device=device)
+
+    # Initialization (t=0)
+    alpha[0, 0] = logp_t_c[0, lprime[0]]
+    if S > 1:
+        alpha[0, 1] = logp_t_c[0, lprime[1]]
+
+    # Forward recursion
+    for t in range(1, T):
+        lp = logp_t_c[t]
+        # vectorized over s
+        stay = alpha[t - 1]
+        shift1 = torch.full((S,), neg_inf, device=device)
+        shift1[1:] = alpha[t - 1, :-1]
+        shift2 = torch.full((S,), neg_inf, device=device)
+        # allowed skip from s-2 if current label not blank and not equal to l'[s-2]
+        mask_skip = torch.zeros((S,), dtype=torch.bool, device=device)
+        mask_skip[2:] = (lprime[2:] != blank) & (lprime[2:] != lprime[:-2])
+        shift2[mask_skip] = alpha[t - 1, :-2][mask_skip[2:]]
+        pre = torch.logsumexp(torch.stack((stay, shift1, shift2), dim=0), dim=0)
+        alpha[t] = pre + lp[lprime]
+
+    # Termination probability logZ
+    if S == 1:
+        logZ = alpha[T - 1, 0]
+    else:
+        logZ = torch.logsumexp(torch.stack((alpha[T - 1, S - 1], alpha[T - 1, S - 2])), dim=0)
+
+    # Backward initialization at t=T-1
+    beta[T - 1, S - 1] = 0.0
+    if S > 1:
+        beta[T - 1, S - 2] = 0.0
+
+    # Backward recursion
+    for t in range(T - 2, -1, -1):
+        lp_next = logp_t_c[t + 1]
+        # stay
+        stay = beta[t + 1] + lp_next[lprime]
+        # move to s+1
+        shift1 = torch.full((S,), neg_inf, device=device)
+        shift1[:-1] = beta[t + 1, 1:] + lp_next[lprime[1:]]
+        # skip to s+2 if allowed
+        shift2 = torch.full((S,), neg_inf, device=device)
+        mask_skip_f = torch.zeros((S,), dtype=torch.bool, device=device)
+        mask_skip_f[:-2] = (lprime[:-2] != blank) & (lprime[:-2] != lprime[2:])
+        shift2[mask_skip_f] = beta[t + 1, 2:][mask_skip_f[:-2]] + lp_next[lprime[2:]][mask_skip_f[:-2]]
+        beta[t] = torch.logsumexp(torch.stack((stay, shift1, shift2), dim=0), dim=0)
+
+    # Gammas for label positions (odd s) -> map to u index
+    s_idx = torch.arange(1, S, 2, device=device)  # odd positions
+    # gamma_log: [T, U]
+    gamma_log = alpha[:, s_idx] + beta[:, s_idx] - logZ
+    # Convert to weights over t per u (normalize over time)
+    # Avoid underflow by subtract max per column before exp
+    m = gamma_log.max(dim=0).values  # [U]
+    gamma = torch.exp(gamma_log - m)  # [T, U]
+    gamma = gamma.clamp_min(0)
+    w = gamma / (gamma.sum(dim=0, keepdim=True) + 1e-8)  # [T, U]
+    # Return [U, T]
+    return w.transpose(0, 1).detach()
 
 
 def compute_loss(args, model, image, batch_size, criterion, enc):
@@ -24,10 +113,10 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
     enc: output of converter.encode(labels). For CTC converter it's (text, length),
          for DualLabelConverter it's (text_base, length_base, tags_mod, tags_tone, per_sample_U)
     """
-    outputs = model(image, args.mask_ratio,
-                    args.max_span_length, use_masking=True)
+    outputs = model(image, args.mask_ratio, args.max_span_length, use_masking=True)
     use_dual = isinstance(outputs, dict)
 
+    # Single-head CTC path
     if not use_dual:
         text, length = enc
         preds = outputs.float()
@@ -38,120 +127,87 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
         torch.backends.cudnn.enabled = True
         return loss
 
-    # Dual-head path
+    # Dual-head: base CTC + tag losses with gamma pooling
     text_base, length_base, tags_mod_list, tags_tone_list, _ = enc
-    base = outputs['base'].float()  # [B, T, Cb]
-    mod_logits = outputs['mod'].float()  # [B, T, 4]
-    tone_logits = outputs['tone'].float()  # [B, T, 6]
-    T = base.size(1)
+    base = outputs['base'].float()          # [B, T, Cb]
+    mod_logits = outputs['mod'].float()     # [B, T, 4]
+    tone_logits = outputs['tone'].float()   # [B, T, 6]
+
+    T = int(base.size(1))
     preds_size = torch.IntTensor([T] * batch_size).to(base.device)
 
-
-    # Base CTC (unchanged)
+    # Base CTC loss
     base_logp = base.permute(1, 0, 2).log_softmax(2)
     torch.backends.cudnn.enabled = False
-    base_loss = criterion(base_logp, text_base.to(base.device),
-                        preds_size, length_base.to(base.device)).mean()
+    base_loss = criterion(base_logp, text_base.to(base.device), preds_size, length_base.to(base.device)).mean()
     torch.backends.cudnn.enabled = True
 
-    # Best-path alignment proxy for tags (greedy, run-length, map to GT order)
-    with torch.no_grad():
-        # frame-wise argmax over base classes
-        base_argmax = base.argmax(dim=2)  # [B, T]
-
+    # Tag losses via gamma pooling
     eps = 1e-8
     batch_mod_losses = []
     batch_tone_losses = []
 
-    # Prepare cumulative offsets to slice text_base flat
-    lengths_cpu = length_base.detach().cpu().tolist()
-    flat_indices = text_base.detach().cpu().tolist()
+    # Offsets for slicing flattened targets per sample
+    lengths_cpu = [int(x) for x in length_base.detach().cpu().tolist()]
     offs = [0]
     for l in lengths_cpu:
         offs.append(offs[-1] + l)
 
-    # Use log_softmax once (faster + more stable than softmax + log)
-    logp_mod = torch.nn.functional.log_softmax(mod_logits, dim=2)
-    logp_tone = torch.nn.functional.log_softmax(tone_logits, dim=2)
+    # Frame-wise probabilities for tag heads
+    mod_sm = torch.softmax(mod_logits, dim=2)   # [B, T, 4]
+    tone_sm = torch.softmax(tone_logits, dim=2) # [B, T, 6]
+
+    # Vowel mask lookup for base class ids (0 is blank)
+    base_charset_str = utils.build_base_charset()
+    vowel_lookup = torch.tensor(
+        [0] + [1 if vn_tags.is_vowel(ch) else 0 for ch in base_charset_str],
+        device=base.device,
+        dtype=torch.float32,
+    )
+
+    # Log-probs for base to run CTC forward–backward per sample
+    logp_base = torch.log_softmax(base, dim=2)  # [B, T, Cb]
 
     for b in range(batch_size):
-        # Ground-truth indices for this sample (1..Cb-1); 0 is blank
-        y = flat_indices[offs[b]:offs[b+1]]  # length U
-        U = len(y)
-        y_mod = tags_mod_list[b].detach().cpu().tolist()  # 0..3
-        y_tone = tags_tone_list[b].detach().cpu().tolist()  # 0..5
+        # Targets for this sample
+        y = text_base[offs[b]:offs[b + 1]].to(base.device).long()  # [U]
+        U = int(y.numel())
+        if U == 0:
+            batch_mod_losses.append(torch.tensor(0.0, device=base.device))
+            batch_tone_losses.append(torch.tensor(0.0, device=base.device))
+            continue
 
-        # Build vowel mask from GT base indices (uses utils.build_base_charset to map indices->chars)
-        base_charset_str = utils.build_base_charset()
-        Cb = len(base_charset_str)
-        # base_chars: length U, empty string for out-of-range indices
-        base_chars = [base_charset_str[idx - 1] if 1 <= idx <= Cb else '' for idx in y]
-        vowel_mask = torch.tensor([vn_tags.is_vowel(ch) for ch in base_chars], device=base.device, dtype=torch.float32)
+        # Gamma weights over time for each label position: [U, T]
+        with torch.no_grad():
+            w_ut = _ctc_compute_gamma_logspace(logp_base[b], y)  # [U, T]
+        # Renormalize per label to avoid tiny drift
+        w_sum = w_ut.sum(dim=1, keepdim=True)
+        w_ut = torch.where(w_sum > 0, w_ut / (w_sum + eps), w_ut)
 
-        # Build run-length segments from best-path over frames
-        frames = base_argmax[b].detach().cpu().tolist()  # [T]
-        # list of (cls_idx, [frame_indices]) excluding blanks (0)
-        segments = []
-        prev = None
-        current_frames = []
-        for t, k in enumerate(frames):
-            if k == 0:
-                # blank: break segment
-                if prev is not None:
-                    segments.append((prev, current_frames))
-                    prev = None
-                    current_frames = []
-                continue
-            if prev is None or k != prev:
-                # start new segment
-                if prev is not None and current_frames:
-                    segments.append((prev, current_frames))
-                prev = int(k)
-                current_frames = [t]
-            else:
-                current_frames.append(t)
-        if prev is not None and current_frames:
-            segments.append((prev, current_frames))
+        # Gamma-weighted pooling of tag probabilities
+        pooled_mod = w_ut @ mod_sm[b]    # [U, 4]
+        pooled_tone = w_ut @ tone_sm[b]  # [U, 6]
 
-        # Map GT positions to matching segments in order (greedy)
-        seg_ptr = 0
-        matched = 0
-        # per-character CE placeholders (so we can mask by vowel positions later)
-        ce_mod_u = torch.zeros(U, device=base.device)
-        ce_tone_u = torch.zeros(U, device=base.device)
-        have_pred = torch.zeros(U, device=base.device)
-        for u in range(U):
-            yt = y[u]
-            # advance seg_ptr to the next segment matching current GT class
-            while seg_ptr < len(segments) and segments[seg_ptr][0] != yt:
-                seg_ptr += 1
-            if seg_ptr >= len(segments):
-                # no frames for this label; skip
-                continue
-            _, t_idx = segments[seg_ptr]
-            seg_ptr += 1
-            if not t_idx:
-                continue
-            # Aggregate probabilities over frames in this segment
-            lpm = logp_mod[b, t_idx, :].mean(dim=0)  # [4]
-            lpt = logp_tone[b, t_idx, :].mean(dim=0)  # [6]
-            # CE = -log p[target]
-            ce_val_mod = (-lpm[y_mod[u]].clamp_min(-60.0))
-            ce_val_tone = (-lpt[y_tone[u]].clamp_min(-60.0))
-            ce_mod_u[u] = ce_val_mod
-            ce_tone_u[u] = ce_val_tone
-            have_pred[u] = 1.0
-            matched += 1
-        # Masked average over vowel positions where we had predictions
-        eps_mask = 1e-6
-        denom = (vowel_mask * have_pred).sum() + eps_mask
-        L_mod = (vowel_mask * have_pred * ce_mod_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
-        L_tone = (vowel_mask * have_pred * ce_tone_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
+        # CE on pooled distributions
+        y_mod = tags_mod_list[b].to(base.device).long()   # [U]
+        y_tone = tags_tone_list[b].to(base.device).long() # [U]
+        ce_mod_u = -torch.log(torch.gather(pooled_mod.clamp_min(1e-8), 1, y_mod.view(-1, 1)).squeeze(1))
+        ce_tone_u = -torch.log(torch.gather(pooled_tone.clamp_min(1e-8), 1, y_tone.view(-1, 1)).squeeze(1))
+
+        # Average over vowel positions only
+        vowel_mask = vowel_lookup[y]
+        denom = vowel_mask.sum()
+        if float(denom.item()) > 0:
+            L_mod = (vowel_mask * ce_mod_u).sum() / (denom + eps)
+            L_tone = (vowel_mask * ce_tone_u).sum() / (denom + eps)
+        else:
+            L_mod = torch.tensor(0.0, device=base.device)
+            L_tone = torch.tensor(0.0, device=base.device)
         batch_mod_losses.append(L_mod)
         batch_tone_losses.append(L_tone)
 
-        mod_loss = torch.stack(batch_mod_losses).mean()
-        tone_loss = torch.stack(batch_tone_losses).mean()
+    mod_loss = torch.stack(batch_mod_losses).mean()
+    tone_loss = torch.stack(batch_tone_losses).mean()
 
     return base_loss + args.lambda_mod * mod_loss + args.lambda_tone * tone_loss
 
@@ -189,7 +245,8 @@ def main():
     else:
         full_charset_str = utils.build_full_charset()
         nb_cls = len(full_charset_str) + 1
-    model = HTR_VT.create_model(nb_cls=nb_cls, img_size=args.img_size[::-1], use_dual_head=args.use_dual_head)
+    model = HTR_VT.create_model(
+        nb_cls=nb_cls, img_size=args.img_size[::-1], use_dual_head=args.use_dual_head)
 
     total_param = sum(p.numel() for p in model.parameters())
     logger.info('total_param is {}'.format(total_param))
