@@ -17,7 +17,7 @@ import numpy as np
 import re
 import importlib
 from utils import vn_tags
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 
 def compute_loss(args, model, image, batch_size, criterion, enc):
@@ -301,7 +301,7 @@ def main():
         batch_size = image.size(0)
 
         # First forward/backward under autocast
-        with autocast(dtype=amp_dtype, enabled=use_amp):
+        with autocast('cuda', dtype=amp_dtype, enabled=use_amp):
             loss = compute_loss(args, model, image, batch_size, criterion, enc)
 
         if scaler.is_enabled():
@@ -313,7 +313,7 @@ def main():
         optimizer.first_step(zero_grad=True)
 
         # Second forward/backward under autocast
-        with autocast(dtype=amp_dtype, enabled=use_amp):
+        with autocast('cuda', dtype=amp_dtype, enabled=use_amp):
             loss2 = compute_loss(args, model, image, batch_size, criterion, enc)
 
         if scaler.is_enabled():
