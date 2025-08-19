@@ -17,6 +17,7 @@ import numpy as np
 import re
 import importlib
 from utils import vn_tags
+from torch.cuda.amp import autocast, GradScaler
 
 
 def compute_loss(args, model, image, batch_size, criterion, enc):
@@ -201,13 +202,26 @@ def main():
     total_param = sum(p.numel() for p in model.parameters())
     logger.info('total_param is {}'.format(total_param))
 
+    # Performance toggles
+    cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision('high')  # enable TF32 if supported
+    except Exception:
+        pass
+
     model.train()
-    model = model.cuda()
+    model = model.cuda().to(memory_format=torch.channels_last)
     # Ensure EMA decay is properly accessed (handle both ema_decay and ema-decay)
     ema_decay = getattr(args, 'ema_decay', 0.9999)
     logger.info(f"Using EMA decay: {ema_decay}")
     model_ema = utils.ModelEma(model, ema_decay)
     model.zero_grad()
+
+    # AMP setup: prefer BF16 if supported (no GradScaler needed); otherwise use FP16 with GradScaler
+    use_amp = torch.cuda.is_available()
+    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
+    scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    logger.info(f"AMP enabled: {use_amp}, dtype: {str(amp_dtype)}; GradScaler: {scaler.is_enabled()}")
 
     # Use centralized checkpoint loader like model_v4-2
     resume_path = args.resume if getattr(
@@ -243,7 +257,11 @@ def main():
         prefetch_factor=2,
     )
 
-    optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
+    # Use fused AdamW when available (PyTorch 2.0+ with CUDA)
+    fused_ok = torch.cuda.is_available() and hasattr(torch.optim, 'AdamW') and \
+        'fused' in torch.optim.AdamW.__init__.__code__.co_varnames
+    base_opt = partial(torch.optim.AdamW, fused=True) if fused_ok else torch.optim.AdamW
+    optimizer = sam.SAM(model.parameters(), base_opt,
                         lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
     if args.use_dual_head:
@@ -270,19 +288,43 @@ def main():
     logger.info('Start training...')
     for nb_iter in range(start_iter, args.total_iter):
 
+        # Update LR
         optimizer, current_lr = utils.update_lr_cos(
-            nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer)
+            nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer
+        )
 
+        # Get batch
         optimizer.zero_grad()
         batch = next(train_iter)
-        image = batch[0].cuda(non_blocking=True)
+        image = batch[0].cuda(non_blocking=True).to(memory_format=torch.channels_last)
         enc = converter.encode(batch[1])
         batch_size = image.size(0)
-        loss = compute_loss(args, model, image, batch_size, criterion, enc)
-        loss.backward()
+
+        # First forward/backward under autocast
+        with autocast(dtype=amp_dtype, enabled=use_amp):
+            loss = compute_loss(args, model, image, batch_size, criterion, enc)
+
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+        else:
+            loss.backward()
+
         optimizer.first_step(zero_grad=True)
-        compute_loss(args, model, image, batch_size, criterion, enc).backward()
-        optimizer.second_step(zero_grad=True)
+
+        # Second forward/backward under autocast
+        with autocast(dtype=amp_dtype, enabled=use_amp):
+            loss2 = compute_loss(args, model, image, batch_size, criterion, enc)
+
+        if scaler.is_enabled():
+            scaler.scale(loss2).backward()
+            scaler.unscale_(optimizer)
+            optimizer.second_step(zero_grad=True)
+            scaler.update()
+        else:
+            loss2.backward()
+            optimizer.second_step(zero_grad=True)
+
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
         train_loss += loss.item()
