@@ -41,7 +41,7 @@ def validation(model, criterion, evaluation_loader, converter):
             text_for_loss, length_for_loss = enc[0], enc[1]
         else:
             text_for_loss, length_for_loss = enc
-    outs = model(image)
+        outs = model(image)
         use_dual = isinstance(outs, dict)
         base_logits = outs['base'] if use_dual else outs
         base_logits = base_logits.float()
