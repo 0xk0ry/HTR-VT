@@ -6,7 +6,7 @@ from utils import utils
 from utils import vn_tags
 import editdistance
 from difflib import SequenceMatcher
-from torch.cuda.amp import autocast
+# AMP removed per user request
 
 
 def validation(model, criterion, evaluation_loader, converter):
@@ -41,9 +41,7 @@ def validation(model, criterion, evaluation_loader, converter):
             text_for_loss, length_for_loss = enc[0], enc[1]
         else:
             text_for_loss, length_for_loss = enc
-        amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
-        with autocast(dtype=amp_dtype, enabled=torch.cuda.is_available()):
-            outs = model(image)
+    outs = model(image)
         use_dual = isinstance(outs, dict)
         base_logits = outs['base'] if use_dual else outs
         base_logits = base_logits.float()

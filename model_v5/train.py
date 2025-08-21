@@ -17,7 +17,7 @@ import numpy as np
 import re
 import importlib
 from utils import vn_tags
-from torch.amp import autocast, GradScaler
+# AMP removed per user request
 
 
 def compute_loss(args, model, image, batch_size, criterion, enc):
@@ -249,11 +249,7 @@ def main():
     model_ema = utils.ModelEma(model, ema_decay)
     model.zero_grad()
 
-    # AMP setup: prefer BF16 if supported (no GradScaler needed); otherwise use FP16 with GradScaler
-    use_amp = torch.cuda.is_available()
-    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
-    scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
-    logger.info(f"AMP enabled: {use_amp}, dtype: {str(amp_dtype)}; GradScaler: {scaler.is_enabled()}")
+    # AMP disabled per user request
 
     # Use centralized checkpoint loader like model_v4-2
     resume_path = args.resume if getattr(
@@ -332,30 +328,16 @@ def main():
         enc = converter.encode(batch[1])
         batch_size = image.size(0)
 
-        # First forward/backward under autocast
-        with autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-            loss = compute_loss(args, model, image, batch_size, criterion, enc)
-
-        if scaler.is_enabled():
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-        else:
-            loss.backward()
+        # First forward/backward (fp32)
+        loss = compute_loss(args, model, image, batch_size, criterion, enc)
+        loss.backward()
 
         optimizer.first_step(zero_grad=True)
 
-        # Second forward/backward under autocast
-        with autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-            loss2 = compute_loss(args, model, image, batch_size, criterion, enc)
-
-        if scaler.is_enabled():
-            scaler.scale(loss2).backward()
-            scaler.unscale_(optimizer)
-            optimizer.second_step(zero_grad=True)
-            scaler.update()
-        else:
-            loss2.backward()
-            optimizer.second_step(zero_grad=True)
+        # Second forward/backward (fp32)
+        loss2 = compute_loss(args, model, image, batch_size, criterion, enc)
+        loss2.backward()
+        optimizer.second_step(zero_grad=True)
 
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
