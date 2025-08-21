@@ -55,11 +55,7 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
                         preds_size, length_base.to(base.device)).mean()
     torch.backends.cudnn.enabled = True
 
-    # Best-path alignment proxy for tags (greedy, run-length, map to GT order)
-    with torch.no_grad():
-        # frame-wise argmax over base classes
-        base_argmax = base.argmax(dim=2)  # [B, T]
-
+    # CTC posterior (gamma) pooling for tag supervision
     eps = 1e-8
     batch_mod_losses = []
     batch_tone_losses = []
@@ -76,84 +72,120 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
     for l in lengths_cpu:
         offs.append(offs[-1] + l)
 
-    # Use log_softmax once (faster + more stable than softmax + log)
-    logp_mod = torch.nn.functional.log_softmax(mod_logits, dim=2)
-    logp_tone = torch.nn.functional.log_softmax(tone_logits, dim=2)
+    # Precompute log-softmax for tag heads; we'll use probs via exp()
+    logp_mod = torch.nn.functional.log_softmax(mod_logits, dim=2)  # [B, T, 4]
+    logp_tone = torch.nn.functional.log_softmax(tone_logits, dim=2)  # [B, T, 6]
+
+    def logsumexp_tensor(vals):
+        m = torch.max(vals)
+        return m + torch.log(torch.clamp(torch.exp(vals - m).sum(), min=eps))
 
     for b in range(batch_size):
-        # Ground-truth indices for this sample (1..Cb-1); 0 is blank
+        # Ground-truth base indices for this sample (1..Cb); 0 is blank
         y = flat_indices[offs[b]:offs[b+1]]  # length U
         U = len(y)
-        y_mod = tags_mod_list[b].detach().cpu().tolist()  # 0..3
-        y_tone = tags_tone_list[b].detach().cpu().tolist()  # 0..5
+        if U == 0:
+            # No characters => no tag loss for this sample
+            batch_mod_losses.append(torch.tensor(0.0, device=base.device))
+            batch_tone_losses.append(torch.tensor(0.0, device=base.device))
+            continue
 
-        # Build vowel mask from GT base indices (uses utils.build_base_charset to map indices->chars)
-        # base_chars: length U, empty string for out-of-range indices
+        y_mod = tags_mod_list[b].detach().cpu().tolist()  # [U]
+        y_tone = tags_tone_list[b].detach().cpu().tolist()  # [U]
+
+        # Vowel mask using ground-truth characters
         base_chars = [base_charset_str[idx - 1] if 1 <= idx <= Cb else '' for idx in y]
-        vowel_mask = torch.tensor([vn_tags.is_vowel(ch) for ch in base_chars], device=base.device, dtype=torch.float32)
+        vowel_mask = torch.tensor(
+            [vn_tags.is_vowel(ch) for ch in base_chars], device=base.device, dtype=torch.float32
+        )  # [U]
 
-        # Build run-length segments from best-path over frames
-        frames = base_argmax[b].detach().cpu().tolist()  # [T]
-        # list of (cls_idx, [frame_indices]) excluding blanks (0)
-        segments = []
-        prev = None
-        current_frames = []
-        for t, k in enumerate(frames):
-            if k == 0:
-                # blank: break segment
-                if prev is not None:
-                    segments.append((prev, current_frames))
-                    prev = None
-                    current_frames = []
-                continue
-            if prev is None or k != prev:
-                # start new segment
-                if prev is not None and current_frames:
-                    segments.append((prev, current_frames))
-                prev = int(k)
-                current_frames = [t]
-            else:
-                current_frames.append(t)
-        if prev is not None and current_frames:
-            segments.append((prev, current_frames))
+        # Base log-probs time-major for CTC DP: [T, C]
+        logp_base_bt = base_logp[:, b, :]  # [T, C]
+        T_b = logp_base_bt.size(0)
+        C = logp_base_bt.size(1)
 
-        # Map GT positions to matching segments in order (greedy)
-        seg_ptr = 0
-        matched = 0
-        # per-character CE placeholders (so we can mask by vowel positions later)
+        # Build extended target l' with blanks between and at ends
+        S = 2 * U + 1
+        lprime = torch.zeros(S, dtype=torch.long, device=base.device)
+        for u in range(U):
+            lprime[2 * u + 1] = int(y[u])
+
+        neg_inf = torch.tensor(-1e30, device=base.device)
+
+        # Forward DP (alpha): [T, S]
+        alpha = torch.full((T_b, S), neg_inf.item(), device=base.device)
+        alpha[0, 0] = logp_base_bt[0, 0]
+        if S > 1:
+            alpha[0, 1] = logp_base_bt[0, lprime[1]]
+        for t in range(1, T_b):
+            for s in range(S):
+                lp = logp_base_bt[t, lprime[s]]
+                a0 = alpha[t - 1, s]
+                a1 = alpha[t - 1, s - 1] if s - 1 >= 0 else neg_inf
+                a2 = neg_inf
+                if s - 2 >= 0 and lprime[s] != lprime[s - 2]:
+                    a2 = alpha[t - 1, s - 2]
+                alpha[t, s] = logsumexp_tensor(torch.stack((a0, a1, a2))) + lp
+
+        # logZ from final states (last blank or last label)
+        last_blank = alpha[T_b - 1, S - 1]
+        last_label = alpha[T_b - 1, S - 2] if S - 2 >= 0 else neg_inf
+        logZ = logsumexp_tensor(torch.stack((last_blank, last_label)))
+
+        # Backward DP (beta): [T, S]
+        beta = torch.full((T_b, S), neg_inf.item(), device=base.device)
+        beta[T_b - 1, S - 1] = 0.0
+        if S - 2 >= 0:
+            beta[T_b - 1, S - 2] = 0.0
+        for t in range(T_b - 2, -1, -1):
+            for s in range(S):
+                b0 = beta[t + 1, s] + logp_base_bt[t + 1, lprime[s]]
+                b1 = beta[t + 1, s + 1] + logp_base_bt[t + 1, lprime[s + 1]] if s + 1 < S else neg_inf
+                b2 = neg_inf
+                if s + 2 < S and lprime[s] != lprime[s + 2]:
+                    b2 = beta[t + 1, s + 2] + logp_base_bt[t + 1, lprime[s + 2]]
+                beta[t, s] = logsumexp_tensor(torch.stack((b0, b1, b2)))
+
+        # Posterior gamma over (t, s)
+        with torch.no_grad():
+            gamma_log = alpha + beta - logZ
+            gamma = torch.exp(gamma_log).clamp_min(0.0)  # [T, S]
+
+        # Per-character CE placeholders
         ce_mod_u = torch.zeros(U, device=base.device)
         ce_tone_u = torch.zeros(U, device=base.device)
         have_pred = torch.zeros(U, device=base.device)
-        for u in range(U):
-            yt = y[u]
-            # advance seg_ptr to the next segment matching current GT class
-            while seg_ptr < len(segments) and segments[seg_ptr][0] != yt:
-                seg_ptr += 1
-            if seg_ptr >= len(segments):
-                # no frames for this label; skip
+
+        # Tag probabilities per frame
+        p_mod_bt = torch.exp(logp_mod[b])  # [T, 4]
+        p_tone_bt = torch.exp(logp_tone[b])  # [T, 6]
+
+        for u_idx in range(U):
+            s_idx = 2 * u_idx + 1
+            if s_idx >= S:
                 continue
-            _, t_idx = segments[seg_ptr]
-            seg_ptr += 1
-            if not t_idx:
+            weights_t = gamma[:, s_idx]  # [T]
+            w_sum = weights_t.sum()
+            if w_sum <= eps:
                 continue
-            # Aggregate probabilities over frames in this segment
-            lpm = logp_mod[b, t_idx, :].mean(dim=0)  # [4]
-            lpt = logp_tone[b, t_idx, :].mean(dim=0)  # [6]
-            # CE = -log p[target]
-            ce_val_mod = (-lpm[y_mod[u]].clamp_min(-60.0))
-            ce_val_tone = (-lpt[y_tone[u]].clamp_min(-60.0))
-            ce_mod_u[u] = ce_val_mod
-            ce_tone_u[u] = ce_val_tone
-            have_pred[u] = 1.0
-            matched += 1
+            w_norm = (weights_t / w_sum).detach()  # stop-grad through gamma
+
+            # Expected tag distributions for this character
+            p_mod_u = (w_norm.unsqueeze(-1) * p_mod_bt).sum(dim=0)  # [4]
+            p_tone_u = (w_norm.unsqueeze(-1) * p_tone_bt).sum(dim=0)  # [6]
+
+            ce_val_mod = -torch.log(p_mod_u[y_mod[u_idx]].clamp_min(1e-8))
+            ce_val_tone = -torch.log(p_tone_u[y_tone[u_idx]].clamp_min(1e-8))
+            ce_mod_u[u_idx] = ce_val_mod
+            ce_tone_u[u_idx] = ce_val_tone
+            have_pred[u_idx] = 1.0
+
         # Masked average over vowel positions where we had predictions
-        # weights = 1 for vowels, alpha for consonants
-        weights = vowel_mask + tag_alpha * (1.0 - vowel_mask)
-        eff_w = weights * have_pred
-        eps_mask = 1e-6
-        denom = eff_w.sum() + eps_mask
-        L_mod = (eff_w * ce_mod_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
-        L_tone = (eff_w * ce_tone_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
+        weights_chars = vowel_mask + tag_alpha * (1.0 - vowel_mask)
+        eff_w = weights_chars * have_pred
+        denom = eff_w.sum()
+        L_mod = (eff_w * ce_mod_u).sum() / (denom + 1e-6) if denom > 0 else torch.tensor(0.0, device=base.device)
+        L_tone = (eff_w * ce_tone_u).sum() / (denom + 1e-6) if denom > 0 else torch.tensor(0.0, device=base.device)
         batch_mod_losses.append(L_mod)
         batch_tone_losses.append(L_tone)
 
