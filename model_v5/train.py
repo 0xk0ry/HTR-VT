@@ -60,9 +60,14 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
     batch_mod_losses = []
     batch_tone_losses = []
 
-    # Build once per batch
-    base_charset_str = utils.build_base_charset()
-    Cb = len(base_charset_str)
+    # Cache base charset + vowel mask (per run) to avoid rebuilding each call
+    if not hasattr(args, '_base_is_vowel_cache'):
+        base_charset_str = utils.build_base_charset()
+        args._base_charset_len = len(base_charset_str)
+        args._base_is_vowel_cache = torch.tensor(
+            [vn_tags.is_vowel(ch) for ch in base_charset_str], dtype=torch.bool, device=base.device)
+    Cb = args._base_charset_len
+    base_is_vowel = args._base_is_vowel_cache  # [Cb]
     tag_alpha = getattr(args, 'tag_alpha', 0.2)
 
     # Prepare cumulative offsets to slice text_base flat
@@ -77,8 +82,7 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
     logp_tone = torch.nn.functional.log_softmax(tone_logits, dim=2)  # [B, T, 6]
 
     def logsumexp_tensor(vals):
-        m = torch.max(vals)
-        return m + torch.log(torch.clamp(torch.exp(vals - m).sum(), min=eps))
+        return torch.logsumexp(vals, dim=0)
 
     for b in range(batch_size):
         # Ground-truth base indices for this sample (1..Cb); 0 is blank
@@ -93,11 +97,12 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
         y_mod = tags_mod_list[b].detach().cpu().tolist()  # [U]
         y_tone = tags_tone_list[b].detach().cpu().tolist()  # [U]
 
-        # Vowel mask using ground-truth characters
-        base_chars = [base_charset_str[idx - 1] if 1 <= idx <= Cb else '' for idx in y]
-        vowel_mask = torch.tensor(
-            [vn_tags.is_vowel(ch) for ch in base_chars], device=base.device, dtype=torch.float32
-        )  # [U]
+        # Vowel mask using cached boolean tensor (blank=0 handled)
+        y_tensor = torch.tensor(y, device=base.device, dtype=torch.long)
+        valid = (y_tensor > 0) & (y_tensor <= Cb)
+        vowel_mask = torch.zeros(U, device=base.device, dtype=torch.float32)
+        if valid.any():
+            vowel_mask[valid] = base_is_vowel[(y_tensor[valid] - 1)].float()
 
         # Base log-probs time-major for CTC DP: [T, C]
         logp_base_bt = base_logp[:, b, :]  # [T, C]
@@ -112,39 +117,59 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
 
         neg_inf = torch.tensor(-1e30, device=base.device)
 
-        # Forward DP (alpha): [T, S]
+        # Forward DP (alpha): [T, S] vectorized across states
         alpha = torch.full((T_b, S), neg_inf.item(), device=base.device)
-        alpha[0, 0] = logp_base_bt[0, 0]
+        # t=0 initialization
+        alpha0 = alpha[0]
+        alpha0[0] = logp_base_bt[0, 0]
         if S > 1:
-            alpha[0, 1] = logp_base_bt[0, lprime[1]]
+            alpha0[1] = logp_base_bt[0, lprime[1]]
+        # Precompute label inequality mask for skip transitions (s -> s+2)
+        if S > 2:
+            skip_ok = (lprime[2:] != lprime[:-2])  # shape [S-2]
         for t in range(1, T_b):
-            for s in range(S):
-                lp = logp_base_bt[t, lprime[s]]
-                a0 = alpha[t - 1, s]
-                a1 = alpha[t - 1, s - 1] if s - 1 >= 0 else neg_inf
-                a2 = neg_inf
-                if s - 2 >= 0 and lprime[s] != lprime[s - 2]:
-                    a2 = alpha[t - 1, s - 2]
-                alpha[t, s] = logsumexp_tensor(torch.stack((a0, a1, a2))) + lp
+            prev = alpha[t - 1]  # [S]
+            same = prev  # stay
+            shift1 = torch.cat([neg_inf.view(1), prev[:-1]])  # advance by 1
+            if S > 2:
+                shift2_core = prev[:-2] + torch.where(skip_ok, torch.zeros_like(prev[:-2]), neg_inf)
+                shift2 = torch.cat([neg_inf.view(1), neg_inf.view(1), shift2_core])
+            else:
+                shift2 = torch.full((S,), neg_inf.item(), device=base.device)
+            stacked = torch.stack((same, shift1, shift2), dim=0)  # [3, S]
+            alpha[t] = torch.logsumexp(stacked, dim=0) + logp_base_bt[t, lprime]
 
         # logZ from final states (last blank or last label)
         last_blank = alpha[T_b - 1, S - 1]
         last_label = alpha[T_b - 1, S - 2] if S - 2 >= 0 else neg_inf
         logZ = logsumexp_tensor(torch.stack((last_blank, last_label)))
 
-        # Backward DP (beta): [T, S]
+        # Backward DP (beta): [T, S] vectorized
         beta = torch.full((T_b, S), neg_inf.item(), device=base.device)
-        beta[T_b - 1, S - 1] = 0.0
+        beta_last = beta[T_b - 1]
+        beta_last[S - 1] = 0.0
         if S - 2 >= 0:
-            beta[T_b - 1, S - 2] = 0.0
+            beta_last[S - 2] = 0.0
+        if S > 2:
+            skip_ok_fwd = skip_ok  # reuse
         for t in range(T_b - 2, -1, -1):
-            for s in range(S):
-                b0 = beta[t + 1, s] + logp_base_bt[t + 1, lprime[s]]
-                b1 = beta[t + 1, s + 1] + logp_base_bt[t + 1, lprime[s + 1]] if s + 1 < S else neg_inf
-                b2 = neg_inf
-                if s + 2 < S and lprime[s] != lprime[s + 2]:
-                    b2 = beta[t + 1, s + 2] + logp_base_bt[t + 1, lprime[s + 2]]
-                beta[t, s] = logsumexp_tensor(torch.stack((b0, b1, b2)))
+            nxt = beta[t + 1]  # [S]
+            # stay
+            b0 = nxt + logp_base_bt[t + 1, lprime]
+            # advance by 1
+            b1 = torch.full((S,), neg_inf.item(), device=base.device)
+            b1[:-1] = nxt[1:] + logp_base_bt[t + 1, lprime[1:]]
+            # advance by 2 where labels differ
+            if S > 2:
+                b2 = torch.full((S,), neg_inf.item(), device=base.device)
+                adv2_src = nxt[2:] + logp_base_bt[t + 1, lprime[2:]]
+                # apply mask
+                adv2_src = torch.where(skip_ok_fwd, adv2_src, torch.full_like(adv2_src, neg_inf.item()))
+                b2[:-2] = adv2_src
+                stacked_b = torch.stack((b0, b1, b2), dim=0)
+            else:
+                stacked_b = torch.stack((b0, b1), dim=0)
+            beta[t] = torch.logsumexp(stacked_b, dim=0)
 
         # Posterior gamma over (t, s)
         with torch.no_grad():
