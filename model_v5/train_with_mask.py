@@ -63,6 +63,11 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
     batch_mod_losses = []
     batch_tone_losses = []
 
+    # Build once per batch
+    base_charset_str = utils.build_base_charset()
+    Cb = len(base_charset_str)
+    tag_alpha = getattr(args, 'tag_alpha', 0.2)
+
     # Prepare cumulative offsets to slice text_base flat
     lengths_cpu = length_base.detach().cpu().tolist()
     flat_indices = text_base.detach().cpu().tolist()
@@ -82,8 +87,6 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
         y_tone = tags_tone_list[b].detach().cpu().tolist()  # 0..5
 
         # Build vowel mask from GT base indices (uses utils.build_base_charset to map indices->chars)
-        base_charset_str = utils.build_base_charset()
-        Cb = len(base_charset_str)
         # base_chars: length U, empty string for out-of-range indices
         base_chars = [base_charset_str[idx - 1] if 1 <= idx <= Cb else '' for idx in y]
         vowel_mask = torch.tensor([vn_tags.is_vowel(ch) for ch in base_chars], device=base.device, dtype=torch.float32)
@@ -143,15 +146,19 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
             have_pred[u] = 1.0
             matched += 1
         # Masked average over vowel positions where we had predictions
+        # weights = 1 for vowels, alpha for consonants
+        weights = vowel_mask + tag_alpha * (1.0 - vowel_mask)
+        eff_w = weights * have_pred
         eps_mask = 1e-6
-        denom = (vowel_mask * have_pred).sum() + eps_mask
-        L_mod = (vowel_mask * have_pred * ce_mod_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
-        L_tone = (vowel_mask * have_pred * ce_tone_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
+        denom = eff_w.sum() + eps_mask
+        L_mod = (eff_w * ce_mod_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
+        L_tone = (eff_w * ce_tone_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
         batch_mod_losses.append(L_mod)
         batch_tone_losses.append(L_tone)
 
-        mod_loss = torch.stack(batch_mod_losses).mean()
-        tone_loss = torch.stack(batch_tone_losses).mean()
+    # Average across batch
+    mod_loss = torch.stack(batch_mod_losses).mean() if batch_mod_losses else torch.tensor(0.0, device=base.device)
+    tone_loss = torch.stack(batch_tone_losses).mean() if batch_tone_losses else torch.tensor(0.0, device=base.device)
 
     return base_loss + args.lambda_mod * mod_loss + args.lambda_tone * tone_loss
 
