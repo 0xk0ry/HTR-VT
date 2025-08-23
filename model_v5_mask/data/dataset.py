@@ -36,10 +36,12 @@ def SameTrCollate(batch, args):
         images = [ColorJitter(args.jitter_brightness, args.jitter_contrast, args.jitter_saturation,
                               args.jitter_hue)(image) for image in images]
 
-    # Convert images to tensors (ensure writable NumPy arrays to avoid PyTorch warning)
-    # Some PIL/transform pipelines can yield non-writeable arrays; copy=True makes them writable/contiguous
-    image_tensors = torch.stack([torch.from_numpy(np.ascontiguousarray(im, dtype=np.uint8)) for im in images], 0)
-    image_tensors = (image_tensors.unsqueeze(1).to(dtype=torch.float32)) * (1.0 / 255.0)
+    # Convert images to tensors
+
+    image_tensors = [torch.from_numpy(np.array(image, copy=False)) for image in images]
+    image_tensors = torch.stack([t for t in image_tensors], 0)
+    image_tensors = image_tensors.unsqueeze(1).float()
+    image_tensors = image_tensors / 255.
     return image_tensors, labels
 
 

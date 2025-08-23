@@ -17,6 +17,7 @@ import numpy as np
 import re
 import importlib
 from utils import vn_tags
+# AMP removed per user request
 
 
 def compute_loss(args, model, image, batch_size, criterion, enc):
@@ -54,14 +55,20 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
                         preds_size, length_base.to(base.device)).mean()
     torch.backends.cudnn.enabled = True
 
-    # Best-path alignment proxy for tags (greedy, run-length, map to GT order)
-    with torch.no_grad():
-        # frame-wise argmax over base classes
-        base_argmax = base.argmax(dim=2)  # [B, T]
-
+    # CTC posterior (gamma) pooling for tag supervision
     eps = 1e-8
     batch_mod_losses = []
     batch_tone_losses = []
+
+    # Cache base charset + vowel mask (per run) to avoid rebuilding each call
+    if not hasattr(args, '_base_is_vowel_cache'):
+        base_charset_str = utils.build_base_charset()
+        args._base_charset_len = len(base_charset_str)
+        args._base_is_vowel_cache = torch.tensor(
+            [vn_tags.is_vowel(ch) for ch in base_charset_str], dtype=torch.bool, device=base.device)
+    Cb = args._base_charset_len
+    base_is_vowel = args._base_is_vowel_cache  # [Cb]
+    tag_alpha = getattr(args, 'tag_alpha', 0.2)
 
     # Prepare cumulative offsets to slice text_base flat
     lengths_cpu = length_base.detach().cpu().tolist()
@@ -70,88 +77,146 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
     for l in lengths_cpu:
         offs.append(offs[-1] + l)
 
-    # Use log_softmax once (faster + more stable than softmax + log)
-    logp_mod = torch.nn.functional.log_softmax(mod_logits, dim=2)
-    logp_tone = torch.nn.functional.log_softmax(tone_logits, dim=2)
+    # Precompute log-softmax for tag heads; we'll use probs via exp()
+    logp_mod = torch.nn.functional.log_softmax(mod_logits, dim=2)  # [B, T, 4]
+    logp_tone = torch.nn.functional.log_softmax(tone_logits, dim=2)  # [B, T, 6]
+
+    def logsumexp_tensor(vals):
+        return torch.logsumexp(vals, dim=0)
 
     for b in range(batch_size):
-        # Ground-truth indices for this sample (1..Cb-1); 0 is blank
+        # Ground-truth base indices for this sample (1..Cb); 0 is blank
         y = flat_indices[offs[b]:offs[b+1]]  # length U
         U = len(y)
-        y_mod = tags_mod_list[b].detach().cpu().tolist()  # 0..3
-        y_tone = tags_tone_list[b].detach().cpu().tolist()  # 0..5
+        if U == 0:
+            # No characters => no tag loss for this sample
+            batch_mod_losses.append(torch.tensor(0.0, device=base.device))
+            batch_tone_losses.append(torch.tensor(0.0, device=base.device))
+            continue
 
-        # Build vowel mask from GT base indices (uses utils.build_base_charset to map indices->chars)
-        base_charset_str = utils.build_base_charset()
-        Cb = len(base_charset_str)
-        # base_chars: length U, empty string for out-of-range indices
-        base_chars = [base_charset_str[idx - 1] if 1 <= idx <= Cb else '' for idx in y]
-        vowel_mask = torch.tensor([vn_tags.is_vowel(ch) for ch in base_chars], device=base.device, dtype=torch.float32)
+        y_mod = tags_mod_list[b].detach().cpu().tolist()  # [U]
+        y_tone = tags_tone_list[b].detach().cpu().tolist()  # [U]
 
-        # Build run-length segments from best-path over frames
-        frames = base_argmax[b].detach().cpu().tolist()  # [T]
-        # list of (cls_idx, [frame_indices]) excluding blanks (0)
-        segments = []
-        prev = None
-        current_frames = []
-        for t, k in enumerate(frames):
-            if k == 0:
-                # blank: break segment
-                if prev is not None:
-                    segments.append((prev, current_frames))
-                    prev = None
-                    current_frames = []
-                continue
-            if prev is None or k != prev:
-                # start new segment
-                if prev is not None and current_frames:
-                    segments.append((prev, current_frames))
-                prev = int(k)
-                current_frames = [t]
+        # Vowel mask using cached boolean tensor (blank=0 handled)
+        y_tensor = torch.tensor(y, device=base.device, dtype=torch.long)
+        valid = (y_tensor > 0) & (y_tensor <= Cb)
+        vowel_mask = torch.zeros(U, device=base.device, dtype=torch.float32)
+        if valid.any():
+            vowel_mask[valid] = base_is_vowel[(y_tensor[valid] - 1)].float()
+
+        # Base log-probs time-major for CTC DP: [T, C]
+        logp_base_bt = base_logp[:, b, :]  # [T, C]
+        T_b = logp_base_bt.size(0)
+        C = logp_base_bt.size(1)
+
+        # Build extended target l' with blanks between and at ends
+        S = 2 * U + 1
+        lprime = torch.zeros(S, dtype=torch.long, device=base.device)
+        for u in range(U):
+            lprime[2 * u + 1] = int(y[u])
+
+        neg_inf = torch.tensor(-1e30, device=base.device)
+
+        # Forward DP (alpha): [T, S] vectorized across states
+        alpha = torch.full((T_b, S), neg_inf.item(), device=base.device)
+        # t=0 initialization
+        alpha0 = alpha[0]
+        alpha0[0] = logp_base_bt[0, 0]
+        if S > 1:
+            alpha0[1] = logp_base_bt[0, lprime[1]]
+        # Precompute label inequality mask for skip transitions (s -> s+2)
+        if S > 2:
+            skip_ok = (lprime[2:] != lprime[:-2])  # shape [S-2]
+        for t in range(1, T_b):
+            prev = alpha[t - 1]  # [S]
+            same = prev  # stay
+            shift1 = torch.cat([neg_inf.view(1), prev[:-1]])  # advance by 1
+            if S > 2:
+                shift2_core = prev[:-2] + torch.where(skip_ok, torch.zeros_like(prev[:-2]), neg_inf)
+                shift2 = torch.cat([neg_inf.view(1), neg_inf.view(1), shift2_core])
             else:
-                current_frames.append(t)
-        if prev is not None and current_frames:
-            segments.append((prev, current_frames))
+                shift2 = torch.full((S,), neg_inf.item(), device=base.device)
+            stacked = torch.stack((same, shift1, shift2), dim=0)  # [3, S]
+            alpha[t] = torch.logsumexp(stacked, dim=0) + logp_base_bt[t, lprime]
 
-        # Map GT positions to matching segments in order (greedy)
-        seg_ptr = 0
-        matched = 0
-        # per-character CE placeholders (so we can mask by vowel positions later)
+        # logZ from final states (last blank or last label)
+        last_blank = alpha[T_b - 1, S - 1]
+        last_label = alpha[T_b - 1, S - 2] if S - 2 >= 0 else neg_inf
+        logZ = logsumexp_tensor(torch.stack((last_blank, last_label)))
+
+        # Backward DP (beta): [T, S] vectorized
+        beta = torch.full((T_b, S), neg_inf.item(), device=base.device)
+        beta_last = beta[T_b - 1]
+        beta_last[S - 1] = 0.0
+        if S - 2 >= 0:
+            beta_last[S - 2] = 0.0
+        if S > 2:
+            skip_ok_fwd = skip_ok  # reuse
+        for t in range(T_b - 2, -1, -1):
+            nxt = beta[t + 1]  # [S]
+            # stay
+            b0 = nxt + logp_base_bt[t + 1, lprime]
+            # advance by 1
+            b1 = torch.full((S,), neg_inf.item(), device=base.device)
+            b1[:-1] = nxt[1:] + logp_base_bt[t + 1, lprime[1:]]
+            # advance by 2 where labels differ
+            if S > 2:
+                b2 = torch.full((S,), neg_inf.item(), device=base.device)
+                adv2_src = nxt[2:] + logp_base_bt[t + 1, lprime[2:]]
+                # apply mask
+                adv2_src = torch.where(skip_ok_fwd, adv2_src, torch.full_like(adv2_src, neg_inf.item()))
+                b2[:-2] = adv2_src
+                stacked_b = torch.stack((b0, b1, b2), dim=0)
+            else:
+                stacked_b = torch.stack((b0, b1), dim=0)
+            beta[t] = torch.logsumexp(stacked_b, dim=0)
+
+        # Posterior gamma over (t, s)
+        with torch.no_grad():
+            gamma_log = alpha + beta - logZ
+            gamma = torch.exp(gamma_log).clamp_min(0.0)  # [T, S]
+
+        # Per-character CE placeholders
         ce_mod_u = torch.zeros(U, device=base.device)
         ce_tone_u = torch.zeros(U, device=base.device)
         have_pred = torch.zeros(U, device=base.device)
-        for u in range(U):
-            yt = y[u]
-            # advance seg_ptr to the next segment matching current GT class
-            while seg_ptr < len(segments) and segments[seg_ptr][0] != yt:
-                seg_ptr += 1
-            if seg_ptr >= len(segments):
-                # no frames for this label; skip
+
+        # Tag probabilities per frame
+        p_mod_bt = torch.exp(logp_mod[b])  # [T, 4]
+        p_tone_bt = torch.exp(logp_tone[b])  # [T, 6]
+
+        for u_idx in range(U):
+            s_idx = 2 * u_idx + 1
+            if s_idx >= S:
                 continue
-            _, t_idx = segments[seg_ptr]
-            seg_ptr += 1
-            if not t_idx:
+            weights_t = gamma[:, s_idx]  # [T]
+            w_sum = weights_t.sum()
+            if w_sum <= eps:
                 continue
-            # Aggregate probabilities over frames in this segment
-            lpm = logp_mod[b, t_idx, :].mean(dim=0)  # [4]
-            lpt = logp_tone[b, t_idx, :].mean(dim=0)  # [6]
-            # CE = -log p[target]
-            ce_val_mod = (-lpm[y_mod[u]].clamp_min(-60.0))
-            ce_val_tone = (-lpt[y_tone[u]].clamp_min(-60.0))
-            ce_mod_u[u] = ce_val_mod
-            ce_tone_u[u] = ce_val_tone
-            have_pred[u] = 1.0
-            matched += 1
+            w_norm = (weights_t / w_sum).detach()  # stop-grad through gamma
+
+            # Expected tag distributions for this character
+            p_mod_u = (w_norm.unsqueeze(-1) * p_mod_bt).sum(dim=0)  # [4]
+            p_tone_u = (w_norm.unsqueeze(-1) * p_tone_bt).sum(dim=0)  # [6]
+
+            ce_val_mod = -torch.log(p_mod_u[y_mod[u_idx]].clamp_min(1e-8))
+            ce_val_tone = -torch.log(p_tone_u[y_tone[u_idx]].clamp_min(1e-8))
+            ce_mod_u[u_idx] = ce_val_mod
+            ce_tone_u[u_idx] = ce_val_tone
+            have_pred[u_idx] = 1.0
+
         # Masked average over vowel positions where we had predictions
-        eps_mask = 1e-6
-        denom = (vowel_mask * have_pred).sum() + eps_mask
-        L_mod = (vowel_mask * have_pred * ce_mod_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
-        L_tone = (vowel_mask * have_pred * ce_tone_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
+        weights_chars = vowel_mask + tag_alpha * (1.0 - vowel_mask)
+        eff_w = weights_chars * have_pred
+        denom = eff_w.sum()
+        L_mod = (eff_w * ce_mod_u).sum() / (denom + 1e-6) if denom > 0 else torch.tensor(0.0, device=base.device)
+        L_tone = (eff_w * ce_tone_u).sum() / (denom + 1e-6) if denom > 0 else torch.tensor(0.0, device=base.device)
         batch_mod_losses.append(L_mod)
         batch_tone_losses.append(L_tone)
 
-        mod_loss = torch.stack(batch_mod_losses).mean()
-        tone_loss = torch.stack(batch_tone_losses).mean()
+    # Average across batch
+    mod_loss = torch.stack(batch_mod_losses).mean() if batch_mod_losses else torch.tensor(0.0, device=base.device)
+    tone_loss = torch.stack(batch_tone_losses).mean() if batch_tone_losses else torch.tensor(0.0, device=base.device)
 
     return base_loss + args.lambda_mod * mod_loss + args.lambda_tone * tone_loss
 
@@ -194,13 +259,22 @@ def main():
     total_param = sum(p.numel() for p in model.parameters())
     logger.info('total_param is {}'.format(total_param))
 
+    # Performance toggles
+    cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision('high')  # enable TF32 if supported
+    except Exception:
+        pass
+
     model.train()
-    model = model.cuda()
+    model = model.cuda().to(memory_format=torch.channels_last)
     # Ensure EMA decay is properly accessed (handle both ema_decay and ema-decay)
     ema_decay = getattr(args, 'ema_decay', 0.9999)
     logger.info(f"Using EMA decay: {ema_decay}")
     model_ema = utils.ModelEma(model, ema_decay)
     model.zero_grad()
+
+    # AMP disabled per user request
 
     # Use centralized checkpoint loader like model_v4-2
     resume_path = args.resume if getattr(
@@ -236,7 +310,11 @@ def main():
         prefetch_factor=2,
     )
 
-    optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
+    # Use fused AdamW when available (PyTorch 2.0+ with CUDA)
+    fused_ok = torch.cuda.is_available() and hasattr(torch.optim, 'AdamW') and \
+        'fused' in torch.optim.AdamW.__init__.__code__.co_varnames
+    base_opt = partial(torch.optim.AdamW, fused=True) if fused_ok else torch.optim.AdamW
+    optimizer = sam.SAM(model.parameters(), base_opt,
                         lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
     if args.use_dual_head:
@@ -263,19 +341,29 @@ def main():
     logger.info('Start training...')
     for nb_iter in range(start_iter, args.total_iter):
 
+        # Update LR
         optimizer, current_lr = utils.update_lr_cos(
-            nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer)
+            nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer
+        )
 
+        # Get batch
         optimizer.zero_grad()
         batch = next(train_iter)
-        image = batch[0].cuda(non_blocking=True)
+        image = batch[0].cuda(non_blocking=True).to(memory_format=torch.channels_last)
         enc = converter.encode(batch[1])
         batch_size = image.size(0)
+
+        # First forward/backward (fp32)
         loss = compute_loss(args, model, image, batch_size, criterion, enc)
         loss.backward()
+
         optimizer.first_step(zero_grad=True)
-        compute_loss(args, model, image, batch_size, criterion, enc).backward()
+
+        # Second forward/backward (fp32)
+        loss2 = compute_loss(args, model, image, batch_size, criterion, enc)
+        loss2.backward()
         optimizer.second_step(zero_grad=True)
+
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
         train_loss += loss.item()
