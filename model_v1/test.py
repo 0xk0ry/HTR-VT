@@ -23,7 +23,7 @@ def main():
 
     model = HTR_VT.create_model(nb_cls=args.nb_cls, img_size=args.img_size[::-1])
 
-    pth_path = args.save_dir + '/best_CER.pth'
+    pth_path = '/kaggle/input/htr-vt/pytorch/default-iam/8/checkpoint_0.0324_0.1066_100000.pth'
     logger.info('loading HWR checkpoint from {}'.format(pth_path))
 
     ckpt = torch.load(pth_path, map_location='cpu')
