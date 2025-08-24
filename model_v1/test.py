@@ -26,7 +26,7 @@ def main():
     pth_path = '/kaggle/input/htr-vt/pytorch/default-iam/8/checkpoint_0.0324_0.1066_100000.pth'
     logger.info('loading HWR checkpoint from {}'.format(pth_path))
 
-    ckpt = torch.load(pth_path, map_location='cpu')
+    ckpt = torch.load(pth_path, map_location='cpu', weights_only=False)
     model_dict = OrderedDict()
     pattern = re.compile('module.')
 
