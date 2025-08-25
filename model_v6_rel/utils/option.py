@@ -107,3 +107,6 @@ def get_args_parser():
     parser.add_argument('--test-data-list', type=str, default='./data/iam/test.ln',
                      help='test data list')
     parser.add_argument('--nb-cls', default=80, type=int, help='nb of classes, IAM=79+1, READ2016=89+1')
+
+    # Return parsed args directly so callers receive a namespace, not the parser
+    return parser.parse_args()
