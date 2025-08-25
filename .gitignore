@@ -1,4 +1,7 @@
 data/iam/lines/
+data/VNOnDB_full/
 __pycache__/
 *.pth
 *.zip
+test_lines/
+prototyping/

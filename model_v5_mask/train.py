@@ -17,6 +17,7 @@ import numpy as np
 import re
 import importlib
 from utils import vn_tags
+import editdistance
 
 
 def compute_loss(args, model, image, batch_size, criterion, enc):
@@ -46,7 +47,6 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
     T = base.size(1)
     preds_size = torch.IntTensor([T] * batch_size).to(base.device)
 
-
     # Base CTC (unchanged)
     base_logp = base.permute(1, 0, 2).log_softmax(2)
     torch.backends.cudnn.enabled = False
@@ -59,11 +59,10 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
         # frame-wise argmax over base classes
         base_argmax = base.argmax(dim=2)  # [B, T]
 
-    eps = 1e-8
     batch_mod_losses = []
     batch_tone_losses = []
 
-    # Build once per batch
+    # Build once per batch (moved outside the loop for efficiency)
     base_charset_str = utils.build_base_charset()
     Cb = len(base_charset_str)
     tag_alpha = getattr(args, 'tag_alpha', 0.2)
@@ -83,8 +82,23 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
         # Ground-truth indices for this sample (1..Cb-1); 0 is blank
         y = flat_indices[offs[b]:offs[b+1]]  # length U
         U = len(y)
+        
+        # Check if we have valid tag lists for this sample
+        if b >= len(tags_mod_list) or b >= len(tags_tone_list):
+            # Skip this sample if tag lists are incomplete
+            batch_mod_losses.append(torch.tensor(0.0, device=base.device))
+            batch_tone_losses.append(torch.tensor(0.0, device=base.device))
+            continue
+            
         y_mod = tags_mod_list[b].detach().cpu().tolist()  # 0..3
         y_tone = tags_tone_list[b].detach().cpu().tolist()  # 0..5
+        
+        # Ensure tag lists have the same length as GT sequence
+        if len(y_mod) != U or len(y_tone) != U:
+            # Skip this sample if lengths don't match
+            batch_mod_losses.append(torch.tensor(0.0, device=base.device))
+            batch_tone_losses.append(torch.tensor(0.0, device=base.device))
+            continue
 
         # Build vowel mask from GT base indices (uses utils.build_base_charset to map indices->chars)
         # base_chars: length U, empty string for out-of-range indices
@@ -123,18 +137,34 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
         ce_mod_u = torch.zeros(U, device=base.device)
         ce_tone_u = torch.zeros(U, device=base.device)
         have_pred = torch.zeros(U, device=base.device)
+        
         for u in range(U):
             yt = y[u]
-            # advance seg_ptr to the next segment matching current GT class
-            while seg_ptr < len(segments) and segments[seg_ptr][0] != yt:
+            # Find the next segment matching current GT class
+            found_segment = False
+            original_seg_ptr = seg_ptr
+            
+            while seg_ptr < len(segments):
+                if segments[seg_ptr][0] == yt:
+                    found_segment = True
+                    break
                 seg_ptr += 1
-            if seg_ptr >= len(segments):
-                # no frames for this label; skip
+            
+            if not found_segment:
+                # Reset seg_ptr and continue to next GT position
+                seg_ptr = original_seg_ptr
                 continue
+                
             _, t_idx = segments[seg_ptr]
             seg_ptr += 1
+            
             if not t_idx:
                 continue
+                
+            # Validate tag indices before using them
+            if y_mod[u] >= mod_logits.size(2) or y_tone[u] >= tone_logits.size(2):
+                continue
+                
             # Aggregate probabilities over frames in this segment
             lpm = logp_mod[b, t_idx, :].mean(dim=0)  # [4]
             lpt = logp_tone[b, t_idx, :].mean(dim=0)  # [6]
@@ -145,14 +175,15 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
             ce_tone_u[u] = ce_val_tone
             have_pred[u] = 1.0
             matched += 1
+            
         # Masked average over vowel positions where we had predictions
         # weights = 1 for vowels, alpha for consonants
         weights = vowel_mask + tag_alpha * (1.0 - vowel_mask)
         eff_w = weights * have_pred
         eps_mask = 1e-6
         denom = eff_w.sum() + eps_mask
-        L_mod = (eff_w * ce_mod_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
-        L_tone = (eff_w * ce_tone_u).sum() / denom if denom > 0 else torch.tensor(0.0, device=base.device)
+        L_mod = (eff_w * ce_mod_u).sum() / denom if denom > eps_mask else torch.tensor(0.0, device=base.device)
+        L_tone = (eff_w * ce_tone_u).sum() / denom if denom > eps_mask else torch.tensor(0.0, device=base.device)
         batch_mod_losses.append(L_mod)
         batch_tone_losses.append(L_tone)
 

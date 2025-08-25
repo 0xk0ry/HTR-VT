@@ -69,7 +69,7 @@ def main():
     model.zero_grad()
 
     # Use centralized checkpoint loader like model_v4-2
-    resume_path = args.resume if getattr(args, 'resume', None) else getattr(args, 'resume_checkpoint', None)
+    resume_path = args.resume
     best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count = utils.load_checkpoint(
         model, model_ema, None, resume_path, logger)
 
