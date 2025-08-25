@@ -29,7 +29,7 @@ def main():
         nb_cls = args.nb_cls
     model = HTR_VT.create_model(nb_cls=nb_cls, img_size=args.img_size[::-1], use_dual_head=use_dual)
 
-    pth_path = args.save_dir + '/best_CER.pth'
+    pth_path = args.resume
     logger.info('loading HWR checkpoint from {}'.format(pth_path))
 
     ckpt = torch.load(pth_path, map_location='cpu')
