@@ -71,6 +71,30 @@ def main():
     logger.info(
         f'Test. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} ')
 
+    # Save predictions as JSON
+    results = {
+        "test_metrics": {
+            "loss": float(val_loss),
+            "cer": float(val_cer),
+            "wer": float(val_wer)
+        },
+        "predictions": []
+    }
+    
+    for i, (pred, label) in enumerate(zip(preds, labels)):
+        print(pred, label)
+        results["predictions"].append({
+            "sample_id": i + 1,
+            "prediction": pred,
+            "ground_truth": label,
+            "match": pred == label
+        })
+    
+    # Save to JSON file
+    pred_file = os.path.join(args.save_dir, 'predictions.json')
+    with open(pred_file, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    
 
 if __name__ == '__main__':
     args = option.get_args_parser()

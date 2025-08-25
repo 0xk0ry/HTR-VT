@@ -31,6 +31,10 @@ def validation(model, criterion, evaluation_loader, converter):
     all_preds_str = []
     all_labels = []
 
+    # Keep track of all composed predictions for dual-head models
+    all_composed_preds = []
+    is_dual_head = False
+
     for i, (image_tensors, labels) in enumerate(evaluation_loader):
         batch_size = image_tensors.size(0)
         image = image_tensors.cuda()
@@ -41,10 +45,13 @@ def validation(model, criterion, evaluation_loader, converter):
             text_for_loss, length_for_loss = enc[0], enc[1]
         else:
             text_for_loss, length_for_loss = enc
-        amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+        amp_dtype = torch.bfloat16 if (torch.cuda.is_available(
+        ) and torch.cuda.is_bf16_supported()) else torch.float16
         with autocast(dtype=amp_dtype, enabled=torch.cuda.is_available()):
             outs = model(image)
         use_dual = isinstance(outs, dict)
+        is_dual_head = use_dual  # Track if we're using dual head
+
         base_logits = outs['base'] if use_dual else outs
         base_logits = base_logits.float()
         preds_size = torch.IntTensor(
@@ -62,6 +69,7 @@ def validation(model, criterion, evaluation_loader, converter):
         valid_loss += cost.item()
         count += 1
 
+        # Store base predictions and labels
         all_preds_str.extend(preds_str)
         all_labels.extend(labels)
 
@@ -164,19 +172,22 @@ def validation(model, criterion, evaluation_loader, converter):
                             if mod_gt[i1 + k] != mod_pr[j1 + k]:
                                 mer_num += 1
 
-                # Replace the just-computed base pred with composed for external reporting if needed
-                all_preds_str[-batch_size + b] = composed
-            # Overwrite current batch predictions with composed VN strings so return value is the final output
-            preds_str = composed_batch
+            # Store composed predictions for this batch
+            all_composed_preds.extend(composed_batch)
 
-    # If dual-head was used at least once, compute final WER on composed outputs
-    wer_tot_final, wer_len_final = 0, 0
-    if 'composed_batch' in locals() and len(composed_batch) > 0:
-        for comp, gt in zip(composed_batch, labels):
+    # If dual-head was used, compute final WER on composed outputs and use composed predictions
+    if is_dual_head and all_composed_preds:
+        wer_tot_final, wer_len_final = 0, 0
+        for comp, gt in zip(all_composed_preds, all_labels):
             p = utils.format_string_for_wer(comp).split(" ")
             g = utils.format_string_for_wer(gt).split(" ")
             wer_tot_final += editdistance.eval(p, g)
             wer_len_final += len(g)
+
+        # Use composed predictions as final predictions
+        final_preds = all_composed_preds
+    else:
+        final_preds = all_preds_str
 
     # at the end, compute both sets
     val_loss = valid_loss / count
@@ -184,7 +195,7 @@ def validation(model, criterion, evaluation_loader, converter):
     WER_base = tot_ED_wer / \
         float(length_of_gt_wer) if length_of_gt_wer > 0 else 0.0
 
-    if 'outs' in locals() and isinstance(outs, dict):
+    if is_dual_head and all_composed_preds:
         CER_final = tot_ED_final / \
             float(length_of_gt_final) if length_of_gt_final > 0 else 0.0
         WER_final = wer_tot_final / \
@@ -193,7 +204,7 @@ def validation(model, criterion, evaluation_loader, converter):
         MER = mer_num / float(mer_den) if mer_den > 0 else 0.0
         print(
             f"[VALID] Composed CER (VN): {CER_final:.4f} | WER: {WER_final:.4f} | TER: {TER:.4f} ({ter_num}/{ter_den}) | MER: {MER:.4f}")
-        return val_loss, CER_final, WER_final, composed_batch, labels
+        return val_loss, CER_final, WER_final, final_preds, all_labels
 
     # non-dual fallback
-    return val_loss, CER_base, WER_base, all_preds_str, all_labels
+    return val_loss, CER_base, WER_base, final_preds, all_labels
