@@ -13,6 +13,47 @@ import random
 import numpy as np
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+VIETNAMESE_CHARACTERS = {
+    idx: char for idx, char in enumerate(
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        '0123456789'
+        '.,!?;: "#&\'()*+-/%=<>@[]^_`{|}~'
+        'àáảãạăằắẳẵặâầấẩẫậ'
+        'èéẻẽẹêềếểễệ'
+        'ìíỉĩị'
+        'òóỏõọôồốổỗộơờớởỡợ'
+        'ùúủũụưừứửữự'
+        'ỳýỷỹỵ'
+        'đ'
+        'ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬ'
+        'ÈÉẺẼẸÊỀẾỂỄỆ'
+        'ÌÍỈĨỊ'
+        'ÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ'
+        'ÙÚỦŨỤƯỪỨỬỮỰ'
+        'ỲÝỶỸỴ'
+        'Đ'
+    )
+}
+
+VIETNAMESE_BASE_CHARACTERS = {
+    idx: char for idx, char in enumerate(
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        '0123456789'
+        '.,!?;: "#&\'()*+-/%=<>@[]^_`{|}~'
+        'ăâêôơưđ'
+        'ĂÂÊÔƠƯĐ'
+    )
+}
+
+def build_base_charset() -> str:
+    """Return the base charset string (includes modifier forms like ă â ê ô ơ ư)."""
+    return ''.join(VIETNAMESE_BASE_CHARACTERS.values())
+
+def build_full_charset() -> str:
+    """Return the full Vietnamese charset string (includes all precomposed vowels)."""
+    return ''.join(VIETNAMESE_CHARACTERS.values())
 
 def randint(low, high):
     return int(torch.randint(low, high, (1, )))
@@ -84,6 +125,102 @@ class CTCLabelConverter(object):
             texts.append(text)
             index += l
         return texts
+
+
+class ToneLabelConverter(object):
+    """Tone label converter for base characters + tone tags.
+    Based on model_v5_mask's DualLabelConverter but simplified to only handle tones.
+    """
+
+    def __init__(self, base_charset: str):
+        from utils import vn_tone_tags
+        self.vn_tone_tags = vn_tone_tags
+        
+        dict_character = list(base_charset)
+        self.dict = {}
+        for i, char in enumerate(dict_character):
+            self.dict[char] = i + 1  # 0 is reserved for CTC blank
+        self.character = ['[blank]'] + dict_character
+        
+        # Cache for decomposition results
+        self._decomposition_cache = {}
+
+    def encode(self, text: list) -> tuple:
+        """Encode text list into base characters and tone tags.
+        Returns: (text_base, length_base, tags_tone, per_sample_U)
+        """
+        base_seqs = []
+        tags_tone = []
+        lengths = []
+
+        for s in text:
+            # Check cache first
+            if s in self._decomposition_cache:
+                base_str, tone_ids = self._decomposition_cache[s]
+            else:
+                base_str, tone_ids = self.vn_tone_tags.decompose_str(s)
+                self._decomposition_cache[s] = (base_str, tone_ids)
+                
+                # Prevent cache from growing too large
+                if len(self._decomposition_cache) > 5000:
+                    # Remove oldest entries
+                    items_to_remove = len(self._decomposition_cache) // 5
+                    keys_to_remove = list(self._decomposition_cache.keys())[:items_to_remove]
+                    for key in keys_to_remove:
+                        del self._decomposition_cache[key]
+            
+            base_seqs.append(base_str)
+            lengths.append(len(base_str))
+            tags_tone.append(torch.LongTensor(tone_ids).to(device))
+
+        # Convert base sequences to indices
+        flat = ''.join(base_seqs)
+        try:
+            text_base = [self.dict[ch] for ch in flat]
+        except KeyError as e:
+            missing = str(e)
+            raise KeyError(
+                f"Character {missing} not in base charset. Consider updating build_base_charset().")
+
+        text_base_tensor = torch.IntTensor(text_base).to(device)
+        length_base_tensor = torch.IntTensor(lengths).to(device)
+        per_sample_U = length_base_tensor.clone()
+        
+        return text_base_tensor, length_base_tensor, tags_tone, per_sample_U
+
+    def decode(self, text_index: torch.Tensor, length: torch.Tensor) -> list:
+        """Decode base character indices back to base strings."""
+        texts = []
+        index = 0
+        for l in length:
+            l = int(l)
+            t = text_index[index:index + l]
+            char_list = []
+            for i in range(l):
+                if t[i] != 0 and (not (i > 0 and t[i - 1] == t[i])) and t[i] < len(self.character):
+                    char_list.append(self.character[int(t[i])])
+            text = ''.join(char_list)
+            texts.append(text)
+            index += l
+        return texts
+
+    def decode_with_tones(self, text_index: torch.Tensor, length: torch.Tensor, tone_preds: torch.Tensor) -> list:
+        """Decode base characters and combine with tone predictions to get full text."""
+        base_texts = self.decode(text_index, length)
+        full_texts = []
+        
+        tone_idx = 0
+        for i, base_text in enumerate(base_texts):
+            # Get corresponding tone predictions for this sequence
+            seq_len = len(base_text)
+            seq_tone_preds = tone_preds[tone_idx:tone_idx + seq_len].cpu().tolist()
+            tone_idx += seq_len
+            
+            # Compose full text
+            full_text = self.vn_tone_tags.compose_str(base_text, seq_tone_preds)
+            full_texts.append(full_text)
+            
+        return full_texts
 
 
 class Averager(object):
@@ -274,3 +411,9 @@ def load_checkpoint(model, model_ema, optimizer, checkpoint_path, logger):
         logger.info(
             f"Resumed best_cer={best_cer}, best_wer={best_wer}, start_iter={start_iter}")
     return best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count
+
+__all__ = [
+    'VIETNAMESE_CHARACTERS', 'VIETNAMESE_BASE_CHARACTERS', 'build_base_charset', 'build_full_charset',
+    'CTCLabelConverter', 'ToneLabelConverter', 'randint', 'rand_uniform', 'get_logger', 'update_lr_cos',
+    'Averager', 'Metric', 'ModelEma', 'format_string_for_wer', 'load_checkpoint'
+]

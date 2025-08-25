@@ -21,7 +21,15 @@ def main():
     logger = utils.get_logger(args.save_dir)
     logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
 
-    model = HTR_VT.create_model(nb_cls=args.nb_cls, img_size=args.img_size[::-1])
+    # Initialize model (tone head aware)
+    if getattr(args, 'use_tone_head', False):
+        base_charset_str = utils.build_base_charset()
+        nb_cls = len(base_charset_str) + 1
+        model = HTR_VT.create_model(nb_cls=nb_cls, img_size=args.img_size[::-1], use_tone_head=True)
+        logger.info(f"Testing with tone head mode, base charset size: {nb_cls}")
+    else:
+        model = HTR_VT.create_model(nb_cls=args.nb_cls, img_size=args.img_size[::-1])
+        logger.info(f"Testing with single head mode, charset size: {args.nb_cls}")
 
     pth_path = '/kaggle/input/htr-vt/pytorch/default-iam/8/checkpoint_0.0324_0.1066_100000.pth'
     logger.info('loading HWR checkpoint from {}'.format(pth_path))
@@ -30,7 +38,12 @@ def main():
     model_dict = OrderedDict()
     pattern = re.compile('module.')
 
-    for k, v in ckpt['state_dict_ema'].items():
+    # Prefer 'state_dict_ema' if present else 'model'
+    state_key = 'state_dict_ema' if 'state_dict_ema' in ckpt else ('model' if 'model' in ckpt else None)
+    if state_key is None:
+        raise KeyError("Checkpoint missing both 'state_dict_ema' and 'model' keys")
+
+    for k, v in ckpt[state_key].items():
         if re.search("module", k):
             model_dict[re.sub(pattern, '', k)] = v
         else:
@@ -49,7 +62,10 @@ def main():
                                               pin_memory=True,
                                               num_workers=args.num_workers)
 
-    converter = utils.CTCLabelConverter(train_dataset.ralph.values())
+    if getattr(args, 'use_tone_head', False):
+        converter = utils.ToneLabelConverter(utils.build_base_charset())
+    else:
+        converter = utils.CTCLabelConverter(train_dataset.ralph.values())
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True).to(device)
 
     model.eval()

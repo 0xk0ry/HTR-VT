@@ -148,7 +148,8 @@ class MaskedAutoencoderViT(nn.Module):
                  depth=24,
                  num_heads=16,
                  mlp_ratio=4.,
-                 norm_layer=nn.LayerNorm):
+                 norm_layer=nn.LayerNorm,
+                 use_tone_head: bool = False):
         super().__init__()
 
         # --------------------------------------------------------------------------
@@ -168,6 +169,11 @@ class MaskedAutoencoderViT(nn.Module):
 
         self.norm = norm_layer(embed_dim, elementwise_affine=True)
         self.head = torch.nn.Linear(embed_dim, nb_cls)
+        
+        # Tone head for Vietnamese tone prediction
+        self.use_tone_head = use_tone_head
+        if self.use_tone_head:
+            self.head_tone = torch.nn.Linear(embed_dim, 6)  # 6 tones
 
         self.initialize_weights()
 
@@ -234,11 +240,19 @@ class MaskedAutoencoderViT(nn.Module):
             x = blk(x)
 
         x = self.norm(x)
-        # To CTC Loss
-        x = self.head(x)
-        x = self.layer_norm(x)
-
-        return x
+        
+        # Output heads
+        if self.use_tone_head:
+            # Dual output: base characters + tone predictions
+            base = self.head(x)
+            base = self.layer_norm(base)
+            tone = self.head_tone(x)
+            return {'base': base, 'tone': tone}
+        else:
+            # Single head path
+            x = self.head(x)
+            x = self.layer_norm(x)
+            return x
 
 
 def create_model(nb_cls, img_size, **kwargs):

@@ -65,6 +65,14 @@ def get_args_parser():
     parser.add_argument('--ema-decay', default=0.9999, type=float, help='Exponential Moving Average (EMA) decay')
     parser.add_argument('--alpha', default=0, type=float, help='kld loss ratio')
 
+    # Tone head feature flag and loss weights
+    parser.add_argument('--use-tone-head', action='store_true', default=False,
+                        help='Enable tone head prediction (base + tone)')
+    parser.add_argument('--lambda-tone', default=0.7, type=float,
+                        help='Loss weight for tone head')
+    parser.add_argument('--tag-alpha', default=0.2, type=float,
+                        help='Weight for consonants in tone loss (vowel=1, consonant=alpha)')
+
     # Encoder-Decoder specific arguments
     parser.add_argument('--model-type', default='ctc', type=str, choices=['ctc', 'encoder_decoder'],
                        help='Model type: ctc (original) or encoder_decoder (new)')
@@ -107,6 +115,4 @@ def get_args_parser():
     parser.add_argument('--test-data-list', type=str, default='./data/iam/test.ln',
                      help='test data list')
     parser.add_argument('--nb-cls', default=80, type=int, help='nb of classes, IAM=79+1, READ2016=89+1')
-
-    # Return parsed args directly so callers receive a namespace, not the parser
     return parser.parse_args()
