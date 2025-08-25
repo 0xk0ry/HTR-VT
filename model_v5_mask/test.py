@@ -82,7 +82,6 @@ def main():
     }
     
     for i, (pred, label) in enumerate(zip(preds, labels)):
-        print(pred, label)
         results["predictions"].append({
             "sample_id": i + 1,
             "prediction": pred,
