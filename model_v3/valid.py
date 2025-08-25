@@ -74,4 +74,4 @@ def validation(model, criterion, evaluation_loader, converter):
     CER = tot_ED / float(length_of_gt)
     WER = tot_ED_wer / float(length_of_gt_wer)
 
-    return val_loss, CER, WER, preds_str, labels
+    return val_loss, CER, WER, all_preds_str, all_labels
