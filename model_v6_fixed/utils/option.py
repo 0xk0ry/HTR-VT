@@ -98,54 +98,12 @@ def get_args_parser():
     parser.add_argument('--strict-loading', action='store_true', default=True,
                        help='Use strict loading for model weights')
 
-    subparsers = parser.add_subparsers(title="dataset setting", dest="subcommand")
-
-    IAM = subparsers.add_parser("IAM",
-                                description='Dataset parser for training on IAM',
-                                add_help=True,
-                                formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-                                help="Dataset parser for training on IAM")
-
-    IAM.add_argument('--train-data-list', type=str, default='./data/iam/train.ln',
+    parser.add_argument('--train-data-list', type=str, default='./data/iam/train.ln',
                      help='train data list (gc file)(ln file)')
-    IAM.add_argument('--data-path', type=str, default='./data/iam/lines/',
+    parser.add_argument('--data-path', type=str, default='./data/iam/lines/',
                      help='train data list')
-    IAM.add_argument('--val-data-list', type=str, default='./data/iam/val.ln',
+    parser.add_argument('--val-data-list', type=str, default='./data/iam/val.ln',
                      help='val data list')
-    IAM.add_argument('--test-data-list', type=str, default='./data/iam/test.ln',
+    parser.add_argument('--test-data-list', type=str, default='./data/iam/test.ln',
                      help='test data list')
-    IAM.add_argument('--nb-cls', default=80, type=int, help='nb of classes, IAM=79+1, READ2016=89+1')
-
-    READ = subparsers.add_parser("READ",
-                                 description='Dataset parser for training on READ',
-                                 add_help=True,
-                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-                                 help="Dataset parser for training on READ")
-
-    READ.add_argument('--train-data-list', type=str, default='./data/read2016/train.ln',
-                      help='train data list (gc file)(ln file)')
-    READ.add_argument('--data-path', type=str, default='./data/read2016/lines/',
-                      help='train data list')
-    READ.add_argument('--val-data-list', type=str, default='./data/read2016/val.ln',
-                      help='val data list')
-    READ.add_argument('--test-data-list', type=str, default='./data/read2016/test.ln',
-                      help='test data list')
-    READ.add_argument('--nb-cls', default=90, type=int, help='nb of classes, IAM=79+1, READ2016=89+1')
-
-    LAM = subparsers.add_parser("LAM",
-                                description='Dataset parser for training on LAM',
-                                add_help=True,
-                                formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-                                help="Dataset parser for training on READ")
-
-    LAM.add_argument('--train-data-list', type=str, default='./data/LAM/train.ln',
-                     help='train data list (gc file)(ln file)')
-    LAM.add_argument('--data-path', type=str, default='./data/LAM/lines/',
-                     help='train data list')
-    LAM.add_argument('--val-data-list', type=str, default='./data/LAM/val.ln',
-                     help='val data list')
-    LAM.add_argument('--test-data-list', type=str, default='./data/LAM/test.ln',
-                     help='test data list')
-    LAM.add_argument('--nb-cls', default=90, type=int, help='nb of classes, IAM=79+1, READ2016=89+1')
-
-    return parser.parse_args()
+    parser.add_argument('--nb-cls', default=80, type=int, help='nb of classes, IAM=79+1, READ2016=89+1')
