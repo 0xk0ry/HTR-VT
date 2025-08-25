@@ -196,4 +196,4 @@ def validation(model, criterion, evaluation_loader, converter):
         return val_loss, CER_final, WER_final, composed_batch, labels
 
     # non-dual fallback
-    return val_loss, CER_base, WER_base, preds_str, labels
+    return val_loss, CER_base, WER_base, all_preds_str, all_labels
