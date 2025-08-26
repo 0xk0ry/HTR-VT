@@ -9,7 +9,7 @@ from functools import partial
 
 
 class Attention(nn.Module):
-    """Multi-head self-attention with 1D relative positional bias (no absolute PE)."""
+    """Multi-head self-attention with learnable 1D relative positional bias."""
     def __init__(self, dim, num_patches, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
@@ -17,33 +17,28 @@ class Attention(nn.Module):
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
         self.num_patches = num_patches
-        # qkv projection
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-        # relative positional bias table (2L-1, num_heads)
+        # (2L-1, heads) relative position bias table
         self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * num_patches - 1), num_heads)
+            torch.zeros(2 * num_patches - 1, num_heads)
         )
-        # pre-compute pair-wise relative position indices
         coords = torch.arange(num_patches)
-        relative_coords = coords[None, :] - coords[:, None]  # (L, L)
-        relative_coords += num_patches - 1  # shift to [0, 2L-2]
-        self.register_buffer("relative_position_index", relative_coords, persistent=False)
+        relative_coords = coords[None, :] - coords[:, None]
+        relative_coords += num_patches - 1  # shift to [0,2L-2]
+        self.register_buffer('relative_position_index', relative_coords, persistent=False)
 
     def forward(self, x):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        # fetch relative positional bias and add
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index[:N, :N]].permute(2, 0, 1)
-        attn = attn + relative_position_bias.unsqueeze(0)
+        rel_bias = self.relative_position_bias_table[self.relative_position_index[:N, :N]].permute(2, 0, 1)
+        attn = attn + rel_bias.unsqueeze(0)
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -150,17 +145,21 @@ class LayerNorm(nn.Module):
 class MaskedAutoencoderViT(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
     """
+
     def __init__(self,
                  nb_cls=80,
-                 img_size=[512, 32],
+                 img_size=[512, 32] ,
                  patch_size=[8, 32],
                  embed_dim=1024,
                  depth=24,
                  num_heads=16,
                  mlp_ratio=4.,
-                 norm_layer=nn.LayerNorm):
+                 norm_layer=nn.LayerNorm,
+                 use_dual_head: bool = False):
         super().__init__()
-        # encoder specifics
+
+        # --------------------------------------------------------------------------
+        # MAE encoder specifics
         self.layer_norm = LayerNorm()
         self.patch_embed = resnet18.ResNet18(embed_dim)
         self.grid_size = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
@@ -170,31 +169,37 @@ class MaskedAutoencoderViT(nn.Module):
         self.blocks = nn.ModuleList([
             Block(embed_dim, num_heads, self.num_patches,
                   mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
-            for _ in range(depth)
-        ])
+            for i in range(depth)])
+
         self.norm = norm_layer(embed_dim, elementwise_affine=True)
         self.head = torch.nn.Linear(embed_dim, nb_cls)
+        self.use_dual_head = use_dual_head
+        if self.use_dual_head:
+            self.head_mod = torch.nn.Linear(embed_dim, 4)
+            self.head_tone = torch.nn.Linear(embed_dim, 6)
+
         self.initialize_weights()
 
     def initialize_weights(self):
-        # init mask token
+        # initialization
         torch.nn.init.normal_(self.mask_token, std=.02)
-        # init relative position bias tables for each block's attention
+        # initialize relative positional bias tables
         for blk in self.blocks:
             if hasattr(blk.attn, 'relative_position_bias_table'):
                 torch.nn.init.normal_(blk.attn.relative_position_bias_table, std=.02)
-        # init linear & layernorm layers
+
+        # initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            # we use xavier_uniform following official JAX ViT:
             torch.nn.init.xavier_uniform_(m.weight)
-            if isinstance(m, nn.Linear) and m.bias is not None:
+            if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
 
     def generate_span_mask(self, x, mask_ratio, max_span_length):
         N, L, D = x.shape  # batch, length, dim
@@ -231,10 +236,15 @@ class MaskedAutoencoderViT(nn.Module):
 
         x = self.norm(x)
         # To CTC Loss
-        x = self.head(x)
-        x = self.layer_norm(x)
+        base = self.head(x)
+        if self.use_dual_head:
+            mod  = self.head_mod(x)
+            tone = self.head_tone(x)
+            return {'base': base, 'mod': mod, 'tone': tone}
+        else:
+            return base
 
-        return x
+
 
 
 def create_model(nb_cls, img_size, **kwargs):
