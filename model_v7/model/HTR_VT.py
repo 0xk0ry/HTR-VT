@@ -250,7 +250,8 @@ class MaskedAutoencoderViT(nn.Module):
 
         x = self.norm(x)
         # To CTC Loss
-        base_logits = self.head(x)  # removed post-head LayerNorm (can destabilize CTC logits)
+        base_logits = self.head(x)
+        base_logits = self.layer_norm(base_logits)
 
         if not self.use_dual_head:
             return base_logits

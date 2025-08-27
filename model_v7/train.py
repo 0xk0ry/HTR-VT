@@ -25,7 +25,6 @@ def compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx):
     """
     with autocast_ctx():
         outputs = model(image, args.mask_ratio, args.max_span_length, use_masking=True)
-    debug_nan = False
     if not isinstance(outputs, dict):
         text, length = enc
         preds = outputs.float()
@@ -45,12 +44,8 @@ def compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx):
     T = base.size(1)
     preds_size = torch.IntTensor([T]*batch_size).to(device)
     base_logp = base.permute(1,0,2).log_softmax(2)
-    if torch.isnan(base_logp).any():
-        debug_nan = True
     torch.backends.cudnn.enabled = False
     base_loss = criterion(base_logp, text_base.to(device), preds_size, length_base.to(device)).mean()
-    if not torch.isfinite(base_loss):
-        debug_nan = True
     torch.backends.cudnn.enabled = True
 
     lambda_mod = args.lambda_mod
@@ -71,8 +66,6 @@ def compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx):
 
     logp_mod = torch.nn.functional.log_softmax(mod_logits, dim=2)
     logp_tone = torch.nn.functional.log_softmax(tone_logits, dim=2)
-    if torch.isnan(logp_mod).any() or torch.isnan(logp_tone).any():
-        debug_nan = True
 
     lengths_cpu = length_base.detach().cpu().tolist()
     flat_indices = text_base.detach().cpu().tolist()
@@ -151,15 +144,7 @@ def compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx):
     else:
         mod_loss = torch.tensor(0.0, device=device)
         tone_loss = torch.tensor(0.0, device=device)
-    total = base_loss + lambda_mod * mod_loss + lambda_tone * tone_loss
-    if (not torch.isfinite(total)) or debug_nan:
-        print('[NaN DEBUG] base_loss', base_loss.item(), 'mod_loss', float(mod_loss), 'tone_loss', float(tone_loss))
-        with torch.no_grad():
-            print('[NaN DEBUG] logits stats base', base.mean().item(), base.std().item(), 'mod', mod_logits.mean().item(), mod_logits.std().item(), 'tone', tone_logits.mean().item(), tone_logits.std().item())
-        if torch.isnan(total):
-            # Return large finite value so training can skip instead of crash
-            return torch.tensor(1e4, device=device, dtype=base_loss.dtype)
-    return total
+    return base_loss + lambda_mod * mod_loss + lambda_tone * tone_loss
 
 
 def main():
