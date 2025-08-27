@@ -182,12 +182,7 @@ def main():
 
     model.train()
     model = model.cuda()
-    if args.use_compile:
-        try:
-            model = torch.compile(model, mode='max-autotune')  # PyTorch 2.x
-            logger.info('Model compiled with torch.compile')
-        except Exception as e:
-            logger.warning(f'torch.compile failed: {e}. Continuing without compile.')
+    # torch.compile removed (simplified FP32 training)
     # Ensure EMA decay is properly accessed (handle both ema_decay and ema-decay)
     ema_decay = getattr(args, 'ema_decay', 0.9999)
     logger.info(f"Using EMA decay: {ema_decay}")
@@ -363,13 +358,12 @@ def main():
         return img
 
     #### ---- train & eval ---- ####
-    logger.info('Start training...')
-    # AMP context factory
-    amp_dtype = torch.bfloat16 if args.amp_dtype == 'bf16' and torch.cuda.is_available() else torch.float16
+    logger.info('Start training (FP32 only, AMP removed)...')
     def autocast_ctx():
-        return torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=args.use_amp)
-
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.use_amp and args.amp_dtype=='fp16'))
+        class Dummy:
+            def __enter__(self): return None
+            def __exit__(self, et, ev, tb): return False
+        return Dummy()
 
     for nb_iter in range(start_iter, args.total_iter):
         optimizer, current_lr = utils.update_lr_cos(
@@ -382,31 +376,11 @@ def main():
         enc = converter.encode(batch[1])
         batch_size = image.size(0)
         loss = compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx)
-        if scaler.is_enabled():
-            # First SAM step: scale, backward, unscale once, (optional clip), first_step
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.first_step(zero_grad=True)
-            # Second step forward/backward on perturbed weights
-            loss2 = compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx)
-            scaler.scale(loss2).backward()
-            scaler.unscale_(optimizer)  # safe: grads were zeroed by first_step, this is first unscale for second backward
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.second_step(zero_grad=True)
-            scaler.update()
-        else:
-            loss.backward()
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.first_step(zero_grad=True)
-            loss2 = compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx)
-            loss2.backward()
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.second_step(zero_grad=True)
+        loss.backward()
+        optimizer.first_step(zero_grad=True)
+        loss2 = compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx)
+        loss2.backward()
+        optimizer.second_step(zero_grad=True)
 
         # NaN/inf guard
         if not torch.isfinite(loss):

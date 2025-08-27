@@ -121,19 +121,11 @@ def get_args_parser():
     parser.add_argument('--base-charset', type=str, default=None,
                         help='Optional override for base charset (no diacritics). If omitted an internal Vietnamese base charset is used.')
 
-    # Optimization flags
-    parser.add_argument('--use-amp', action='store_true', default=False,
-                        help='Enable mixed precision (autocast, bfloat16 preferred)')
-    parser.add_argument('--amp-dtype', type=str, default='bf16', choices=['bf16','fp16'],
-                        help='AMP dtype preference (bf16 if hardware supports)')
-    parser.add_argument('--use-compile', action='store_true', default=False,
-                        help='Wrap model with torch.compile for graph optimization (PyTorch 2.x)')
+    # (Removed) AMP & torch.compile flags for simplified FP32 training
     parser.add_argument('--prefetch-factor', type=int, default=2,
                         help='DataLoader prefetch_factor (only if num_workers>0)')
     parser.add_argument('--no-persistent-workers', action='store_true', default=False,
                         help='Disable persistent_workers even if num_workers>0')
-    parser.add_argument('--grad-clip', type=float, default=0.0,
-                        help='Max gradient norm (0 to disable clipping)')
 
     subparsers = parser.add_subparsers(
         title="dataset setting", dest="subcommand")
