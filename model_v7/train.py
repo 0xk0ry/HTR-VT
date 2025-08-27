@@ -396,7 +396,7 @@ def main():
             logger.error(f"Non-finite loss detected (loss={loss.item()}). Aborting iteration {nb_iter}.")
             assert False, "Non-finite loss detected"
         model.zero_grad(set_to_none=True)
-        model_ema.update(model, num_updates=nb_iter / 2)
+        model_ema.update(model, num_updates=nb_iter / 4)
         train_loss += loss.item()
         train_loss_count += 1
 
@@ -415,7 +415,7 @@ def main():
         if nb_iter % args.eval_iter == 0:
             model.eval()
             with torch.no_grad():
-                val_loss, val_cer, val_wer, preds, labels = valid.validation(
+                val_loss, val_cer, val_wer, preds, labels, val_cer_base, val_wer_base = valid.validation(
                     model_ema.ema, criterion, val_loader, converter, args)
 
                 if val_cer < best_cer:
@@ -460,8 +460,12 @@ def main():
                     torch.save(checkpoint, os.path.join(
                         args.save_dir, 'best_WER.pth'))
 
-                logger.info(
-                    f'Val. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} \t ')
+                if args.use_dual_head:
+                    logger.info(
+                        f'Val. loss : {val_loss:0.3f} \t CER_full : {val_cer:0.4f} \t WER_full : {val_wer:0.4f} \t CER_base : {val_cer_base:0.4f} \t WER_base : {val_wer_base:0.4f}')
+                else:
+                    logger.info(
+                        f'Val. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f}')
 
                 # Save checkpoint every print interval
                 ckpt_name = f"checkpoint_{best_cer:.4f}_{best_wer:.4f}_{nb_iter}.pth"
@@ -482,8 +486,11 @@ def main():
                 }
                 torch.save(checkpoint, os.path.join(args.save_dir, ckpt_name))
 
-                writer.add_scalar('./VAL/CER', val_cer, nb_iter)
-                writer.add_scalar('./VAL/WER', val_wer, nb_iter)
+                writer.add_scalar('./VAL/CER_full', val_cer, nb_iter)
+                writer.add_scalar('./VAL/WER_full', val_wer, nb_iter)
+                if args.use_dual_head:
+                    writer.add_scalar('./VAL/CER_base', val_cer_base, nb_iter)
+                    writer.add_scalar('./VAL/WER_base', val_wer_base, nb_iter)
                 writer.add_scalar('./VAL/bestCER', best_cer, nb_iter)
                 writer.add_scalar('./VAL/bestWER', best_wer, nb_iter)
                 writer.add_scalar('./VAL/val_loss', val_loss, nb_iter)

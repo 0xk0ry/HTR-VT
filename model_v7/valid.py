@@ -55,13 +55,24 @@ def _compose_if_dual(preds_dict, converter, args):
 
 
 def validation(model, criterion, evaluation_loader, converter, args=None):
-    """ validation or evaluation """
+    """Validation/evaluation.
+    Returns:
+        val_loss, CER_full, WER_full, preds_full, labels, CER_base, WER_base
+        (For single-head models, CER_base/WER_base == CER_full/WER_full)
+    """
 
     norm_ED = 0
     norm_ED_wer = 0
-
     tot_ED = 0
     tot_ED_wer = 0
+
+    # Base-only accumulators (dual-head)
+    norm_ED_base = 0
+    norm_ED_wer_base = 0
+    tot_ED_base = 0
+    tot_ED_wer_base = 0
+    length_of_gt_base = 0
+    length_of_gt_wer_base = 0
 
     valid_loss = 0.0
     length_of_gt = 0
@@ -69,6 +80,7 @@ def validation(model, criterion, evaluation_loader, converter, args=None):
     count = 0
     all_preds_str = []
     all_labels = []
+    dual = getattr(args, 'use_dual_head', False)
 
     for i, (image_tensors, labels) in enumerate(evaluation_loader):
         batch_size = image_tensors.size(0)
@@ -76,25 +88,21 @@ def validation(model, criterion, evaluation_loader, converter, args=None):
 
         text_for_loss, length_for_loss = converter.encode(labels)
 
-        preds = model(image)
-        if isinstance(preds, dict):
-            base_logits = preds['base'].float()
+        preds_out = model(image)
+        if isinstance(preds_out, dict):
+            base_logits = preds_out['base']
             preds_size = torch.IntTensor([base_logits.size(1)] * batch_size)
             base_logp = base_logits.permute(1,0,2).log_softmax(2)
             torch.backends.cudnn.enabled = False
             cost = criterion(base_logp, text_for_loss, preds_size, length_for_loss).mean()
             torch.backends.cudnn.enabled = True
-            # Decode base only for CER/WER
             _, preds_index = base_logp.max(2)
             preds_index = preds_index.transpose(1,0).contiguous().view(-1)
-            preds_str = converter.decode(preds_index.data, preds_size.data)
-            # Compose full strings (optional metrics) if dual-head enabled
-            # args is always passed from training; compose full predictions
-            base_only, composed = _compose_if_dual(preds, converter, args)
-            # Use composed strings for edit distance vs labels (they contain diacritics). If training base charset, labels may already be base.
-            eval_strings = composed
+            base_strs = converter.decode(preds_index.data, preds_size.data)
+            base_only, composed = _compose_if_dual(preds_out, converter, args)
+            eval_strings = composed  # full (with diacritics)
         else:
-            preds = preds.float()
+            preds = preds_out
             preds_size = torch.IntTensor([preds.size(1)] * batch_size)
             preds = preds.permute(1, 0, 2).log_softmax(2)
             torch.backends.cudnn.enabled = False
@@ -104,6 +112,9 @@ def validation(model, criterion, evaluation_loader, converter, args=None):
             preds_index = preds_index.transpose(1, 0).contiguous().view(-1)
             preds_str = converter.decode(preds_index.data, preds_size.data)
             eval_strings = preds_str
+            base_strs = preds_str  # single-head: base == full
+            base_only = base_strs
+            composed = eval_strings
         valid_loss += cost.item()
         count += 1
 
@@ -134,8 +145,35 @@ def validation(model, criterion, evaluation_loader, converter, args=None):
             tot_ED_wer += tmp_ED_wer
             length_of_gt_wer += len(gt_wer)
 
+        # Base-only metrics (only meaningful if dual-head and labels contain diacritics)
+        if dual:
+            base_gts = [vn_tags.decompose_str(lbl)[0] for lbl in labels]
+            for pred_base, gt_base in zip(base_only, base_gts):
+                tmp_ED_b = editdistance.eval(pred_base, gt_base)
+                if len(gt_base) == 0:
+                    norm_ED_base += 1
+                else:
+                    norm_ED_base += tmp_ED_b / float(len(gt_base))
+                tot_ED_base += tmp_ED_b
+                length_of_gt_base += len(gt_base)
+            # WER base (word-level over base strings)
+            for pred_bwer, gt_bwer in zip(base_only, base_gts):
+                pred_bwer_fmt = utils.format_string_for_wer(pred_bwer).split(" ")
+                gt_bwer_fmt = utils.format_string_for_wer(gt_bwer).split(" ")
+                tmp_ED_bwer = editdistance.eval(pred_bwer_fmt, gt_bwer_fmt)
+                if len(gt_bwer_fmt) == 0:
+                    norm_ED_wer_base += 1
+                else:
+                    norm_ED_wer_base += tmp_ED_bwer / float(len(gt_bwer_fmt))
+                tot_ED_wer_base += tmp_ED_bwer
+                length_of_gt_wer_base += len(gt_bwer_fmt)
+
     val_loss = valid_loss / count
     CER = tot_ED / float(length_of_gt)
     WER = tot_ED_wer / float(length_of_gt_wer)
-
-    return val_loss, CER, WER, all_preds_str, all_labels
+    if dual and length_of_gt_base > 0 and length_of_gt_wer_base > 0:
+        CER_base = tot_ED_base / float(length_of_gt_base)
+        WER_base = tot_ED_wer_base / float(length_of_gt_wer_base)
+    else:
+        CER_base, WER_base = CER, WER
+    return val_loss, CER, WER, all_preds_str, all_labels, CER_base, WER_base
