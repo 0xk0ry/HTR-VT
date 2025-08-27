@@ -18,12 +18,13 @@ import random
 import numpy as np
 
 
-def compute_loss(args, model, image, batch_size, criterion, enc):
+def compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx):
     """Compute loss for single or dual-head.
     enc: (text, length) for CTCLabelConverter OR
          (text_base, length_base, tags_mod, tags_tone, per_sample_U) for DualLabelConverter
     """
-    outputs = model(image, args.mask_ratio, args.max_span_length, use_masking=True)
+    with autocast_ctx():
+        outputs = model(image, args.mask_ratio, args.max_span_length, use_masking=True)
     if not isinstance(outputs, dict):
         text, length = enc
         preds = outputs.float()
@@ -78,53 +79,56 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
     tag_alpha = args.tag_alpha
     vowel_only = args.vowel_only_tags
 
+    # Vectorized alignment: iterate frames once per batch element using torch.unique_consecutive
     for b in range(batch_size):
         y = flat_indices[offs[b]:offs[b+1]]
-        U = len(y)
-        if U == 0: continue
-        y_mod = tags_mod_list[b].detach().cpu().tolist()
-        y_tone = tags_tone_list[b].detach().cpu().tolist()
-        frames = base_argmax[b]
+        if not y:
+            continue
+        frames = base_argmax[b]  # [T]
         non_blank = frames != 0
         if not non_blank.any():
             continue
-        prev = torch.cat([torch.tensor([0],device=device), frames[:-1]])
-        change = (frames != prev) & non_blank
-        seg_starts = torch.nonzero(change, as_tuple=True)[0]
-        if len(seg_starts)==0: continue
-        seg_vals = frames[seg_starts]
-        segments=[]
-        for si in range(len(seg_starts)):
-            st = seg_starts[si]
-            en = seg_starts[si+1] if si+1 < len(seg_starts) else len(frames)
-            segments.append((seg_vals[si].item(), torch.arange(st,en,device=device)))
-        gt_to_seg={}
-        seg_idx=0
-        for u, gt in enumerate(y):
-            while seg_idx < len(segments) and segments[seg_idx][0] != gt:
-                seg_idx += 1
-            if seg_idx < len(segments):
-                gt_to_seg[u] = segments[seg_idx][1]
-                seg_idx += 1
-        if not gt_to_seg: continue
+        # Unique consecutive collapse
+        collapsed = torch.unique_consecutive(frames[non_blank])  # sequence of classes
+        # Map collapsed sequence elements to GT order (greedy): find first occurrence sequentially
+        gt_ptr = 0
+        seg_ptr = 0
+        seg_to_indices = []  # store index lists for each matched GT char
+        # Build index mapping of each class in order for frames
+        # Precompute run boundaries on full frame seq for averaging
+        prev = torch.cat([frames[:1], frames[:-1]])
+        change = frames != prev
+        run_starts = torch.nonzero(change, as_tuple=True)[0]
+        run_starts = torch.cat([run_starts, torch.tensor([len(frames)], device=device)])
+        # Iterate runs, match to GT sequentially
+        for r in range(len(run_starts)-1):
+            cls = frames[run_starts[r]]
+            if cls == 0:
+                continue
+            if gt_ptr >= len(y):
+                break
+            if cls.item() == y[gt_ptr]:
+                seg_to_indices.append((gt_ptr, torch.arange(run_starts[r], run_starts[r+1], device=device)))
+                gt_ptr += 1
+        if not seg_to_indices:
+            continue
+        # Prepare losses
+        y_mod = tags_mod_list[b].detach().cpu().tolist()
+        y_tone = tags_tone_list[b].detach().cpu().tolist()
         mod_losses=[]; tone_losses=[]; weights=[]
-        for u in range(U):
-            if u not in gt_to_seg: continue
-            t_idx = gt_to_seg[u]
-            if len(t_idx)==0: continue
-            lpm = logp_mod[b, t_idx, :].mean(dim=0)
-            lpt = logp_tone[b, t_idx, :].mean(dim=0)
-            mod_loss = (-lpm[y_mod[u]]).clamp_min(-60.0)
-            tone_loss = (-lpt[y_tone[u]]).clamp_min(-60.0)
-            # Determine base char for weighting
-            base_char = base_charset[y[u]-1] if 1 <= y[u] <= Cb else ''
+        for gt_index, idx_tensor in seg_to_indices:
+            if gt_index >= len(y):
+                break
+            lpm = logp_mod[b, idx_tensor, :].mean(dim=0)
+            lpt = logp_tone[b, idx_tensor, :].mean(dim=0)
+            # cap extreme losses to avoid inf propagating (e.g., -log(0))
+            mod_loss = torch.clamp(-lpm[y_mod[gt_index]], max=60.0)
+            tone_loss = torch.clamp(-lpt[y_tone[gt_index]], max=60.0)
+            base_char = base_charset[y[gt_index]-1] if 1 <= y[gt_index] <= Cb else ''
             is_vowel = base_char in vowels
-            if vowel_only:
-                if not is_vowel:
-                    continue
-                weight = 1.0
-            else:
-                weight = 1.0 if is_vowel else tag_alpha
+            if vowel_only and not is_vowel:
+                continue
+            weight = 1.0 if is_vowel else (1.0 if vowel_only else tag_alpha)
             mod_losses.append(mod_loss)
             tone_losses.append(tone_loss)
             weights.append(weight)
@@ -178,6 +182,12 @@ def main():
 
     model.train()
     model = model.cuda()
+    if args.use_compile:
+        try:
+            model = torch.compile(model, mode='max-autotune')  # PyTorch 2.x
+            logger.info('Model compiled with torch.compile')
+        except Exception as e:
+            logger.warning(f'torch.compile failed: {e}. Continuing without compile.')
     # Ensure EMA decay is properly accessed (handle both ema_decay and ema-decay)
     ema_decay = getattr(args, 'ema_decay', 0.9999)
     logger.info(f"Using EMA decay: {ema_decay}")
@@ -293,22 +303,28 @@ def main():
     logger.info('Loading train loader...')
     train_dataset = dataset.myLoadDS(
         args.train_data_list, args.data_path, args.img_size)
-    train_loader = torch.utils.data.DataLoader(train_dataset,
-                                               batch_size=args.train_bs,
-                                               shuffle=True,
-                                               pin_memory=True,
-                                               num_workers=args.num_workers,
-                                               collate_fn=partial(dataset.SameTrCollate, args=args))
+    loader_kwargs = dict(batch_size=args.train_bs,
+                         shuffle=True,
+                         pin_memory=True,
+                         num_workers=args.num_workers,
+                         collate_fn=partial(dataset.SameTrCollate, args=args))
+    if args.num_workers > 0:
+        loader_kwargs['persistent_workers'] = (not args.no_persistent_workers)
+        loader_kwargs['prefetch_factor'] = max(2, args.prefetch_factor)
+    train_loader = torch.utils.data.DataLoader(train_dataset, **loader_kwargs)
     train_iter = dataset.cycle_data(train_loader)
 
     logger.info('Loading val loader...')
     val_dataset = dataset.myLoadDS(
         args.val_data_list, args.data_path, args.img_size, ralph=train_dataset.ralph)
-    val_loader = torch.utils.data.DataLoader(val_dataset,
-                                             batch_size=args.val_bs,
-                                             shuffle=False,
-                                             pin_memory=True,
-                                             num_workers=args.num_workers)
+    vloader_kwargs = dict(batch_size=args.val_bs,
+                          shuffle=False,
+                          pin_memory=True,
+                          num_workers=args.num_workers)
+    if args.num_workers > 0:
+        vloader_kwargs['persistent_workers'] = (not args.no_persistent_workers)
+        vloader_kwargs['prefetch_factor'] = max(2, args.prefetch_factor)
+    val_loader = torch.utils.data.DataLoader(val_dataset, **vloader_kwargs)
 
     logger.info('Initializing optimizer, criterion and converter...')
     optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
@@ -348,22 +364,47 @@ def main():
 
     #### ---- train & eval ---- ####
     logger.info('Start training...')
+    # AMP context factory
+    amp_dtype = torch.bfloat16 if args.amp_dtype == 'bf16' and torch.cuda.is_available() else torch.float16
+    def autocast_ctx():
+        return torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=args.use_amp)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.use_amp and args.amp_dtype=='fp16'))
+
     for nb_iter in range(start_iter, args.total_iter):
         optimizer, current_lr = utils.update_lr_cos(
             nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer)
 
         # ----- forward & backward -----
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         batch = next(train_iter)
         image = batch[0].cuda()
         enc = converter.encode(batch[1])
         batch_size = image.size(0)
-        loss = compute_loss(args, model, image, batch_size, criterion, enc)
-        loss.backward()
-        optimizer.first_step(zero_grad=True)
-        compute_loss(args, model, image, batch_size, criterion, enc).backward()
-        optimizer.second_step(zero_grad=True)
-        model.zero_grad()
+        loss = compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx)
+        if scaler.is_enabled():
+            # First SAM step
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            optimizer.first_step(zero_grad=True)
+            # Second forward/backward on perturbed weights
+            loss2 = compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx)
+            scaler.scale(loss2).backward()
+            scaler.unscale_(optimizer)
+            # Restore weights & step (second_step) using unscaled grads
+            optimizer.second_step(zero_grad=True)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.first_step(zero_grad=True)
+            compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx).backward()
+            optimizer.second_step(zero_grad=True)
+
+        # NaN/inf guard
+        if not torch.isfinite(loss):
+            logger.error(f"Non-finite loss detected (loss={loss.item()}). Aborting iteration {nb_iter}.")
+            break
+        model.zero_grad(set_to_none=True)
         model_ema.update(model, num_updates=nb_iter / 2)
         train_loss += loss.item()
         train_loss_count += 1
