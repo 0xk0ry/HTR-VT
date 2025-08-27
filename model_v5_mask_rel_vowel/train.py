@@ -14,176 +14,203 @@ from model import HTR_VT
 from functools import partial
 import random
 import numpy as np
-import re
 import importlib
+from utils import vn_tags
+import editdistance
 
 
 def compute_loss(args, model, image, batch_size, criterion, enc):
-    """Compute loss for base head and optionally tone head when tone head is enabled.
-    enc: output of converter.encode(labels). For CTC converter it's (text, length),
-         for ToneLabelConverter it's (text_base, length_base, tags_tone, per_sample_U)
+    """
+    Compute loss for base head and optionally tag heads when dual-head is enabled.
+    Args:
+        args: argparse.Namespace, training arguments
+        model: torch.nn.Module, the model
+        image: torch.Tensor, input images
+        batch_size: int, batch size
+        criterion: loss function (CTC)
+        enc: tuple, output of converter.encode(labels)
+            - For CTC converter: (text, length)
+            - For DualLabelConverter: (text_base, length_base, tags_mod, tags_tone, per_sample_U)
+    Returns:
+        torch.Tensor: total loss
     """
     outputs = model(image, args.mask_ratio,
                     args.max_span_length, use_masking=True)
-    use_tone = isinstance(outputs, dict)
+    use_dual = isinstance(outputs, dict)
 
-    if not use_tone:
-        # Single head path (original CTC)
+    if not use_dual:
         text, length = enc
         preds = outputs.float()
-        preds_size = torch.IntTensor([preds.size(1)] * batch_size).cuda()
+        preds_size = torch.IntTensor([preds.size(1)] * batch_size).to(preds.device)
         preds = preds.permute(1, 0, 2).log_softmax(2)
         torch.backends.cudnn.enabled = False
-        loss = criterion(preds, text.cuda(), preds_size, length.cuda()).mean()
+        loss = criterion(preds, text.to(preds.device), preds_size, length.to(preds.device)).mean()
         torch.backends.cudnn.enabled = True
         return loss
 
-    # Tone head path
-    text_base, length_base, tags_tone_list, _ = enc
+    # Dual-head path (base + modifier + tone)
+    text_base, length_base, tags_mod_list, tags_tone_list, _ = enc
     base = outputs['base'].float()  # [B, T, Cb]
+    mod_logits = outputs['mod'].float()  # [B, T, 4]
     tone_logits = outputs['tone'].float()  # [B, T, 6]
     T = base.size(1)
-    device = base.device
-    preds_size = torch.IntTensor([T] * batch_size).to(device)
+    preds_size = torch.IntTensor([T] * batch_size).to(base.device)
 
-    # Base CTC loss
+    # Base CTC (unchanged)
     base_logp = base.permute(1, 0, 2).log_softmax(2)
     torch.backends.cudnn.enabled = False
-    base_loss = criterion(base_logp, text_base.to(
-        device), preds_size, length_base.to(device)).mean()
+    base_loss = criterion(base_logp, text_base.to(base.device),
+                        preds_size, length_base.to(base.device)).mean()
     torch.backends.cudnn.enabled = True
 
-    # Check if tone loss should be computed
-    lambda_tone = getattr(args, 'lambda_tone', 0.7)
-    if lambda_tone == 0.0:
-        return base_loss
-
-    # Tone loss computation (adapted from model_v5_mask)
-    tag_alpha = getattr(args, 'tag_alpha', 0.2)
-
-    # Pre-compute log probabilities
-    logp_tone = torch.nn.functional.log_softmax(tone_logits, dim=2)
-
-    # Get base predictions for alignment
+    # Best-path alignment proxy for tags (greedy, run-length, map to GT order)
     with torch.no_grad():
+        # frame-wise argmax over base classes
         base_argmax = base.argmax(dim=2)  # [B, T]
 
-    # Optimized batch processing
+    batch_mod_losses = []
+    batch_tone_losses = []
+
+    # Build once per batch (moved outside the loop for efficiency)
+    base_charset_str = utils.build_base_charset()
+    Cb = len(base_charset_str)
+    tag_alpha = getattr(args, 'tag_alpha', 0.2)
+
+    # Prepare cumulative offsets to slice text_base flat
     lengths_cpu = length_base.detach().cpu().tolist()
     flat_indices = text_base.detach().cpu().tolist()
+    offs = [0]
+    for l in lengths_cpu:
+        offs.append(offs[-1] + l)
 
-    # Cache vowel information
-    if not hasattr(compute_loss, '_vowel_chars'):
-        from utils import vn_tone_tags
-        compute_loss._vowel_chars = set('aăâeêioôơuưyAĂÂEÊIOÔƠUƯY')
-        compute_loss._vn_tone_tags = vn_tone_tags
+    # Use log_softmax once (faster + more stable than softmax + log)
+    logp_mod = torch.nn.functional.log_softmax(mod_logits, dim=2)
+    logp_tone = torch.nn.functional.log_softmax(tone_logits, dim=2)
 
-    vowel_chars = compute_loss._vowel_chars
-    base_charset_str = utils.build_base_charset()
-
-    # Process each sample in batch
-    batch_tone_losses = torch.zeros(batch_size, device=device)
-    batch_valid_mask = torch.zeros(batch_size, device=device)
-
-    flat_idx = 0
     for b in range(batch_size):
-        U = lengths_cpu[b]
-        if U == 0:
+        # Ground-truth indices for this sample (1..Cb-1); 0 is blank
+        y = flat_indices[offs[b]:offs[b+1]]  # length U
+        U = len(y)
+        
+        # Check if we have valid tag lists for this sample
+        if b >= len(tags_mod_list) or b >= len(tags_tone_list):
+            # Skip this sample if tag lists are incomplete
+            batch_mod_losses.append(torch.tensor(0.0, device=base.device))
+            batch_tone_losses.append(torch.tensor(0.0, device=base.device))
+            continue
+            
+        y_mod = tags_mod_list[b].detach().cpu().tolist()  # 0..3
+        y_tone = tags_tone_list[b].detach().cpu().tolist()  # 0..5
+        
+        # Ensure tag lists have the same length as GT sequence
+        if len(y_mod) != U or len(y_tone) != U:
+            # Skip this sample if lengths don't match
+            batch_mod_losses.append(torch.tensor(0.0, device=base.device))
+            batch_tone_losses.append(torch.tensor(0.0, device=base.device))
             continue
 
-        # Get ground truth for this sample
-        y = flat_indices[flat_idx:flat_idx + U]
-        y_tone = tags_tone_list[b].cpu().tolist()
-        flat_idx += U
+    # Build vowel mask from GT base indices (uses utils.build_base_charset to map indices->chars)
+    # base_chars: length U, empty string for out-of-range indices
+        base_chars = [base_charset_str[idx - 1] if 1 <= idx <= Cb else '' for idx in y]
+        vowel_mask = torch.tensor([vn_tags.is_vowel(ch) for ch in base_chars], device=base.device, dtype=torch.float32)
 
-        # Create vowel mask for weighting
-        vowel_mask = torch.zeros(U)
+    # Build run-length segments from best-path over frames (greedy CTC-style)
+        frames = base_argmax[b].detach().cpu().tolist()  # [T]
+        # list of (cls_idx, [frame_indices]) excluding blanks (0)
+        segments = []
+        prev = None
+        current_frames = []
+        for t, k in enumerate(frames):
+            if k == 0:
+                # blank: break segment
+                if prev is not None:
+                    segments.append((prev, current_frames))
+                    prev = None
+                    current_frames = []
+                continue
+            if prev is None or k != prev:
+                # start new segment
+                if prev is not None and current_frames:
+                    segments.append((prev, current_frames))
+                prev = int(k)
+                current_frames = [t]
+            else:
+                current_frames.append(t)
+        if prev is not None and current_frames:
+            segments.append((prev, current_frames))
+
+    # Map GT positions to matching segments in order (greedy)
+        seg_ptr = 0
+        matched = 0
+    # Per-character CE placeholders (so we can mask by vowel positions later)
+        ce_mod_u = torch.zeros(U, device=base.device)
+        ce_tone_u = torch.zeros(U, device=base.device)
+        have_pred = torch.zeros(U, device=base.device)
+        
         for u in range(U):
-            if y[u] > 0 and y[u] <= len(base_charset_str):
-                char = base_charset_str[y[u] - 1]
-                vowel_mask[u] = 1.0 if char in vowel_chars else 0.0
+            yt = y[u]
+            # Find the next segment matching current GT class
+            found_segment = False
+            original_seg_ptr = seg_ptr
+            
+            while seg_ptr < len(segments):
+                if segments[seg_ptr][0] == yt:
+                    found_segment = True
+                    break
+                seg_ptr += 1
+            
+            if not found_segment:
+                # Reset seg_ptr and continue to next GT position
+                seg_ptr = original_seg_ptr
+                continue
+                
+            _, t_idx = segments[seg_ptr]
+            seg_ptr += 1
+            
+            if not t_idx:
+                continue
+                
+            # Validate tag indices before using them
+            if y_mod[u] >= mod_logits.size(2) or y_tone[u] >= tone_logits.size(2):
+                continue
+                
+            # Aggregate probabilities over frames in this segment
+            lpm = logp_mod[b, t_idx, :].mean(dim=0)  # [4]
+            lpt = logp_tone[b, t_idx, :].mean(dim=0)  # [6]
+            # CE = -log p[target]
+            ce_val_mod = (-lpm[y_mod[u]].clamp_min(-60.0))
+            ce_val_tone = (-lpt[y_tone[u]].clamp_min(-60.0))
+            ce_mod_u[u] = ce_val_mod
+            ce_tone_u[u] = ce_val_tone
+            have_pred[u] = 1.0
+            matched += 1
+            
+        # Weighting: either vowel-only supervision or mixed (vowel + consonant with alpha)
+        if getattr(args, 'vowel_only_tags', False):
+            weights = vowel_mask  # consonants get zero weight
+        else:
+            # weights = 1 for vowels, alpha for consonants
+            weights = vowel_mask + tag_alpha * (1.0 - vowel_mask)
+        eff_w = weights * have_pred
+        eps_mask = 1e-6
+        denom = eff_w.sum() + eps_mask
+        L_mod = (eff_w * ce_mod_u).sum() / denom if denom > eps_mask else torch.tensor(0.0, device=base.device)
+        L_tone = (eff_w * ce_tone_u).sum() / denom if denom > eps_mask else torch.tensor(0.0, device=base.device)
+        batch_mod_losses.append(L_mod)
+        batch_tone_losses.append(L_tone)
 
-        # Get predicted frames for alignment
-        frames = base_argmax[b]  # [T]
+    # Average across batch
+    mod_loss = torch.stack(batch_mod_losses).mean() if batch_mod_losses else torch.tensor(0.0, device=base.device)
+    tone_loss = torch.stack(batch_tone_losses).mean() if batch_tone_losses else torch.tensor(0.0, device=base.device)
 
-        # Simple alignment: find segments for each ground truth position
-        non_blank_mask = frames != 0
-        if not non_blank_mask.any():
-            continue
-
-        # Extract frame segments
-        prev_frames = torch.cat(
-            [torch.tensor([0], device=device), frames[:-1]])
-        change_points = (frames != prev_frames) & non_blank_mask
-        segment_starts = torch.nonzero(change_points, as_tuple=True)[0]
-
-        if len(segment_starts) == 0:
-            continue
-
-        # Map segments to ground truth positions
-        segment_values = frames[segment_starts]
-        valid_segments = []
-
-        for start_idx in range(len(segment_starts)):
-            start_pos = segment_starts[start_idx]
-            end_pos = segment_starts[start_idx + 1] if start_idx + \
-                1 < len(segment_starts) else len(frames)
-            segment_frames = torch.arange(start_pos, end_pos, device=device)
-            segment_class = segment_values[start_idx].item()
-            valid_segments.append((segment_class, segment_frames))
-
-        # Match ground truth to segments
-        gt_to_segment = {}
-        seg_idx = 0
-        for u, gt_class in enumerate(y):
-            while seg_idx < len(valid_segments) and valid_segments[seg_idx][0] != gt_class:
-                seg_idx += 1
-            if seg_idx < len(valid_segments):
-                gt_to_segment[u] = valid_segments[seg_idx][1]
-                seg_idx += 1
-
-        # Compute tone losses
-        if gt_to_segment:
-            tone_losses = []
-            weights = []
-
-            for u in range(U):
-                if u in gt_to_segment:
-                    t_indices = gt_to_segment[u]
-                    if len(t_indices) > 0:
-                        # Average tone predictions over segment frames
-                        lpt = logp_tone[b, t_indices, :].mean(dim=0)
-                        tone_loss = (-lpt[y_tone[u]]).clamp_min(-60.0)
-                        tone_losses.append(tone_loss)
-
-                        # Weight: 1.0 for vowels, tag_alpha for consonants
-                        weight = 1.0 if vowel_mask[u] > 0.5 else tag_alpha
-                        weights.append(weight)
-
-            if tone_losses:
-                # Weighted average
-                tone_tensor = torch.stack(tone_losses)
-                weight_tensor = torch.tensor(weights, device=device)
-                total_weight = weight_tensor.sum() + 1e-6
-                batch_tone_losses[b] = (
-                    weight_tensor * tone_tensor).sum() / total_weight
-                batch_valid_mask[b] = 1.0
-
-    # Final loss aggregation
-    valid_samples = batch_valid_mask.sum()
-    if valid_samples > 0:
-        tone_loss = (batch_tone_losses *
-                     batch_valid_mask).sum() / valid_samples
-    else:
-        tone_loss = torch.tensor(0.0, device=device)
-
-    return base_loss + lambda_tone * tone_loss
+    return base_loss + args.lambda_mod * mod_loss + args.lambda_tone * tone_loss
 
 
 def main():
 
     args = option.get_args_parser()
     torch.manual_seed(args.seed)
+    cudnn.benchmark = True
 
     args.save_dir = os.path.join(args.out_dir, args.exp_name)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -206,17 +233,13 @@ def main():
     else:
         wandb = None
 
-    # Initialize model with tone head support
-    if getattr(args, 'use_tone_head', False):
+    if args.use_dual_head:
         base_charset_str = utils.build_base_charset()
         nb_cls = len(base_charset_str) + 1
-        logger.info(f"Using tone head mode with base charset size: {nb_cls}")
-        model = HTR_VT.create_model(
-            nb_cls=nb_cls, img_size=args.img_size[::-1], use_tone_head=True)
     else:
-        model = HTR_VT.create_model(
-            nb_cls=args.nb_cls, img_size=args.img_size[::-1])
-        logger.info(f"Using single head mode with charset size: {args.nb_cls}")
+        full_charset_str = utils.build_full_charset()
+        nb_cls = len(full_charset_str) + 1
+    model = HTR_VT.create_model(nb_cls=nb_cls, img_size=args.img_size[::-1], use_dual_head=args.use_dual_head)
 
     total_param = sum(p.numel() for p in model.parameters())
     logger.info('total_param is {}'.format(total_param))
@@ -229,42 +252,49 @@ def main():
     model_ema = utils.ModelEma(model, ema_decay)
     model.zero_grad()
 
-    # Use centralized checkpoint loader like model_v4-2
-    resume_path = args.resume
+    # Use centralized checkpoint loader
+    resume_path = args.resume if getattr(
+        args, 'resume', None) else getattr(args, 'resume_checkpoint', None)
     best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count = utils.load_checkpoint(
         model, model_ema, None, resume_path, logger)
 
     logger.info('Loading train loader...')
     train_dataset = dataset.myLoadDS(
-        args.train_data_list, args.data_path, args.img_size)
-    train_loader = torch.utils.data.DataLoader(train_dataset,
-                                               batch_size=args.train_bs,
-                                               shuffle=True,
-                                               pin_memory=True,
-                                               num_workers=args.num_workers,
-                                               collate_fn=partial(dataset.SameTrCollate, args=args))
+        args.train_data_list, args.data_path, args.img_size, ralph=utils.VIETNAMESE_CHARACTERS)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.train_bs,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=args.num_workers,
+        persistent_workers=True if args.num_workers and args.num_workers > 0 else False,
+        prefetch_factor=2,
+        collate_fn=partial(dataset.SameTrCollate, args=args),
+    )
     train_iter = dataset.cycle_data(train_loader)
 
     logger.info('Loading val loader...')
     val_dataset = dataset.myLoadDS(
-        args.val_data_list, args.data_path, args.img_size, ralph=train_dataset.ralph)
-    val_loader = torch.utils.data.DataLoader(val_dataset,
-                                             batch_size=args.val_bs,
-                                             shuffle=False,
-                                             pin_memory=True,
-                                             num_workers=args.num_workers)
+        args.val_data_list, args.data_path, args.img_size, ralph=utils.VIETNAMESE_CHARACTERS)
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=args.val_bs,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=args.num_workers,
+        persistent_workers=True if args.num_workers and args.num_workers > 0 else False,
+        prefetch_factor=2,
+    )
 
     optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
                         lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
-
-    # Initialize appropriate converter
-    if getattr(args, 'use_tone_head', False):
-        converter = utils.ToneLabelConverter(utils.build_base_charset())
-        logger.info("Using ToneLabelConverter for tone head training")
+    if args.use_dual_head:
+        base_charset_str = utils.build_base_charset()
+        converter = utils.DualLabelConverter(base_charset_str)
     else:
-        converter = utils.CTCLabelConverter(train_dataset.ralph.values())
-        logger.info("Using CTCLabelConverter for standard training")
+        full_charset_str = utils.build_full_charset()
+        converter = utils.CTCLabelConverter(full_charset_str)
 
     # Load optimizer state after initialization
     if optimizer_state is not None:
@@ -279,7 +309,7 @@ def main():
     best_cer, best_wer = best_cer, best_wer
     train_loss = train_loss
     train_loss_count = train_loss_count
-    #### ---- train & eval ---- ####
+    # ---- train & eval ---- #
     logger.info('Start training...')
     for nb_iter in range(start_iter, args.total_iter):
 
@@ -288,29 +318,13 @@ def main():
 
         optimizer.zero_grad()
         batch = next(train_iter)
-        image = batch[0].cuda()
-
-        if getattr(args, 'use_tone_head', False):
-            # Tone head mode: encode returns (text_base, length_base, tags_tone, per_sample_U)
-            enc = converter.encode(batch[1])
-            text_base, length_base, tags_tone_list, per_sample_U = enc
-            batch_size = image.size(0)
-            loss = compute_loss(args, model, image, batch_size, criterion, enc)
-            loss.backward()
-            optimizer.first_step(zero_grad=True)
-            compute_loss(args, model, image, batch_size,
-                         criterion, enc).backward()
-        else:
-            # Single head mode: encode returns (text, length)
-            text, length = converter.encode(batch[1])
-            batch_size = image.size(0)
-            loss = compute_loss(args, model, image,
-                                batch_size, criterion, (text, length))
-            loss.backward()
-            optimizer.first_step(zero_grad=True)
-            compute_loss(args, model, image, batch_size,
-                         criterion, (text, length)).backward()
-
+        image = batch[0].cuda(non_blocking=True)
+        enc = converter.encode(batch[1])
+        batch_size = image.size(0)
+        loss = compute_loss(args, model, image, batch_size, criterion, enc)
+        loss.backward()
+        optimizer.first_step(zero_grad=True)
+        compute_loss(args, model, image, batch_size, criterion, enc).backward()
         optimizer.second_step(zero_grad=True)
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
@@ -340,7 +354,8 @@ def main():
                 val_loss, val_cer, val_wer, preds, labels = valid.validation(model_ema.ema,
                                                                              criterion,
                                                                              val_loader,
-                                                                             converter)
+                                                                             converter,
+                                                                             args=args)
                 # Save checkpoint every print interval (like model_v4-2)
                 ckpt_name = f"checkpoint_{best_cer:.4f}_{best_wer:.4f}_{nb_iter}.pth"
                 checkpoint = {
