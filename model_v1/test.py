@@ -24,7 +24,7 @@ def main():
     model = HTR_VT.create_model(
         nb_cls=args.nb_cls, img_size=args.img_size[::-1])
 
-    pth_path = '/kaggle/input/htr-vt/pytorch/default-iam/8/checkpoint_0.0324_0.1066_100000.pth'
+    pth_path = args.resume
     logger.info('loading HWR checkpoint from {}'.format(pth_path))
 
     ckpt = torch.load(pth_path, map_location='cpu', weights_only=False)
@@ -150,8 +150,17 @@ def main():
         return _levenshtein(pred_words, gt_words) / len(gt_words)
 
     for i, (pred, label) in enumerate(zip(preds, labels)):
+        # Retrieve corresponding image file path from dataset (test_dataset order matches loader order with shuffle=False)
+        if i < len(test_dataset.fns):
+            img_path = test_dataset.fns[i]
+            img_name = os.path.basename(img_path)
+        else:
+            img_path = None
+            img_name = None
         results["predictions"].append({
             "sample_id": i + 1,
+            "image_filename": img_name,
+            "image_path": img_path,
             "prediction": pred,
             "ground_truth": label,
             "match": pred == label,
