@@ -396,7 +396,7 @@ def main():
             logger.error(f"Non-finite loss detected (loss={loss.item()}). Aborting iteration {nb_iter}.")
             assert False, "Non-finite loss detected"
         model.zero_grad(set_to_none=True)
-        model_ema.update(model, num_updates=nb_iter / 2)
+        model_ema.update(model, num_updates=nb_iter / 4)
         train_loss += loss.item()
         train_loss_count += 1
 
@@ -428,6 +428,10 @@ def main():
                         'nb_iter': nb_iter,
                         'best_cer': best_cer,
                         'best_wer': best_wer,
+                        'val_cer_full': val_cer,
+                        'val_wer_full': val_wer,
+                        'val_cer_base': val_cer_base,
+                        'val_wer_base': val_wer_base,
                         'args': vars(args),
                         'random_state': random.getstate(),
                         'numpy_state': np.random.get_state(),
@@ -449,6 +453,10 @@ def main():
                         'nb_iter': nb_iter,
                         'best_cer': best_cer,
                         'best_wer': best_wer,
+                        'val_cer_full': val_cer,
+                        'val_wer_full': val_wer,
+                        'val_cer_base': val_cer_base,
+                        'val_wer_base': val_wer_base,
                         'args': vars(args),
                         'random_state': random.getstate(),
                         'numpy_state': np.random.get_state(),
@@ -476,6 +484,10 @@ def main():
                     'nb_iter': nb_iter,
                     'best_cer': best_cer,
                     'best_wer': best_wer,
+                    'val_cer_full': val_cer,
+                    'val_wer_full': val_wer,
+                    'val_cer_base': val_cer_base,
+                    'val_wer_base': val_wer_base,
                     'args': vars(args),
                     'random_state': random.getstate(),
                     'numpy_state': np.random.get_state(),
@@ -527,15 +539,21 @@ def main():
                         examples_table.add_data(nb_iter, i, wandb.Image(
                             img_tensor), pred_text, true_text, bool(is_correct))
 
-                    wandb.log({
+                    log_payload = {
                         "val/loss": val_loss,
-                        "val/CER": val_cer,
-                        "val/WER": val_wer,
+                        "val/CER_full": val_cer,
+                        "val/WER_full": val_wer,
                         "val/best_CER": best_cer,
                         "val/best_WER": best_wer,
                         "val/examples_table": examples_table,
                         "iter": nb_iter
-                    }, step=nb_iter)
+                    }
+                    if args.use_dual_head:
+                        log_payload.update({
+                            "val/CER_base": val_cer_base,
+                            "val/WER_base": val_wer_base
+                        })
+                    wandb.log(log_payload, step=nb_iter)
                 model.train()
 
 
