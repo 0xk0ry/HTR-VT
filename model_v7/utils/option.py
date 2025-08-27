@@ -132,6 +132,8 @@ def get_args_parser():
                         help='DataLoader prefetch_factor (only if num_workers>0)')
     parser.add_argument('--no-persistent-workers', action='store_true', default=False,
                         help='Disable persistent_workers even if num_workers>0')
+    parser.add_argument('--grad-clip', type=float, default=0.0,
+                        help='Max gradient norm (0 to disable clipping)')
 
     subparsers = parser.add_subparsers(
         title="dataset setting", dest="subcommand")

@@ -383,21 +383,29 @@ def main():
         batch_size = image.size(0)
         loss = compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx)
         if scaler.is_enabled():
-            # First SAM step
+            # First SAM step: scale, backward, unscale once, (optional clip), first_step
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.first_step(zero_grad=True)
-            # Second forward/backward on perturbed weights
+            # Second step forward/backward on perturbed weights
             loss2 = compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx)
             scaler.scale(loss2).backward()
-            scaler.unscale_(optimizer)
-            # Restore weights & step (second_step) using unscaled grads
+            scaler.unscale_(optimizer)  # safe: grads were zeroed by first_step, this is first unscale for second backward
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.second_step(zero_grad=True)
             scaler.update()
         else:
             loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.first_step(zero_grad=True)
-            compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx).backward()
+            loss2 = compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx)
+            loss2.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.second_step(zero_grad=True)
 
         # NaN/inf guard
