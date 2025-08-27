@@ -180,6 +180,16 @@ def main():
     total_param = sum(p.numel() for p in model.parameters())
     logger.info('total_param is {}'.format(total_param))
 
+    # ---- Sanity check: nb_cls must match derived charset length (CTC: base chars + blank) ----
+    if args.use_dual_head:
+        base_charset = args.base_charset if getattr(args, 'base_charset', None) else utils.build_base_charset()
+        expected_nb_cls = len(base_charset) + 1  # +1 for CTC blank
+        if args.nb_cls != expected_nb_cls:
+            raise ValueError(f"nb_cls ({args.nb_cls}) mismatch: base charset length {len(base_charset)} requires nb_cls={expected_nb_cls} (including CTC blank). Set --nb-cls accordingly or adjust --base-charset.")
+    else:
+        # For single-head path we can infer from training dataset ralph after dataset load (done later), so defer.
+        pass
+
     model.train()
     model = model.cuda()
     # torch.compile removed (simplified FP32 training)
@@ -298,6 +308,10 @@ def main():
     logger.info('Loading train loader...')
     train_dataset = dataset.myLoadDS(
         args.train_data_list, args.data_path, args.img_size)
+    if not args.use_dual_head:
+        inferred_len = len(train_dataset.ralph.values()) + 1  # chars + blank
+        if args.nb_cls != inferred_len:
+            raise ValueError(f"nb_cls ({args.nb_cls}) mismatch: dataset charset length {inferred_len-1} requires nb_cls={inferred_len} (including CTC blank). Update --nb-cls or dataset charset.")
     loader_kwargs = dict(batch_size=args.train_bs,
                          shuffle=True,
                          pin_memory=True,
