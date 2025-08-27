@@ -86,7 +86,12 @@ def validation(model, criterion, evaluation_loader, converter, args=None):
         batch_size = image_tensors.size(0)
         image = image_tensors.cuda()
 
-        text_for_loss, length_for_loss = converter.encode(labels)
+        enc = converter.encode(labels)
+        # Support DualLabelConverter (5-tuple) and CTCLabelConverter (2-tuple)
+        if isinstance(enc, (list, tuple)) and len(enc) == 5:
+            text_for_loss, length_for_loss = enc[0], enc[1]
+        else:
+            text_for_loss, length_for_loss = enc
 
         preds_out = model(image)
         if isinstance(preds_out, dict):
