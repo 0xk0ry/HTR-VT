@@ -27,8 +27,8 @@ def compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx):
         outputs = model(image, args.mask_ratio, args.max_span_length, use_masking=True)
     if not isinstance(outputs, dict):
         text, length = enc
-        preds = outputs.float()
-        preds_size = torch.IntTensor([preds.size(1)] * batch_size).to(preds.device)
+        preds = outputs  # already float32
+        preds_size = torch.full((batch_size,), preds.size(1), dtype=torch.int32, device=preds.device)
         preds = preds.permute(1,0,2).log_softmax(2)
         torch.backends.cudnn.enabled = False
         loss = criterion(preds, text.to(preds.device), preds_size, length.to(preds.device)).mean()
@@ -36,16 +36,16 @@ def compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx):
         return loss
 
     # Dual-head path
-    text_base, length_base, tags_mod_list, tags_tone_list, _ = enc
-    base = outputs['base'].float()
-    mod_logits = outputs['mod'].float()
-    tone_logits = outputs['tone'].float()
+    text_base, length_base, tags_mod_list, tags_tone_list, _ = enc  # tensors already on device
+    base = outputs['base']
+    mod_logits = outputs['mod']
+    tone_logits = outputs['tone']
     device = base.device
     T = base.size(1)
-    preds_size = torch.IntTensor([T]*batch_size).to(device)
+    preds_size = torch.full((batch_size,), T, dtype=torch.int32, device=device)
     base_logp = base.permute(1,0,2).log_softmax(2)
     torch.backends.cudnn.enabled = False
-    base_loss = criterion(base_logp, text_base.to(device), preds_size, length_base.to(device)).mean()
+    base_loss = criterion(base_logp, text_base, preds_size, length_base).mean()
     torch.backends.cudnn.enabled = True
 
     lambda_mod = args.lambda_mod
@@ -56,22 +56,24 @@ def compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx):
     with torch.no_grad():
         base_argmax = base.argmax(dim=2)
 
-    # Static cache for charset & vowels
+    # Static cache for charset & vowel mask tensor (index aligned with CTC classes)
     if not hasattr(compute_loss, '_cached'):
         base_charset = args.base_charset if getattr(args, 'base_charset', None) else utils.build_base_charset()
-        vowels = set('aeiouAEIOU')  # simple vowel set for weighting
-        compute_loss._cached = (base_charset, vowels)
-    base_charset, vowels = compute_loss._cached
+        vowels = set('aeiouAEIOU')
+        # Build vowel mask with length = len(base_charset)+1 (index 0 = blank)
+        vowel_mask = torch.zeros(len(base_charset)+1, dtype=torch.bool)
+        for i,ch in enumerate(base_charset, start=1):
+            if ch in vowels:
+                vowel_mask[i] = True
+        compute_loss._cached = (base_charset, vowel_mask.to(device))
+    base_charset, vowel_mask = compute_loss._cached
     Cb = len(base_charset)
 
     logp_mod = torch.nn.functional.log_softmax(mod_logits, dim=2)
     logp_tone = torch.nn.functional.log_softmax(tone_logits, dim=2)
 
-    lengths_cpu = length_base.detach().cpu().tolist()
-    flat_indices = text_base.detach().cpu().tolist()
-    offs=[0]
-    for l in lengths_cpu:
-        offs.append(offs[-1]+l)
+    # Offsets to slice flat text_base per sample (device-side, no Python list needed)
+    offs = torch.cat([torch.zeros(1, dtype=length_base.dtype, device=device), length_base.cumsum(0)])
 
     batch_mod_losses = torch.zeros(batch_size, device=device)
     batch_tone_losses = torch.zeros(batch_size, device=device)
@@ -81,62 +83,53 @@ def compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx):
 
     # Vectorized alignment: iterate frames once per batch element using torch.unique_consecutive
     for b in range(batch_size):
-        y = flat_indices[offs[b]:offs[b+1]]
-        if not y:
+        start = offs[b].item(); end = offs[b+1].item()
+        if end <= start:
             continue
+        y = text_base[start:end]  # tensor of labels (CTC indices)
         frames = base_argmax[b]  # [T]
         non_blank = frames != 0
         if not non_blank.any():
             continue
-        # Unique consecutive collapse
-        collapsed = torch.unique_consecutive(frames[non_blank])  # sequence of classes
-        # Map collapsed sequence elements to GT order (greedy): find first occurrence sequentially
-        gt_ptr = 0
-        seg_ptr = 0
-        seg_to_indices = []  # store index lists for each matched GT char
-        # Build index mapping of each class in order for frames
-        # Precompute run boundaries on full frame seq for averaging
+        # Run-length encode frames
         prev = torch.cat([frames[:1], frames[:-1]])
         change = frames != prev
         run_starts = torch.nonzero(change, as_tuple=True)[0]
         run_starts = torch.cat([run_starts, torch.tensor([len(frames)], device=device)])
-        # Iterate runs, match to GT sequentially
+        gt_ptr = 0
+        y_mod = tags_mod_list[b]
+        y_tone = tags_tone_list[b]
+        mod_acc = []
+        tone_acc = []
+        weight_acc = []
         for r in range(len(run_starts)-1):
             cls = frames[run_starts[r]]
             if cls == 0:
                 continue
-            if gt_ptr >= len(y):
+            if gt_ptr >= y.numel():
                 break
-            if cls.item() == y[gt_ptr]:
-                seg_to_indices.append((gt_ptr, torch.arange(run_starts[r], run_starts[r+1], device=device)))
+            if cls == y[gt_ptr]:
+                idx_tensor = torch.arange(run_starts[r], run_starts[r+1], device=device)
+                # Mean log prob over the segment then index target
+                mod_lp = logp_mod[b, idx_tensor, y_mod[gt_ptr]].mean()
+                tone_lp = logp_tone[b, idx_tensor, y_tone[gt_ptr]].mean()
+                is_vowel = vowel_mask[y[gt_ptr]]
+                if vowel_only and not is_vowel:
+                    gt_ptr += 1
+                    continue
+                weight = 1.0 if is_vowel else (1.0 if vowel_only else tag_alpha)
+                mod_acc.append(torch.clamp(-mod_lp, max=60.0))
+                tone_acc.append(torch.clamp(-tone_lp, max=60.0))
+                weight_acc.append(weight)
                 gt_ptr += 1
-        if not seg_to_indices:
-            continue
-        # Prepare losses
-        y_mod = tags_mod_list[b].detach().cpu().tolist()
-        y_tone = tags_tone_list[b].detach().cpu().tolist()
-        mod_losses=[]; tone_losses=[]; weights=[]
-        for gt_index, idx_tensor in seg_to_indices:
-            if gt_index >= len(y):
-                break
-            lpm = logp_mod[b, idx_tensor, :].mean(dim=0)
-            lpt = logp_tone[b, idx_tensor, :].mean(dim=0)
-            # cap extreme losses to avoid inf propagating (e.g., -log(0))
-            mod_loss = torch.clamp(-lpm[y_mod[gt_index]], max=60.0)
-            tone_loss = torch.clamp(-lpt[y_tone[gt_index]], max=60.0)
-            base_char = base_charset[y[gt_index]-1] if 1 <= y[gt_index] <= Cb else ''
-            is_vowel = base_char in vowels
-            if vowel_only and not is_vowel:
-                continue
-            weight = 1.0 if is_vowel else (1.0 if vowel_only else tag_alpha)
-            mod_losses.append(mod_loss)
-            tone_losses.append(tone_loss)
-            weights.append(weight)
-        if mod_losses:
-            w = torch.tensor(weights, device=device)
-            batch_mod_losses[b] = (w*torch.stack(mod_losses)).sum()/(w.sum()+1e-6)
-            batch_tone_losses[b] = (w*torch.stack(tone_losses)).sum()/(w.sum()+1e-6)
-            batch_mask[b]=1.0
+        if mod_acc:
+            w = torch.tensor(weight_acc, device=device)
+            mod_stack = torch.stack(mod_acc)
+            tone_stack = torch.stack(tone_acc)
+            denom = w.sum() + 1e-6
+            batch_mod_losses[b] = (w*mod_stack).sum()/denom
+            batch_tone_losses[b] = (w*tone_stack).sum()/denom
+            batch_mask[b] = 1.0
     valid = batch_mask.sum()
     if valid>0:
         mod_loss = (batch_mod_losses*batch_mask).sum()/valid
@@ -312,14 +305,16 @@ def main():
         inferred_len = len(train_dataset.ralph.values()) + 1  # chars + blank
         if args.nb_cls != inferred_len:
             raise ValueError(f"nb_cls ({args.nb_cls}) mismatch: dataset charset length {inferred_len-1} requires nb_cls={inferred_len} (including CTC blank). Update --nb-cls or dataset charset.")
-    loader_kwargs = dict(batch_size=args.train_bs,
-                         shuffle=True,
-                         pin_memory=True,
-                         num_workers=args.num_workers,
-                         collate_fn=partial(dataset.SameTrCollate, args=args))
+    loader_kwargs = dict(
+        batch_size=args.train_bs,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=args.num_workers,
+        drop_last=True,  # more stable batch shapes
+        collate_fn=partial(dataset.SameTrCollate, args=args))
     if args.num_workers > 0:
         loader_kwargs['persistent_workers'] = (not args.no_persistent_workers)
-        loader_kwargs['prefetch_factor'] = max(2, args.prefetch_factor)
+        loader_kwargs['prefetch_factor'] = max(2, getattr(args, 'prefetch_factor', 2))
     train_loader = torch.utils.data.DataLoader(train_dataset, **loader_kwargs)
     train_iter = dataset.cycle_data(train_loader)
 
@@ -332,7 +327,7 @@ def main():
                           num_workers=args.num_workers)
     if args.num_workers > 0:
         vloader_kwargs['persistent_workers'] = (not args.no_persistent_workers)
-        vloader_kwargs['prefetch_factor'] = max(2, args.prefetch_factor)
+        vloader_kwargs['prefetch_factor'] = max(2, getattr(args, 'prefetch_factor', 2))
     val_loader = torch.utils.data.DataLoader(val_dataset, **vloader_kwargs)
 
     logger.info('Initializing optimizer, criterion and converter...')
@@ -386,7 +381,7 @@ def main():
         # ----- forward & backward -----
         optimizer.zero_grad(set_to_none=True)
         batch = next(train_iter)
-        image = batch[0].cuda()
+        image = batch[0].cuda(non_blocking=True)
         enc = converter.encode(batch[1])
         batch_size = image.size(0)
         loss = compute_loss(args, model, image, batch_size, criterion, enc, autocast_ctx)
@@ -399,7 +394,7 @@ def main():
         # NaN/inf guard
         if not torch.isfinite(loss):
             logger.error(f"Non-finite loss detected (loss={loss.item()}). Aborting iteration {nb_iter}.")
-            break
+            assert False, "Non-finite loss detected"
         model.zero_grad(set_to_none=True)
         model_ema.update(model, num_updates=nb_iter / 2)
         train_loss += loss.item()
