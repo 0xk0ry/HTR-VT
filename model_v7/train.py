@@ -396,7 +396,7 @@ def main():
             logger.error(f"Non-finite loss detected (loss={loss.item()}). Aborting iteration {nb_iter}.")
             assert False, "Non-finite loss detected"
         model.zero_grad(set_to_none=True)
-        model_ema.update(model, num_updates=nb_iter / 4)
+        model_ema.update(model, num_updates=nb_iter / 2)
         train_loss += loss.item()
         train_loss_count += 1
 
