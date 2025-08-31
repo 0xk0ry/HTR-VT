@@ -112,6 +112,14 @@ def main():
 
     args = option.get_args_parser()
 
+    torch.backends.cudnn.benchmark = True          # autotune convs
+    torch.backends.cuda.matmul.allow_tf32 = True   # TF32 speed on Ampere+
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")  # PyTorch 2.x
+    except Exception:
+        pass
+
     torch.manual_seed(args.seed)
 
     args.save_dir = os.path.join(args.out_dir, args.exp_name)
@@ -271,7 +279,8 @@ def main():
     train_iter = dataset.cycle_data(train_loader)
 
     logger.info('Loading val loader...')
-    val_dataset = dataset.myLoadDS(args.val_data_list, args.data_path, args.img_size, ralph=train_dataset.ralph)
+    val_dataset = dataset.myLoadDS(
+        args.val_data_list, args.data_path, args.img_size, ralph=train_dataset.ralph)
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=args.val_bs,
@@ -330,11 +339,13 @@ def main():
         batch_size = image.size(0)
         if use_amp:
             with autocast('cuda'):
-                loss = compute_loss(args, model, image, batch_size, criterion, enc)
+                loss = compute_loss(args, model, image,
+                                    batch_size, criterion, enc)
             scaler.scale(loss).backward()
             optimizer.first_step(zero_grad=True)
             with autocast('cuda'):
-                loss_second = compute_loss(args, model, image, batch_size, criterion, enc)
+                loss_second = compute_loss(
+                    args, model, image, batch_size, criterion, enc)
             scaler.scale(loss_second).backward()
             # Unscale gradients before SAM second step weight restore + base optimizer update
             scaler.unscale_(optimizer.base_optimizer)
@@ -356,7 +367,8 @@ def main():
             loss = compute_loss(args, model, image, batch_size, criterion, enc)
             loss.backward()
             optimizer.first_step(zero_grad=True)
-            compute_loss(args, model, image, batch_size, criterion, enc).backward()
+            compute_loss(args, model, image, batch_size,
+                         criterion, enc).backward()
             optimizer.second_step(zero_grad=True)
             model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
