@@ -2,6 +2,7 @@ import torch
 import torch.utils.data
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
+from torch.amp import autocast, GradScaler
 
 import os
 import json
@@ -20,14 +21,17 @@ import time
 
 def compute_loss(args, model, image, batch_size, criterion, enc):
     """Unified loss: base CTC + optional tone CE (frame->segment alignment)."""
-    outputs = model(image, args.mask_ratio, args.max_span_length, use_masking=True)
+    outputs = model(image, args.mask_ratio,
+                    args.max_span_length, use_masking=True)
     if not isinstance(outputs, dict):  # fallback single head
         text, length = enc
         preds = outputs.float()
-        preds_size = torch.full((batch_size,), preds.size(1), dtype=torch.int32, device=preds.device)
-        logp = preds.permute(1,0,2).log_softmax(2)
+        preds_size = torch.full((batch_size,), preds.size(
+            1), dtype=torch.int32, device=preds.device)
+        logp = preds.permute(1, 0, 2).log_softmax(2)
         torch.backends.cudnn.enabled = False
-        loss = criterion(logp, text.to(preds.device), preds_size, length.to(preds.device)).mean()
+        loss = criterion(logp, text.to(preds.device),
+                         preds_size, length.to(preds.device)).mean()
         torch.backends.cudnn.enabled = True
         return loss
 
@@ -37,9 +41,10 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
     device = base_logits.device
     T = base_logits.size(1)
     preds_size = torch.full((batch_size,), T, dtype=torch.int32, device=device)
-    base_logp = base_logits.permute(1,0,2).log_softmax(2)
+    base_logp = base_logits.permute(1, 0, 2).log_softmax(2)
     torch.backends.cudnn.enabled = False
-    base_loss = criterion(base_logp, text_base.to(device), preds_size, length_base.to(device)).mean()
+    base_loss = criterion(base_logp, text_base.to(
+        device), preds_size, length_base.to(device)).mean()
     torch.backends.cudnn.enabled = True
 
     lambda_tone = getattr(args, 'lambda_tone', 1.0)
@@ -74,19 +79,20 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
         for si in range(starts.numel()):
             st = starts[si]
             en = starts[si+1] if si+1 < starts.numel() else frames.numel()
-            segments.append((int(seg_vals[si].item()), torch.arange(st,en,device=device)))
+            segments.append(
+                (int(seg_vals[si].item()), torch.arange(st, en, device=device)))
         # map targets to segments sequentially
-        seg_ptr=0
-        per_char_losses=[]
-        weights=[]
+        seg_ptr = 0
+        per_char_losses = []
+        weights = []
         for u, cls in enumerate(target_seq):
             # find next segment with same class id
             while seg_ptr < len(segments) and segments[seg_ptr][0] != cls:
-                seg_ptr+=1
+                seg_ptr += 1
             if seg_ptr >= len(segments):
                 break
             _, idxs = segments[seg_ptr]
-            seg_ptr+=1
+            seg_ptr += 1
             seg_logp = logp_tone[b, idxs, :].mean(dim=0)  # [C_tone]
             tone_id = tone_target[u]
             per_char_losses.append(-seg_logp[tone_id])
@@ -97,7 +103,8 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
             lc = torch.stack(per_char_losses)
             w = torch.tensor(weights, device=device)
             batch_losses.append((lc*w).sum()/(w.sum()+1e-6))
-    tone_loss = torch.stack(batch_losses).mean() if batch_losses else torch.tensor(0.0, device=device)
+    tone_loss = torch.stack(batch_losses).mean(
+    ) if batch_losses else torch.tensor(0.0, device=device)
     return base_loss + lambda_tone * tone_loss
 
 
@@ -258,17 +265,22 @@ def main():
                                                shuffle=True,
                                                pin_memory=True,
                                                num_workers=args.num_workers,
+                                               persistent_workers=True,
+                                               prefetch_factor=4,
                                                collate_fn=partial(dataset.SameTrCollate, args=args))
     train_iter = dataset.cycle_data(train_loader)
 
     logger.info('Loading val loader...')
-    val_dataset = dataset.myLoadDS(
-        args.val_data_list, args.data_path, args.img_size, ralph=train_dataset.ralph)
-    val_loader = torch.utils.data.DataLoader(val_dataset,
-                                             batch_size=args.val_bs,
-                                             shuffle=False,
-                                             pin_memory=True,
-                                             num_workers=args.num_workers)
+    val_dataset = dataset.myLoadDS(args.val_data_list, args.data_path, args.img_size, ralph=train_dataset.ralph)
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=args.val_bs,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+        prefetch_factor=4,
+    )
 
     logger.info('Initializing optimizer, criterion and converter...')
     optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
@@ -303,6 +315,8 @@ def main():
         return img
 
     #### ---- train & eval ---- ####
+    use_amp = getattr(args, 'amp', False) and torch.cuda.is_available()
+    scaler = GradScaler('cuda', enabled=use_amp)
     logger.info('Start training...')
     for nb_iter in range(start_iter, args.total_iter):
         optimizer, current_lr = utils.update_lr_cos(
@@ -311,14 +325,40 @@ def main():
         optimizer.zero_grad()
         batch = next(train_iter)
         image = batch[0].cuda()
-        enc = converter.encode(batch[1])  # (text_base, length_base, tone_lists, duplicate_len)
+        # (text_base, length_base, tone_lists, duplicate_len)
+        enc = converter.encode(batch[1])
         batch_size = image.size(0)
-        loss = compute_loss(args, model, image, batch_size, criterion, enc)
-        loss.backward()
-        optimizer.first_step(zero_grad=True)
-        compute_loss(args, model, image, batch_size, criterion, enc).backward()
-        optimizer.second_step(zero_grad=True)
-        model.zero_grad()
+        if use_amp:
+            with autocast('cuda'):
+                loss = compute_loss(args, model, image, batch_size, criterion, enc)
+            scaler.scale(loss).backward()
+            optimizer.first_step(zero_grad=True)
+            with autocast('cuda'):
+                loss_second = compute_loss(args, model, image, batch_size, criterion, enc)
+            scaler.scale(loss_second).backward()
+            # Unscale gradients before SAM second step weight restore + base optimizer update
+            scaler.unscale_(optimizer.base_optimizer)
+            # Restore weights and apply base optimizer step through SAM second_step logic
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    state_p = optimizer.state.get(p, {})
+                    if "old_p" in state_p:
+                        p.data = state_p["old_p"]
+                        # match SAM.second_step behavior (keeps old_p) but we can delete to save memory
+                        del state_p["old_p"]
+            scaler.step(optimizer.base_optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            model.zero_grad()
+        else:
+            loss = compute_loss(args, model, image, batch_size, criterion, enc)
+            loss.backward()
+            optimizer.first_step(zero_grad=True)
+            compute_loss(args, model, image, batch_size, criterion, enc).backward()
+            optimizer.second_step(zero_grad=True)
+            model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
         train_loss += loss.item()
         train_loss_count += 1
@@ -428,12 +468,14 @@ def main():
                         image = batch[0].cuda()
                         # Use the same inference call as validation function (no masking for inference)
                         outputs = model(image)
-                        base_logits = outputs['base'] if isinstance(outputs, dict) else outputs
+                        base_logits = outputs['base'] if isinstance(
+                            outputs, dict) else outputs
                         base_logits = base_logits.float()
-                        preds_size = torch.IntTensor([base_logits.size(1)] * image.size(0))
-                        logp = base_logits.permute(1,0,2).log_softmax(2)
+                        preds_size = torch.IntTensor(
+                            [base_logits.size(1)] * image.size(0))
+                        logp = base_logits.permute(1, 0, 2).log_softmax(2)
                         _, idx = logp.max(2)
-                        idx = idx.transpose(1,0).contiguous().view(-1)
+                        idx = idx.transpose(1, 0).contiguous().view(-1)
                         preds_str = converter.decode(idx.data, preds_size.data)
 
                     examples_table = wandb.Table(

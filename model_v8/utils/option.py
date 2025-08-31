@@ -36,6 +36,8 @@ def get_args_parser():
                         help='experimental name (save dir will be out_dir + exp_name)')
     parser.add_argument('--seed', default=123, type=int,
                         help='seed for initializing training. ')
+    parser.add_argument('--amp', action='store_true', default=False,
+                        help='enable CUDA Automatic Mixed Precision during training')
 
     # RoBERTa LLM correction arguments
     parser.add_argument('--roberta-model-name', type=str, default='roberta-large',
