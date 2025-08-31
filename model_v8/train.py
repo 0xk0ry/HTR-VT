@@ -325,7 +325,7 @@ def main():
 
     #### ---- train & eval ---- ####
     use_amp = getattr(args, 'amp', False) and torch.cuda.is_available()
-    scaler = GradScaler('cuda', enabled=use_amp)
+    scaler = GradScaler('cuda')
     logger.info('Start training...')
     for nb_iter in range(start_iter, args.total_iter):
         optimizer, current_lr = utils.update_lr_cos(
@@ -342,6 +342,7 @@ def main():
                 loss = compute_loss(args, model, image,
                                     batch_size, criterion, enc)
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer.base_optimizer)
             optimizer.first_step(zero_grad=True)
             with autocast('cuda'):
                 loss_second = compute_loss(
