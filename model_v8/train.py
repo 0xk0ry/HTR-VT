@@ -60,13 +60,16 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
     offset = 0
     base_chars = ''.join(utils.build_base_charset())
     vowel_set = set('aăâeêioôơuưyAĂÂEÊIOÔƠUƯY')
+    alpha_consonant = 0.2  # small weight for consonants
     for b in range(batch_size):
         U = int(length_base[b].item())
         if U == 0:
             continue
-        target_seq = text_base[offset:offset+U].tolist()
-        tone_target = tone_lists[b].to(device)
+        target_seq = text_base[offset:offset+U].tolist()  # GT base class ids (1..)
+        tone_target = tone_lists[b].to(device)            # GT tone ids per base char
         offset += U
+
+        # Frame-level predicted base ids
         frames = frame_argmax[b]
         non_blank = frames.ne(0)
         prev = torch.cat([frames.new_zeros(1), frames[:-1]])
@@ -74,35 +77,39 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
         starts = torch.nonzero(change, as_tuple=True)[0]
         if starts.numel() == 0:
             continue
+
+        # Build segments (class id, frame indices)
         seg_vals = frames[starts]
         segments = []
         for si in range(starts.numel()):
             st = starts[si]
             en = starts[si+1] if si+1 < starts.numel() else frames.numel()
-            segments.append(
-                (int(seg_vals[si].item()), torch.arange(st, en, device=device)))
-        # map targets to segments sequentially
+            segments.append((int(seg_vals[si].item()), torch.arange(st, en, device=device)))
+
         seg_ptr = 0
-        per_char_losses = []
-        weights = []
+        char_losses = []
+        vowel_mask = []  # 1 for vowel, 0 for consonant
+
         for u, cls in enumerate(target_seq):
-            # find next segment with same class id
+            # advance to matching segment; if not found, skip (do not break to keep later chars)
             while seg_ptr < len(segments) and segments[seg_ptr][0] != cls:
                 seg_ptr += 1
             if seg_ptr >= len(segments):
+                # no further matching segment; stop mapping
                 break
             _, idxs = segments[seg_ptr]
             seg_ptr += 1
-            seg_logp = logp_tone[b, idxs, :].mean(dim=0)  # [C_tone]
+            seg_logp = logp_tone[b, idxs, :].mean(dim=0)  # averaged tone log-probs for this char
             tone_id = tone_target[u]
-            per_char_losses.append(-seg_logp[tone_id])
-            # vowel heavier weight
+            char_losses.append(-seg_logp[tone_id])
             ch = base_chars[cls-1] if 1 <= cls <= len(base_chars) else ''
-            weights.append(1.0 if ch in vowel_set else 0.2)
-        if per_char_losses:
-            lc = torch.stack(per_char_losses)
-            w = torch.tensor(weights, device=device)
-            batch_losses.append((lc*w).sum()/(w.sum()+1e-6))
+            vowel_mask.append(1.0 if ch in vowel_set else 0.0)
+
+        if char_losses:
+            lc = torch.stack(char_losses)                                # [M]
+            vm = torch.tensor(vowel_mask, device=device)                 # [M]
+            weights = vm + alpha_consonant * (1.0 - vm)                  # vowel=1, consonant=alpha
+            batch_losses.append((lc * weights).sum() / (weights.sum() + 1e-6))
     tone_loss = torch.stack(batch_losses).mean(
     ) if batch_losses else torch.tensor(0.0, device=device)
     return base_loss + lambda_tone * tone_loss
@@ -395,10 +402,18 @@ def main():
         if nb_iter % args.eval_iter == 0:
             model.eval()
             with torch.no_grad():
-                val_loss, val_cer, val_wer, preds, labels = valid.validation(model_ema.ema,
-                                                                             criterion,
-                                                                             val_loader,
-                                                                             converter)
+                val_ret = valid.validation(model_ema.ema,
+                                           criterion,
+                                           val_loader,
+                                           converter)
+                (val_loss,
+                 val_cer_base,
+                 val_wer_base,
+                 val_cer,
+                 val_wer,
+                 val_ter,
+                 preds,
+                 labels) = val_ret
 
                 if val_cer < best_cer:
                     logger.info(
@@ -445,7 +460,8 @@ def main():
                         args.save_dir, 'best_WER.pth'))
 
                 logger.info(
-                    f'Val. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} \t ')
+                    f'Val. loss : {val_loss:0.3f} \t CER_base : {val_cer_base:0.4f} \t WER_base : {val_wer_base:0.4f} \t '
+                    f'CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} \t TER : {val_ter:0.4f}')
 
                 # Save checkpoint every print interval
                 ckpt_name = f"checkpoint_{best_cer:.4f}_{best_wer:.4f}_{nb_iter}.pth"
@@ -466,8 +482,11 @@ def main():
                 }
                 torch.save(checkpoint, os.path.join(args.save_dir, ckpt_name))
 
+                writer.add_scalar('./VAL/CER_base', val_cer_base, nb_iter)
+                writer.add_scalar('./VAL/WER_base', val_wer_base, nb_iter)
                 writer.add_scalar('./VAL/CER', val_cer, nb_iter)
                 writer.add_scalar('./VAL/WER', val_wer, nb_iter)
+                writer.add_scalar('./VAL/TER', val_ter, nb_iter)
                 writer.add_scalar('./VAL/bestCER', best_cer, nb_iter)
                 writer.add_scalar('./VAL/bestWER', best_wer, nb_iter)
                 writer.add_scalar('./VAL/val_loss', val_loss, nb_iter)
@@ -526,8 +545,11 @@ def main():
 
                     wandb.log({
                         "val/loss": val_loss,
+                        "val/CER_base": val_cer_base,
+                        "val/WER_base": val_wer_base,
                         "val/CER": val_cer,
                         "val/WER": val_wer,
+                        "val/TER": val_ter,
                         "val/best_CER": best_cer,
                         "val/best_WER": best_wer,
                         "val/examples_table": examples_table,
