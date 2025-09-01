@@ -481,15 +481,38 @@ def main():
                         image = batch[0].cuda()
                         # Use the same inference call as validation function (no masking for inference)
                         outputs = model(image)
-                        base_logits = outputs['base'] if isinstance(
-                            outputs, dict) else outputs
-                        base_logits = base_logits.float()
-                        preds_size = torch.IntTensor(
-                            [base_logits.size(1)] * image.size(0))
-                        logp = base_logits.permute(1, 0, 2).log_softmax(2)
-                        _, idx = logp.max(2)
-                        idx = idx.transpose(1, 0).contiguous().view(-1)
-                        preds_str = converter.decode(idx.data, preds_size.data)
+                        if isinstance(outputs, dict):
+                            base_logits = outputs['base'].float()
+                            tone_logits = outputs.get('tone', None)
+                        else:
+                            base_logits = outputs.float()
+                            tone_logits = None
+                        B = image.size(0)
+                        preds_size = torch.IntTensor([base_logits.size(1)] * B)
+                        base_logp = base_logits.permute(1, 0, 2).log_softmax(2)
+                        _, base_idx = base_logp.max(2)  # [T,B]
+                        base_idx_flat = base_idx.transpose(1, 0).contiguous().view(-1)
+                        base_strs = converter.decode(base_idx_flat.data, preds_size.data)
+                        if tone_logits is not None:
+                            tone_frame = tone_logits.argmax(dim=2)  # [B,T]
+                            tone_char_preds = []
+                            for b in range(B):
+                                fcls = base_logits[b].argmax(dim=1)
+                                tcls = tone_frame[b]
+                                prev = -1
+                                tc = []
+                                for fc, tcid in zip(fcls.tolist(), tcls.tolist()):
+                                    if fc != 0 and fc != prev:
+                                        tc.append(tcid)
+                                        prev = fc
+                                tone_char_preds.extend(tc)
+                            tone_char_preds_tensor = torch.tensor(tone_char_preds, device=base_logits.device)
+                            try:
+                                preds_str = converter.decode_with_tones(base_idx_flat.data, preds_size.data, tone_char_preds_tensor)
+                            except Exception:
+                                preds_str = base_strs
+                        else:
+                            preds_str = base_strs
 
                     examples_table = wandb.Table(
                         columns=["iter", "index", "image", "pred", "gt", "correct"])
