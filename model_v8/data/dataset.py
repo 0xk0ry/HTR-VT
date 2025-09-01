@@ -96,9 +96,32 @@ class myLoadDS(Dataset):
 
 
 def get_files(nfile, dpath):
-    fnames = open(nfile, 'r').readlines()
-    fnames = [dpath + x.strip() for x in fnames]
-    return fnames
+    """Read list file and build normalized absolute/relative paths.
+
+    Supports Windows-style backslashes, absolute drive paths, UTF-8 BOM, and
+    gracefully skips empty/comment lines (# ...).
+    """
+    paths = []
+    try:
+        with open(nfile, 'r', encoding='utf-8-sig') as f:
+            for line in f:
+                raw = line.strip()  # removes \r, \n, spaces
+                if not raw or raw.startswith('#'):
+                    continue
+                # Strip optional surrounding quotes
+                raw = raw.strip('"').strip("'")
+                # Normalize separators
+                raw_norm = raw.replace('\\\\', '\\').replace('/', os.sep).replace('\\', os.sep)
+                if os.path.isabs(raw_norm):
+                    full = os.path.normpath(raw_norm)
+                else:
+                    full = os.path.normpath(os.path.join(dpath, raw_norm))
+                paths.append(full)
+    except FileNotFoundError:
+        print(f'[get_files] List file not found: {nfile}')
+    except Exception as e:
+        print(f'[get_files] Error reading {nfile}: {e}')
+    return paths
 
 
 def npThum(img, max_w, max_h):
@@ -136,14 +159,25 @@ def get_images(fname, max_w=500, max_h=500, nch=1):  # args.max_w args.max_h arg
 
 
 def get_labels(fnames):
+    """Load label text files corresponding to image paths.
+
+    Uses UTF-8 (with BOM tolerance), normalizes whitespace, and is tolerant to
+    Windows CRLF endings. If a label file is missing, an empty string is used.
+    """
     labels = []
-    for id, image_file in enumerate(fnames):
+    for image_file in fnames:
         fn = os.path.splitext(image_file)[0] + '.txt'
-        lbl = open(fn, 'r').read()
-        lbl = ' '.join(lbl.split())  # remove linebreaks if present
-
+        try:
+            with open(fn, 'r', encoding='utf-8-sig') as f:
+                lbl_raw = f.read()
+        except FileNotFoundError:
+            print(f'[get_labels] Missing label file: {fn}')
+            lbl_raw = ''
+        except Exception as e:
+            print(f'[get_labels] Error reading {fn}: {e}')
+            lbl_raw = ''
+        lbl = ' '.join(lbl_raw.split())
         labels.append(lbl)
-
     return labels
 
 

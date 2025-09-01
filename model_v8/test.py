@@ -21,8 +21,11 @@ def main():
     logger = utils.get_logger(args.save_dir)
     logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
 
+    # Use dynamic base charset length like training
+    base_charset_str = utils.build_base_charset()
+    nb_cls = len(base_charset_str) + 1
     model = HTR_VT.create_model(
-        nb_cls=args.nb_cls, img_size=args.img_size[::-1])
+        nb_cls=nb_cls, img_size=args.img_size[::-1])
 
     # pth_path = args.save_dir + '/best_CER.pth'
     pth_path = args.resume_checkpoint
@@ -53,26 +56,38 @@ def main():
                                               pin_memory=True,
                                               num_workers=args.num_workers)
 
-    converter = utils.CTCLabelConverter(train_dataset.ralph.values())
+    # Tone-aware converter (matches training pipeline)
+    converter = utils.ToneLabelConverter(base_charset_str)
     criterion = torch.nn.CTCLoss(
         reduction='none', zero_infinity=True).to(device)
 
     model.eval()
     with torch.no_grad():
-        val_loss, val_cer, val_wer, preds, labels = valid.validation(model,
-                                                                     criterion,
-                                                                     test_loader,
-                                                                     converter)
+        (val_loss,
+         cer_base,
+         wer_base,
+         cer_full,
+         wer_full,
+         ter,
+         preds,
+         labels) = valid.validation(model,
+                                    criterion,
+                                    test_loader,
+                                    converter)
 
     logger.info(
-        f'Test. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} ')
+        f'Test. loss : {val_loss:0.3f} \t CER_base : {cer_base:0.4f} \t WER_base : {wer_base:0.4f} '
+        f'\t CER : {cer_full:0.4f} \t WER : {wer_full:0.4f} \t TER : {ter:0.4f}')
 
     # Save predictions as JSON
     results = {
         "test_metrics": {
             "loss": float(val_loss),
-            "cer": float(val_cer),
-            "wer": float(val_wer)
+            "cer_base": float(cer_base),
+            "wer_base": float(wer_base),
+            "cer": float(cer_full),
+            "wer": float(wer_full),
+            "ter": float(ter)
         },
         "predictions": []
     }
@@ -150,23 +165,42 @@ def main():
             return 0.0 if len(pred_words) == 0 else 1.0
         return _levenshtein(pred_words, gt_words) / len(gt_words)
 
-    for i, (pred, label) in enumerate(zip(preds, labels)):
-        # Retrieve corresponding image file path from dataset (test_dataset order matches loader order with shuffle=False)
+    # Per-sample extended stats
+    for i, (pred_full, label_full) in enumerate(zip(preds, labels)):
         if i < len(test_dataset.fns):
             img_path = test_dataset.fns[i]
             img_name = os.path.basename(img_path)
         else:
             img_path = None
             img_name = None
+        # Decompose to base + tones to compute base metrics & tone mismatches
+        pred_base, pred_tones = converter.vn_tags.decompose_str(pred_full)
+        label_base, label_tones = converter.vn_tags.decompose_str(label_full)
+        sample_cer_full = _cer(pred_full, label_full)
+        sample_cer_base = _cer(pred_base, label_base)
+        sample_wer_full = _wer(pred_full, label_full)
+        sample_wer_base = _wer(pred_base, label_base)
+        tone_len = len(label_tones)
+        tone_err = 0
+        for pos in range(tone_len):
+            if pos >= len(pred_tones) or pred_tones[pos] != label_tones[pos]:
+                tone_err += 1
+        sample_ter = tone_err / tone_len if tone_len > 0 else 0.0
         results["predictions"].append({
             "sample_id": i + 1,
             "image_filename": img_name,
             "image_path": img_path,
-            "prediction": pred,
-            "ground_truth": label,
-            "match": pred == label,
-            "cer": round(float(_cer(pred, label)), 6),
-            "wer": round(float(_wer(pred, label)), 6)
+            "prediction_full": pred_full,
+            "prediction_base": pred_base,
+            "ground_truth_full": label_full,
+            "ground_truth_base": label_base,
+            "match_full": pred_full == label_full,
+            "match_base": pred_base == label_base,
+            "cer_full": round(float(sample_cer_full), 6),
+            "cer_base": round(float(sample_cer_base), 6),
+            "wer_full": round(float(sample_wer_full), 6),
+            "wer_base": round(float(sample_wer_base), 6),
+            "ter": round(float(sample_ter), 6)
         })
 
     # Save to JSON file
