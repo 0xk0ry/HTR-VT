@@ -54,7 +54,8 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
     # Tone loss: align collapsed argmax segments to targets.
     with torch.no_grad():
         frame_argmax = base_logits.argmax(dim=2)  # [B,T]
-    logp_tone = torch.log_softmax(tone_logits, dim=2)
+    p_tone = torch.softmax(tone_logits, dim=2)              # (B,T,6)
+    P_base = base_logp.permute(1, 0, 2).exp()               # (B,T,C_base)
     batch_losses = []
     batch_weights = []
     offset = 0
@@ -96,12 +97,19 @@ def compute_loss(args, model, image, batch_size, criterion, enc):
                 seg_ptr += 1
             if seg_ptr >= len(segments):
                 # no further matching segment; stop mapping
-                break
+                continue
             _, idxs = segments[seg_ptr]
             seg_ptr += 1
-            seg_logp = logp_tone[b, idxs, :].mean(dim=0)  # averaged tone log-probs for this char
+            # gamma-lite weights inside segment
+            cls_prob_frames = P_base[b, idxs, cls]                  # (S,)
+            blank_prob_frames = P_base[b, idxs, 0]                  # (S,)
+            w = (1.0 - blank_prob_frames) * cls_prob_frames         # (S,)
+            if w.sum() <= 0:
+                continue
+            w = w / (w.sum() + 1e-6)
+            seg_p_tone = (p_tone[b, idxs, :] * w.unsqueeze(1)).sum(dim=0)  # (6,)
             tone_id = tone_target[u]
-            char_losses.append(-seg_logp[tone_id])
+            char_losses.append(-torch.log(seg_p_tone[tone_id] + 1e-8))
             ch = base_chars[cls-1] if 1 <= cls <= len(base_chars) else ''
             vowel_mask.append(1.0 if ch in vowel_set else 0.0)
 
@@ -405,8 +413,10 @@ def main():
                 val_ret = valid.validation(model_ema.ema,
                                            criterion,
                                            val_loader,
-                                           converter)
-                (val_loss,
+                                           converter,
+                                           args)
+                (val_loss_base,
+                 val_loss_full,
                  val_cer_base,
                  val_wer_base,
                  val_cer,
@@ -460,7 +470,8 @@ def main():
                         args.save_dir, 'best_WER.pth'))
 
                 logger.info(
-                    f'Val. loss : {val_loss:0.3f} \t CER_base : {val_cer_base:0.4f} \t WER_base : {val_wer_base:0.4f} \t '
+                    f'Val. loss_base : {val_loss_base:0.3f} \t loss_full : {val_loss_full:0.3f} \t '
+                    f'CER_base : {val_cer_base:0.4f} \t WER_base : {val_wer_base:0.4f} \t '
                     f'CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} \t TER : {val_ter:0.4f}')
 
                 # Save checkpoint every print interval
@@ -489,7 +500,8 @@ def main():
                 writer.add_scalar('./VAL/TER', val_ter, nb_iter)
                 writer.add_scalar('./VAL/bestCER', best_cer, nb_iter)
                 writer.add_scalar('./VAL/bestWER', best_wer, nb_iter)
-                writer.add_scalar('./VAL/val_loss', val_loss, nb_iter)
+                writer.add_scalar('./VAL/val_loss_base', val_loss_base, nb_iter)
+                writer.add_scalar('./VAL/val_loss_full', val_loss_full, nb_iter)
                 # wandb log (optional): examples and metrics (table style)
                 if wandb is not None:
                     # log up to 5 examples from current batch
@@ -544,7 +556,8 @@ def main():
                             img_tensor), pred_text, true_text, bool(is_correct))
 
                     wandb.log({
-                        "val/loss": val_loss,
+                        "val/loss_base": val_loss_base,
+                        "val/loss_full": val_loss_full,
                         "val/CER_base": val_cer_base,
                         "val/WER_base": val_wer_base,
                         "val/CER": val_cer,
