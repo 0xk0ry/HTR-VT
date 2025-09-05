@@ -196,6 +196,9 @@ def load_checkpoint(model, model_ema, optimizer, checkpoint_path, logger):
         if 'model' in checkpoint:
             source_dict = checkpoint['model']
             logger.info("Loading main model from 'model' state dict")
+        elif 'state_dict' in checkpoint:
+            source_dict = checkpoint['state_dict']
+            logger.info("Loading main model from 'state_dict' state dict")
         elif 'state_dict_ema' in checkpoint:
             source_dict = checkpoint['state_dict_ema']
             logger.info(

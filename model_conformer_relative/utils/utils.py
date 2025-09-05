@@ -196,13 +196,16 @@ def load_checkpoint(model, model_ema, optimizer, checkpoint_path, logger):
         if 'model' in checkpoint:
             source_dict = checkpoint['model']
             logger.info("Loading main model from 'model' state dict")
+        elif 'state_dict' in checkpoint:
+            source_dict = checkpoint['state_dict']
+            logger.info("Loading main model from 'state_dict' state dict")
         elif 'state_dict_ema' in checkpoint:
             source_dict = checkpoint['state_dict_ema']
             logger.info(
                 "Loading main model from 'state_dict_ema' (fallback)")
         else:
             raise KeyError(
-                "Neither 'model' nor 'state_dict_ema' found in checkpoint")
+                "Neither 'model', 'state_dict', nor 'state_dict_ema' found in checkpoint")
 
         for k, v in source_dict.items():
             if re.search("module", k):
