@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from timm.models.vision_transformer import Mlp, DropPath
 
 import numpy as np
-from model_conformer.model import resnet18
+from model import resnet18
 from functools import partial
 
 
