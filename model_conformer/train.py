@@ -16,17 +16,19 @@ import random
 import numpy as np
 import re
 import importlib
+from torch.amp import autocast, GradScaler
 
 
 def compute_loss(args, model, image, batch_size, criterion, text, length):
-    preds = model(image, args.mask_ratio, args.max_span_length, use_masking=True)
+    preds = model(image, args.mask_ratio,
+                  args.max_span_length, use_masking=True)
     preds = preds.float()
     preds_size = torch.IntTensor([preds.size(1)] * batch_size).cuda()
     preds = preds.permute(1, 0, 2).log_softmax(2)
 
-    torch.backends.cudnn.enabled = False
-    loss = criterion(preds, text.cuda(), preds_size, length.cuda()).mean()
-    torch.backends.cudnn.enabled = True
+    with torch.backends.cudnn.flags(enabled=False):
+        loss = criterion(preds, text.cuda(), preds_size, length.cuda()).mean()
+
     return loss
 
 
@@ -50,16 +52,23 @@ def main():
                        config=vars(args), dir=args.save_dir)
             logger.info("Weights & Biases logging enabled")
         except Exception as e:
-            logger.warning(f"Failed to initialize wandb: {e}. Continuing without wandb.")
+            logger.warning(
+                f"Failed to initialize wandb: {e}. Continuing without wandb.")
             wandb = None
     else:
         wandb = None
 
-    model = HTR_VT.create_model(nb_cls=args.nb_cls,
-                                img_size=args.img_size[::-1],
-                                encoder_type=args.encoder_type,
-                                conv_kernel_size=args.conv_kernel_size,
-                                dropout=getattr(args, 'encoder_dropout', 0.1))
+    model = HTR_VT.create_model(
+        nb_cls=args.nb_cls,
+        img_size=args.img_size[::-1],
+        # 'vit'|'conformer'|'hybrid'
+        encoder_type=getattr(args, "encoder_type", "conformer"),
+        conformer_kernel=getattr(args, "conformer_kernel", 15),
+        conformer_ratio=getattr(args, "conformer_ratio", 1.0),
+        dropout=getattr(args, "dropout", 0.1),
+        attn_drop=getattr(args, "attn_drop", 0.0),
+        drop_path=getattr(args, "drop_path", 0.0),
+    )
 
     total_param = sum(p.numel() for p in model.parameters())
     logger.info('total_param is {}'.format(total_param))
@@ -73,12 +82,14 @@ def main():
     model.zero_grad()
 
     # Use centralized checkpoint loader like model_v4-2
-    resume_path = args.resume if getattr(args, 'resume', None) else getattr(args, 'resume_checkpoint', None)
+    resume_path = args.resume if getattr(
+        args, 'resume', None) else getattr(args, 'resume_checkpoint', None)
     best_cer, best_wer, start_iter, optimizer_state, train_loss, train_loss_count = utils.load_checkpoint(
         model, model_ema, None, resume_path, logger)
 
     logger.info('Loading train loader...')
-    train_dataset = dataset.myLoadDS(args.train_data_list, args.data_path, args.img_size)
+    train_dataset = dataset.myLoadDS(
+        args.train_data_list, args.data_path, args.img_size)
     train_loader = torch.utils.data.DataLoader(train_dataset,
                                                batch_size=args.train_bs,
                                                shuffle=True,
@@ -88,14 +99,23 @@ def main():
     train_iter = dataset.cycle_data(train_loader)
 
     logger.info('Loading val loader...')
-    val_dataset = dataset.myLoadDS(args.val_data_list, args.data_path, args.img_size, ralph=train_dataset.ralph)
+    val_dataset = dataset.myLoadDS(
+        args.val_data_list, args.data_path, args.img_size, ralph=train_dataset.ralph)
     val_loader = torch.utils.data.DataLoader(val_dataset,
                                              batch_size=args.val_bs,
                                              shuffle=False,
                                              pin_memory=True,
                                              num_workers=args.num_workers)
 
-    optimizer = sam.SAM(model.parameters(), torch.optim.AdamW, lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
+    optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
+                        lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
+    # AMP scaler (enabled only if CUDA + user flag)
+    use_amp = torch.cuda.is_available()
+    scaler = GradScaler(device='cuda',enabled=use_amp)
+    if use_amp:
+        logger.info("AMP mixed precision training ENABLED")
+    else:
+        logger.info("AMP mixed precision training DISABLED")
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
     converter = utils.CTCLabelConverter(train_dataset.ralph.values())
 
@@ -116,27 +136,40 @@ def main():
     logger.info('Start training...')
     for nb_iter in range(start_iter, args.total_iter):
 
-        optimizer, current_lr = utils.update_lr_cos(nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer)
+        optimizer, current_lr = utils.update_lr_cos(
+            nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer)
 
         optimizer.zero_grad()
         batch = next(train_iter)
         image = batch[0].cuda()
         text, length = converter.encode(batch[1])
         batch_size = image.size(0)
-        loss = compute_loss(args, model, image, batch_size, criterion, text, length)
-        loss.backward()
+        # ---- Mixed Precision + SAM two-step ----
+        with autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+            loss = compute_loss(args, model, image, batch_size,
+                                criterion, text, length)
+        scaler.scale(loss).backward()
+        # Unscale for SAM gradient norm computation
+        scaler.unscale_(optimizer)
         optimizer.first_step(zero_grad=True)
-        compute_loss(args, model, image, batch_size, criterion, text, length).backward()
+
+        with autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+            loss_second = compute_loss(args, model, image, batch_size,
+                                       criterion, text, length)
+        scaler.scale(loss_second).backward()
+        scaler.unscale_(optimizer)
         optimizer.second_step(zero_grad=True)
+        scaler.update()
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
-        train_loss += loss.item()
+        train_loss += loss.item()  # first loss (both are similar in expectation)
         train_loss_count += 1
 
         if nb_iter % args.print_iter == 0:
             train_loss_avg = train_loss / train_loss_count if train_loss_count > 0 else 0.0
 
-            logger.info(f'Iter : {nb_iter} \t LR : {current_lr:0.5f} \t training loss : {train_loss_avg:0.5f} \t ' )
+            logger.info(
+                f'Iter : {nb_iter} \t LR : {current_lr:0.5f} \t training loss : {train_loss_avg:0.5f} \t ')
 
             writer.add_scalar('./Train/lr', current_lr, nb_iter)
             writer.add_scalar('./Train/train_loss', train_loss_avg, nb_iter)
@@ -175,7 +208,8 @@ def main():
                 }
                 torch.save(checkpoint, os.path.join(args.save_dir, ckpt_name))
                 if val_cer < best_cer:
-                    logger.info(f'CER improved from {best_cer:.4f} to {val_cer:.4f}!!!')
+                    logger.info(
+                        f'CER improved from {best_cer:.4f} to {val_cer:.4f}!!!')
                     best_cer = val_cer
                     checkpoint = {
                         'model': model.state_dict(),
@@ -192,10 +226,12 @@ def main():
                         'train_loss': train_loss,
                         'train_loss_count': train_loss_count,
                     }
-                    torch.save(checkpoint, os.path.join(args.save_dir, 'best_CER.pth'))
+                    torch.save(checkpoint, os.path.join(
+                        args.save_dir, 'best_CER.pth'))
 
                 if val_wer < best_wer:
-                    logger.info(f'WER improved from {best_wer:.4f} to {val_wer:.4f}!!!')
+                    logger.info(
+                        f'WER improved from {best_wer:.4f} to {val_wer:.4f}!!!')
                     best_wer = val_wer
                     checkpoint = {
                         'model': model.state_dict(),
@@ -212,7 +248,8 @@ def main():
                         'train_loss': train_loss,
                         'train_loss_count': train_loss_count,
                     }
-                    torch.save(checkpoint, os.path.join(args.save_dir, 'best_WER.pth'))
+                    torch.save(checkpoint, os.path.join(
+                        args.save_dir, 'best_WER.pth'))
 
                 logger.info(
                     f'Val. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} \t ')

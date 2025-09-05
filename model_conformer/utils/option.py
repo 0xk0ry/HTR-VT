@@ -53,13 +53,6 @@ def get_args_parser():
                         help='the spacing between two span masks')
     parser.add_argument('--proj', default=8, type=float,
                         help='projection value')
-    # Encoder architecture selection
-    parser.add_argument('--encoder-type', default='conformer', type=str, choices=['conformer', 'vit'],
-                        help='Encoder backbone type')
-    parser.add_argument('--conv-kernel-size', default=31, type=int,
-                        help='Conformer convolution kernel size (odd number)')
-    parser.add_argument('--encoder-dropout', default=0.1, type=float,
-                        help='Dropout used inside encoder blocks')
 
     parser.add_argument('--dpi-min-factor', default=0.5, type=float)
     parser.add_argument('--dpi-max-factor', default=1.5, type=float)
