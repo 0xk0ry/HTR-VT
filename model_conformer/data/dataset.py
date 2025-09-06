@@ -17,11 +17,11 @@ def SameTrCollate(batch, args):
               for i in range(len(images))]
 
     # Apply data augmentations with 90% probability
-    if np.random.rand() < 0.5:
+    if np.random.rand() < args.proba:
         images = [transform.RandomTransform(
             args.proj)(image) for image in images]
 
-    if np.random.rand() < 0.5:
+    if np.random.rand() < args.proba:
         kernel_h = utils.randint(1, args.dila_ero_max_kernel + 1)
         kernel_w = utils.randint(1, args.dila_ero_max_kernel + 1)
         if utils.randint(0, 2) == 0:
@@ -31,7 +31,7 @@ def SameTrCollate(batch, args):
             images = [transform.Dilation((kernel_w, kernel_h), args.dila_ero_iter)(
                 image) for image in images]
 
-    if np.random.rand() < 0.5:
+    if np.random.rand() < args.proba:
         images = [ColorJitter(args.jitter_brightness, args.jitter_contrast, args.jitter_saturation,
                               args.jitter_hue)(image) for image in images]
 

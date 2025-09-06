@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 
-
 def conv3x3(in_planes, out_planes, stride=1):
 
     return nn.Conv2d(in_planes, out_planes, kernel_size=3,
@@ -42,17 +41,15 @@ class BasicBlock(nn.Module):
 
 class ResNet18(nn.Module):
 
-    def __init__(self, nb_feat=384):
-
+    def __init__(self, nb_feat = 384):
+        
         self.inplanes = nb_feat // 4
         super(ResNet18, self).__init__()
-        self.conv1 = nn.Conv2d(
-            1, nb_feat // 4, kernel_size=3, stride=(2, 1), padding=1, bias=False)
+        self.conv1 = nn.Conv2d(1, nb_feat // 4, kernel_size=3, stride=(2, 1), padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(nb_feat // 4, eps=1e-05)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=(2, 1), padding=1)
-        self.layer1 = self._make_layer(
-            BasicBlock, nb_feat // 4, 2, stride=(2, 1))
+        self.layer1 = self._make_layer(BasicBlock, nb_feat // 4, 2, stride=(2, 1))
         self.layer2 = self._make_layer(BasicBlock, nb_feat // 2, 2, stride=2)
         self.layer3 = self._make_layer(BasicBlock, nb_feat, 2, stride=2)
 
