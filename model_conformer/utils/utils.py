@@ -196,9 +196,6 @@ def load_checkpoint(model, model_ema, optimizer, checkpoint_path, logger):
         if 'model' in checkpoint:
             source_dict = checkpoint['model']
             logger.info("Loading main model from 'model' state dict")
-        elif 'state_dict' in checkpoint:
-            source_dict = checkpoint['state_dict']
-            logger.info("Loading main model from 'state_dict' state dict")
         elif 'state_dict_ema' in checkpoint:
             source_dict = checkpoint['state_dict_ema']
             logger.info(
@@ -207,11 +204,60 @@ def load_checkpoint(model, model_ema, optimizer, checkpoint_path, logger):
             raise KeyError(
                 "Neither 'model' nor 'state_dict_ema' found in checkpoint")
 
+        # Strip potential DistributedDataParallel 'module.' prefix
         for k, v in source_dict.items():
             if re.search("module", k):
                 model_dict[re.sub(pattern, '', k)] = v
             else:
                 model_dict[k] = v
+
+        # Remap conv naming differences if needed
+        def remap_conv_keys(sd: OrderedDict, model_keys) -> OrderedDict:
+            mapping_flat_to_nested = {
+                'conv_layer_norm': 'conv_module.layer_norm',
+                'conv_pointwise_conv1': 'conv_module.pointwise_conv1',
+                'conv_depthwise_conv': 'conv_module.depthwise_conv',
+                'conv_batch_norm': 'conv_module.batch_norm',
+                'conv_pointwise_conv2': 'conv_module.pointwise_conv2',
+            }
+            mapping_nested_to_flat = {
+                'conv_module.layer_norm': 'conv_layer_norm',
+                'conv_module.pointwise_conv1': 'conv_pointwise_conv1',
+                'conv_module.depthwise_conv': 'conv_depthwise_conv',
+                'conv_module.batch_norm': 'conv_batch_norm',
+                'conv_module.pointwise_conv2': 'conv_pointwise_conv2',
+            }
+
+            wants_nested = any('conv_module.' in k for k in model_keys)
+            wants_flat = any(re.search(r'blocks\.\d+\.conv_layer_norm\.', k) for k in model_keys)
+
+            if not wants_nested and not wants_flat:
+                return sd  # nothing to do
+
+            remapped = OrderedDict()
+            changes = 0
+            for k, v in sd.items():
+                new_k = k
+                if wants_nested:
+                    # replace blocks.<i>.<flat_name>. -> blocks.<i>.<nested_path>.
+                    for old, new_mid in mapping_flat_to_nested.items():
+                        new_k_candidate = re.sub(fr'(blocks\.\d+)\.{old}\.', fr'\1.{new_mid}.', new_k)
+                        if new_k_candidate != new_k:
+                            new_k = new_k_candidate
+                            changes += 1
+                elif wants_flat:
+                    # replace blocks.<i>.conv_module.<name>. -> blocks.<i>.<flat_name>.
+                    for old_mid, new_flat in mapping_nested_to_flat.items():
+                        new_k_candidate = re.sub(fr'(blocks\.\d+)\.{old_mid}\.', fr'\1.{new_flat}.', new_k)
+                        if new_k_candidate != new_k:
+                            new_k = new_k_candidate
+                            changes += 1
+                remapped[new_k] = v
+            if changes:
+                logger.info(f"Remapped {changes} checkpoint keys to match model conv naming")
+            return remapped
+
+        model_dict = remap_conv_keys(model_dict, model.state_dict().keys())
 
         model.load_state_dict(model_dict, strict=True)
         logger.info("Successfully loaded main model state dict")
@@ -224,6 +270,7 @@ def load_checkpoint(model, model_ema, optimizer, checkpoint_path, logger):
                     ema_dict[re.sub(pattern, '', k)] = v
                 else:
                     ema_dict[k] = v
+            ema_dict = remap_conv_keys(ema_dict, model_ema.ema.state_dict().keys())
             model_ema.ema.load_state_dict(ema_dict, strict=True)
             logger.info("Successfully loaded EMA model state dict")
 
