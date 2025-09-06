@@ -1,14 +1,12 @@
 import torch
 
 import os
-import re
 import json
 import valid
 from utils import utils
 from utils import option
 from data import dataset
 from model import HTR_VT
-from collections import OrderedDict
 
 
 def main():
@@ -30,19 +28,9 @@ def main():
 
     pth_path = args.resume
     logger.info('loading HWR checkpoint from {}'.format(pth_path))
-
-    ckpt = torch.load(pth_path, map_location='cpu', weights_only=False)
-    model_dict = OrderedDict()
-    pattern = re.compile('module.')
-
-    for k, v in ckpt['state_dict_ema'].items():
-        if re.search("module", k):
-            model_dict[re.sub(pattern, '', k)] = v
-        else:
-            model_dict[k] = v
-
-    model.load_state_dict(model_dict, strict=True)
-    model = model.cuda()
+    # Use unified loader that strips DDP prefixes and remaps conv keys automatically
+    utils.load_checkpoint(model, model_ema=None, optimizer=None, checkpoint_path=pth_path, logger=logger)
+    model = model.to(device)
 
     logger.info('Loading test loader...')
     train_dataset = dataset.myLoadDS(
