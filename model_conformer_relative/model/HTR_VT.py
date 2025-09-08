@@ -301,7 +301,7 @@ class MaskedAutoencoderViT(nn.Module):
                         self.num_patches,
                         mlp_ratio=mlp_ratio,
                         ff_dropout=dropout,
-                        attn_dropout=0.0,
+                        attn_dropout=dropout,
                         conv_dropout=dropout,
                         conv_kernel_size=conv_kernel_size,
                         norm_layer=norm_layer,
