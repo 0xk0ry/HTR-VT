@@ -385,7 +385,7 @@ class MaskedAutoencoderViT(nn.Module):
         return x
 
 
-def create_model(nb_cls, img_size, **kwargs):
+def create_model(nb_cls, img_size, mlp_ratio, **kwargs):
     # Default now uses Conformer encoder; pass encoder_type='vit' to revert.
     model = MaskedAutoencoderViT(
         nb_cls,
@@ -394,7 +394,7 @@ def create_model(nb_cls, img_size, **kwargs):
         embed_dim=768,
         depth=4,
         num_heads=6,
-        mlp_ratio=4,
+        mlp_ratio=mlp_ratio,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
         encoder_type=kwargs.pop("encoder_type", "conformer"),
         **kwargs,

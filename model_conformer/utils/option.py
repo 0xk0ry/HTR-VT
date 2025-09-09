@@ -111,6 +111,8 @@ def get_args_parser():
                         help='Number of transformer decoder layers')
     parser.add_argument('--decoder-heads', default=8, type=int,
                         help='Number of attention heads in decoder')
+    parser.add_argument('--mlp-ratio', default=256, type=int,
+                        help='MLP ratio for encoder/decoder FFN')
     parser.add_argument('--max-seq-len', default=256, type=int,
                         help='Maximum sequence length for decoder')
     parser.add_argument('--label-smoothing', default=0.1, type=float,
