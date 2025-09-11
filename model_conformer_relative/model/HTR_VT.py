@@ -157,6 +157,7 @@ class ConformerBlock(nn.Module):
     """Minimal Conformer encoder block.
     Order: x + 1/2 FFN -> x + MHSA -> x + ConvModule -> x + 1/2 FFN -> LayerNorm.
     """
+
     def __init__(
         self,
         dim,
@@ -168,28 +169,38 @@ class ConformerBlock(nn.Module):
         conv_dropout=0.1,
         conv_kernel_size=31,
         norm_layer=nn.LayerNorm,
+        drop_path=0.1,
     ):
         super().__init__()
         ff_hidden = int(dim * mlp_ratio)
         self.ffn1_norm = norm_layer(dim, elementwise_affine=True)
         self.ffn1 = FeedForward(dim, ff_hidden, dropout=ff_dropout)
         self.attn_norm = norm_layer(dim, elementwise_affine=True)
-        self.attn = Attention(dim, num_patches, num_heads=num_heads, qkv_bias=True, attn_drop=attn_dropout, proj_drop=ff_dropout)
-        self.conv_module = ConvModule(dim, kernel_size=conv_kernel_size, dropout=conv_dropout)
+        self.attn = Attention(dim, num_patches, num_heads=num_heads,
+                              qkv_bias=True, attn_drop=attn_dropout, proj_drop=ff_dropout)
+        self.conv_module = ConvModule(
+            dim, kernel_size=conv_kernel_size, dropout=conv_dropout)
         self.ffn2_norm = norm_layer(dim, elementwise_affine=True)
         self.ffn2 = FeedForward(dim, ff_hidden, dropout=ff_dropout)
         self.final_norm = norm_layer(dim, elementwise_affine=True)
         self.dropout = nn.Dropout(ff_dropout)
+        # drop path (stochastic depth) on residual branches
+        self.drop_path_ffn1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path_attn = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path_conv = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path_ffn2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x):
         # Macaron FFN (scaled by 1/2)
-        x = x + 0.5 * self.dropout(self.ffn1(self.ffn1_norm(x)))
+        x = x + 0.5 * self.drop_path_ffn1(self.ffn1(self.ffn1_norm(x)))
         # MHSA
-        x = x + self.dropout(self.attn(self.attn_norm(x)))
-        # Conv module (already includes residual internally)
-        x = self.conv_module(x)
+        x = x + self.drop_path_attn(self.attn(self.attn_norm(x)))
+        # Conv module (already includes residual internally). Apply drop-path to the conv branch.
+        conv_out = self.conv_module(x)
+        conv_branch = conv_out - x
+        x = x + self.drop_path_conv(conv_branch)
         # Second FFN (scaled by 1/2)
-        x = x + 0.5 * self.dropout(self.ffn2(self.ffn2_norm(x)))
+        x = x + 0.5 * self.drop_path_ffn2(self.ffn2(self.ffn2_norm(x)))
         # Final norm
         return self.final_norm(x)
 
@@ -385,7 +396,7 @@ class MaskedAutoencoderViT(nn.Module):
         return x
 
 
-def create_model(nb_cls, img_size, mlp_ratio, **kwargs):
+def create_model(nb_cls, img_size, mlp_ratio=4, **kwargs):
     # Default now uses Conformer encoder; pass encoder_type='vit' to revert.
     model = MaskedAutoencoderViT(
         nb_cls,
