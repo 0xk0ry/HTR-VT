@@ -254,20 +254,23 @@ class MaskedAutoencoderViT(nn.Module):
         self.embed_dim = embed_dim
         # Set num_patches based on actual CNN output spatial dims (safe upper bound)
         with torch.no_grad():
-            dummy = torch.zeros(1, 3, img_size[1], img_size[0])  # [B,C,H,W]
-            feat = self.patch_embed(dummy)  # [1, C, H', W'] (or W', H')
+            # grayscale (1-channel) dummy to match ResNet18 stem
+            dummy = torch.zeros(1, 1, img_size[1], img_size[0])  # [B,1,H,W]
+            feat = self.patch_embed(dummy)  # [1, C, H', W']
             self.num_patches = int(feat.shape[2] * feat.shape[3])
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         # Remove absolute positional embedding
+        drop_path_rate = 0.1  # tweakable: 0.08–0.12 is good for depth=4
+        dpr = torch.linspace(0, drop_path_rate, steps=depth).tolist()
+
         self.blocks = nn.ModuleList([
             Block(
-                embed_dim,
-                num_heads,
-                self.num_patches,
-                mlp_ratio,
+                embed_dim, num_heads, self.num_patches, mlp_ratio,
                 qkv_bias=True,
+                drop=0.1,                 # MLP/proj dropout ~0.1–0.2
+                attn_drop=0.05,           # keep attention dropout modest (≤0.1)
+                drop_path=dpr[i],
                 norm_layer=norm_layer,
-                # Window first 1–2 blocks; rest global
                 window_size=(16 if i in (0, 1) else 0),
                 shift_size=(0 if i == 0 else (8 if i == 1 else 0)),
             )
