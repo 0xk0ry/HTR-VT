@@ -24,6 +24,7 @@ def main():
         img_size=args.img_size[::-1],
         encoder_type=args.encoder_type,
         conv_kernel_size=args.conv_kernel_size,
+        mlp_ratio=args.mlp_ratio,
         dropout=getattr(args, 'encoder_dropout', 0.1))
 
     pth_path = args.resume

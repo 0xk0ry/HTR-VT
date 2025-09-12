@@ -26,8 +26,10 @@ class Attention(nn.Module):
 
     def forward(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C //
+                                  self.num_heads).permute(2, 0, 3, 1, 4)
+        # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv.unbind(0)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
@@ -37,6 +39,7 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
 
 class LayerScale(nn.Module):
     def __init__(self, dim, init_values=1e-5, inplace=False):
@@ -50,6 +53,7 @@ class LayerScale(nn.Module):
 
 class Block(nn.Module):
     """Original ViT style block (retained for compatibility)."""
+
     def __init__(
         self,
         dim,
@@ -74,8 +78,10 @@ class Block(nn.Module):
             attn_drop=attn_drop,
             proj_drop=drop,
         )
-        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
-        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.ls1 = LayerScale(
+            dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path1 = DropPath(
+            drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim, elementwise_affine=True)
         self.mlp = Mlp(
             in_features=dim,
@@ -83,8 +89,10 @@ class Block(nn.Module):
             act_layer=act_layer,
             drop=drop,
         )
-        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
-        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.ls2 = LayerScale(
+            dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(
+            drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x):
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
@@ -94,6 +102,7 @@ class Block(nn.Module):
 
 class FeedForward(nn.Module):
     """Position-wise Feed Forward with configurable expansion (used for Conformer macaron)."""
+
     def __init__(self, dim, hidden_dim, dropout=0.1, activation=nn.SiLU):
         super().__init__()
         self.lin1 = nn.Linear(dim, hidden_dim)
@@ -108,29 +117,27 @@ class FeedForward(nn.Module):
 class ConvModule(nn.Module):
     """Conformer convolution module (1D) implementing: LN -> pw conv -> GLU -> dw conv -> BN -> SiLU -> pw conv.
     Expect input (B, N, C)."""
-    def __init__(self, dim, kernel_size=31, dropout=0.1):
+
+    def __init__(self, dim, kernel_size=31, dropout=0.1, drop_path=0.0):
         super().__init__()
         self.layer_norm = nn.LayerNorm(dim)
         self.pointwise_conv1 = nn.Conv1d(dim, 2 * dim, kernel_size=1)
         self.glu = nn.GLU(dim=1)
         self.depthwise_conv = nn.Conv1d(
-            dim,
-            dim,
-            kernel_size=kernel_size,
-            padding=kernel_size // 2,
-            groups=dim,
-            bias=True,
+            dim, dim, kernel_size=kernel_size, padding=kernel_size // 2, groups=dim, bias=True
         )
-        self.batch_norm = nn.BatchNorm1d(dim, eps=1e-05)
+        self.batch_norm = nn.BatchNorm1d(dim, eps=1e-5)
         self.act = nn.SiLU()
         self.pointwise_conv2 = nn.Conv1d(dim, dim, kernel_size=1)
         self.dropout = nn.Dropout(dropout)
+        self.drop_path = DropPath(
+            drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x):
         # x: (B, N, C)
         residual = x
         x = self.layer_norm(x)
-        x = x.transpose(1, 2)  # (B, C, N)
+        x = x.transpose(1, 2)           # (B, C, N)
         x = self.pointwise_conv1(x)
         x = self.glu(x)
         x = self.depthwise_conv(x)
@@ -138,14 +145,74 @@ class ConvModule(nn.Module):
         x = self.act(x)
         x = self.pointwise_conv2(x)
         x = self.dropout(x)
-        x = x.transpose(1, 2)  # (B, N, C)
-        return x + residual
+        x = x.transpose(1, 2)           # (B, N, C)
+        return residual + self.drop_path(x)
+
+
+class ConformerBlock(nn.Module):
+    """Pre-norm macaron Conformer block:
+       x + 1/2 FFN -> x + MHSA -> x + ConvModule -> x + 1/2 FFN -> LN(final)
+    """
+
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        num_patches,
+        mlp_ratio=4.0,
+        ff_dropout=0.1,
+        attn_dropout=0.0,
+        conv_dropout=0.1,
+        conv_kernel_size=31,
+        norm_layer=nn.LayerNorm,
+        drop_path: float = 0.0,   # NEW
+    ):
+        super().__init__()
+        ff_hidden = int(dim * mlp_ratio)
+
+        # macaron halves
+        self.ffn1_norm = norm_layer(dim, elementwise_affine=True)
+        self.ffn1 = FeedForward(dim, ff_hidden, dropout=ff_dropout)
+
+        self.attn_norm = norm_layer(dim, elementwise_affine=True)
+        self.attn = Attention(
+            dim, num_patches, num_heads=num_heads,
+            qkv_bias=True, attn_drop=attn_dropout, proj_drop=ff_dropout
+        )
+
+        # conv has its own LN + residual internally
+        self.conv_module = ConvModule(
+            dim, kernel_size=conv_kernel_size,
+            dropout=conv_dropout, drop_path=drop_path  # pass droppath inside
+        )
+
+        self.ffn2_norm = norm_layer(dim, elementwise_affine=True)
+        self.ffn2 = FeedForward(dim, ff_hidden, dropout=ff_dropout)
+
+        self.final_norm = norm_layer(dim, elementwise_affine=True)
+
+        # DropPath for residual branches
+        self.drop_path = DropPath(
+            drop_path) if drop_path > 0.0 else nn.Identity()
+
+    def forward(self, x):
+        # 1) macaron half-FFN
+        x = x + self.drop_path(0.5 * self.ffn1(self.ffn1_norm(x)))
+        # 2) MHSA
+        x = x + self.drop_path(self.attn(self.attn_norm(x)))
+        # 3) ConvModule (already does residual + droppath inside)
+        x = self.conv_module(x)
+        # 4) macaron half-FFN
+        x = x + self.drop_path(0.5 * self.ffn2(self.ffn2_norm(x)))
+        # 5) single final norm
+        return self.final_norm(x)
 
 
 class ConformerBlock(nn.Module):
     """Minimal Conformer encoder block.
     Order: x + 1/2 FFN -> x + MHSA -> x + ConvModule -> x + 1/2 FFN -> LayerNorm.
     """
+
     def __init__(
         self,
         dim,
@@ -163,8 +230,10 @@ class ConformerBlock(nn.Module):
         self.ffn1_norm = norm_layer(dim, elementwise_affine=True)
         self.ffn1 = FeedForward(dim, ff_hidden, dropout=ff_dropout)
         self.attn_norm = norm_layer(dim, elementwise_affine=True)
-        self.attn = Attention(dim, num_patches, num_heads=num_heads, qkv_bias=True, attn_drop=attn_dropout, proj_drop=ff_dropout)
-        self.conv_module = ConvModule(dim, kernel_size=conv_kernel_size, dropout=conv_dropout)
+        self.attn = Attention(dim, num_patches, num_heads=num_heads,
+                              qkv_bias=True, attn_drop=attn_dropout, proj_drop=ff_dropout)
+        self.conv_module = ConvModule(
+            dim, kernel_size=conv_kernel_size, dropout=conv_dropout)
         self.ffn2_norm = norm_layer(dim, elementwise_affine=True)
         self.ffn2 = FeedForward(dim, ff_hidden, dropout=ff_dropout)
         self.final_norm = norm_layer(dim, elementwise_affine=True)
@@ -173,13 +242,16 @@ class ConformerBlock(nn.Module):
     def forward(self, x):
         # Macaron FFN (scaled by 1/2)
         x = x + 0.5 * self.dropout(self.ffn1(self.ffn1_norm(x)))
+        x = self.final_norm(x)
         # MHSA
         x = x + self.dropout(self.attn(self.attn_norm(x)))
+        x = self.final_norm(x)
         # Conv module (already includes residual internally)
         x = self.conv_module(x)
+        x = self.final_norm(x)
         # Second FFN (scaled by 1/2)
         x = x + 0.5 * self.dropout(self.ffn2(self.ffn2_norm(x)))
-        # Final norm
+        # Final norm (already applied after each step, keep for compatibility)
         return self.final_norm(x)
 
 
@@ -203,8 +275,10 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     assert embed_dim % 2 == 0
 
     # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+    emb_h = get_1d_sincos_pos_embed_from_grid(
+        embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(
+        embed_dim // 2, grid[1])  # (H*W, D/2)
 
     emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
     return emb
@@ -252,16 +326,19 @@ class MaskedAutoencoderViT(nn.Module):
         encoder_type: str = "conformer",
         conv_kernel_size: int = 31,
         dropout: float = 0.1,
+        drop_path: float = 0.15
     ):
         super().__init__()
 
         encoder_type = encoder_type.lower()
-        assert encoder_type in {"vit", "conformer"}, "encoder_type must be 'vit' or 'conformer'"
+        assert encoder_type in {
+            "vit", "conformer"}, "encoder_type must be 'vit' or 'conformer'"
 
         self.encoder_type = encoder_type
         self.layer_norm = LayerNorm()
         self.patch_embed = resnet18.ResNet18(embed_dim)
-        self.grid_size = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        self.grid_size = [img_size[0] // patch_size[0],
+                          img_size[1] // patch_size[1]]
         self.embed_dim = embed_dim
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -270,38 +347,23 @@ class MaskedAutoencoderViT(nn.Module):
         )  # fixed sin-cos embedding
 
         if self.encoder_type == "vit":
-            self.blocks = nn.ModuleList(
-                [
-                    Block(
-                        embed_dim,
-                        num_heads,
-                        self.num_patches,
-                        mlp_ratio,
-                        qkv_bias=True,
-                        norm_layer=norm_layer,
-                        drop=dropout,
-                    )
-                    for _ in range(depth)
-                ]
-            )
-        else:  # Conformer
-            self.blocks = nn.ModuleList(
-                [
-                    ConformerBlock(
-                        embed_dim,
-                        num_heads,
-                        self.num_patches,
-                        mlp_ratio=mlp_ratio,
-                        ff_dropout=dropout,
-                        attn_dropout=dropout,
-                        conv_dropout=dropout,
-                        conv_kernel_size=conv_kernel_size,
-                        norm_layer=norm_layer,
-                    )
-                    for _ in range(depth)
-                ]
-            )
-
+            dpr = [x.item() for x in torch.linspace(0, drop_path, depth)]
+            self.blocks = nn.ModuleList([
+                Block(embed_dim, num_heads, self.num_patches, mlp_ratio,
+                      qkv_bias=True, norm_layer=norm_layer, drop=dropout,
+                      drop_path=dpr[i])              # pass droppath to ViT too
+                for i in range(depth)
+            ])
+        else:
+            dpr = [x.item() for x in torch.linspace(0, drop_path, depth)]
+            self.blocks = nn.ModuleList([
+                ConformerBlock(embed_dim, num_heads, self.num_patches,
+                               mlp_ratio=mlp_ratio,
+                               ff_dropout=dropout, attn_dropout=dropout,
+                               conv_dropout=dropout, conv_kernel_size=conv_kernel_size,
+                               norm_layer=norm_layer, drop_path=dpr[i])  # NEW
+                for i in range(depth)
+            ])
         self.norm = norm_layer(embed_dim, elementwise_affine=True)
         self.head = torch.nn.Linear(embed_dim, nb_cls)
         self.initialize_weights()
@@ -310,15 +372,8 @@ class MaskedAutoencoderViT(nn.Module):
         # initialization
         # initialize (and freeze) pos_embed by sin-cos embedding
         pos_embed = get_2d_sincos_pos_embed(self.embed_dim, self.grid_size)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-        # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
-        # w = self.patch_embed.proj.weight.data
-        # torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-
-        # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
-        # pos_embed = get_2d_sincos_pos_embed(self.embed_dim, [1, self.nb_query])
-        # self.qry_tokens.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        self.pos_embed.data.copy_(
+            torch.from_numpy(pos_embed).float().unsqueeze(0))
         torch.nn.init.normal_(self.mask_token, std=.02)
 
         # initialize nn.Linear and nn.LayerNorm
@@ -333,7 +388,6 @@ class MaskedAutoencoderViT(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-
     def generate_span_mask(self, x, mask_ratio, max_span_length):
         N, L, D = x.shape  # batch, length, dim
         mask = torch.ones(N, L, 1).to(x.device)
@@ -341,7 +395,7 @@ class MaskedAutoencoderViT(nn.Module):
         num_spans = span_length // max_span_length
         for i in range(num_spans):
             idx = torch.randint(L - max_span_length, (1,))
-            mask[:,idx:idx + max_span_length,:] = 0
+            mask[:, idx:idx + max_span_length, :] = 0
         return mask
 
     def random_masking(self, x, mask_ratio, max_span_length):
@@ -393,4 +447,3 @@ def create_model(nb_cls, img_size, mlp_ratio, **kwargs):
         **kwargs,
     )
     return model
-
