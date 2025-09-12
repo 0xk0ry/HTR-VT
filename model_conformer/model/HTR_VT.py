@@ -224,6 +224,7 @@ class ConformerBlock(nn.Module):
         conv_dropout=0.1,
         conv_kernel_size=31,
         norm_layer=nn.LayerNorm,
+        drop_path=0.0,
     ):
         super().__init__()
         ff_hidden = int(dim * mlp_ratio)
@@ -238,20 +239,27 @@ class ConformerBlock(nn.Module):
         self.ffn2 = FeedForward(dim, ff_hidden, dropout=ff_dropout)
         self.final_norm = norm_layer(dim, elementwise_affine=True)
         self.dropout = nn.Dropout(ff_dropout)
+        # drop path (stochastic depth) on residual branches
+        self.drop_path_ffn1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path_attn = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path_conv = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path_ffn2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x):
         # Macaron FFN (scaled by 1/2)
-        x = x + 0.5 * self.dropout(self.ffn1(self.ffn1_norm(x)))
+        x = x + 0.5 * self.drop_path_ffn1(self.ffn1(self.ffn1_norm(x)))
         x = self.final_norm(x)
         # MHSA
-        x = x + self.dropout(self.attn(self.attn_norm(x)))
+        x = x + self.drop_path_attn(self.attn(self.attn_norm(x)))
         x = self.final_norm(x)
-        # Conv module (already includes residual internally)
-        x = self.conv_module(x)
+        # Conv module (already includes residual internally). Apply drop-path to the conv branch.
+        conv_out = self.conv_module(x)
+        conv_branch = conv_out - x
+        x = x + self.drop_path_conv(conv_branch)
         x = self.final_norm(x)
         # Second FFN (scaled by 1/2)
-        x = x + 0.5 * self.dropout(self.ffn2(self.ffn2_norm(x)))
-        # Final norm (already applied after each step, keep for compatibility)
+        x = x + 0.5 * self.drop_path_ffn2(self.ffn2(self.ffn2_norm(x)))
+        # Final norm
         return self.final_norm(x)
 
 
