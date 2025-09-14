@@ -334,7 +334,7 @@ class MaskedAutoencoderViT(nn.Module):
         encoder_type: str = "conformer",
         conv_kernel_size: int = 3,
         dropout: float = 0.1,
-        drop_path: float = 0.15
+        drop_path: float = 0.0
     ):
         super().__init__()
 
