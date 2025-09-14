@@ -118,7 +118,7 @@ class ConvModule(nn.Module):
     """Conformer convolution module (1D) implementing: LN -> pw conv -> GLU -> dw conv -> BN -> SiLU -> pw conv.
     Expect input (B, N, C)."""
 
-    def __init__(self, dim, kernel_size=31, dropout=0.1, drop_path=0.0):
+    def __init__(self, dim, kernel_size=3, dropout=0.1, drop_path=0.0):
         super().__init__()
         self.layer_norm = nn.LayerNorm(dim)
         self.pointwise_conv1 = nn.Conv1d(dim, 2 * dim, kernel_size=1)
@@ -163,7 +163,7 @@ class ConformerBlock(nn.Module):
         ff_dropout=0.1,
         attn_dropout=0.0,
         conv_dropout=0.1,
-        conv_kernel_size=31,
+        conv_kernel_size=3,
         norm_layer=nn.LayerNorm,
         drop_path: float = 0.0,   # NEW
     ):
@@ -221,8 +221,8 @@ class ConformerBlock(nn.Module):
         mlp_ratio=4.0,
         ff_dropout=0.1,
         attn_dropout=0.0,
-        conv_dropout=0.1,
-        conv_kernel_size=31,
+        conv_dropout=0.0,
+        conv_kernel_size=3,
         norm_layer=nn.LayerNorm,
         drop_path=0.0,
     ):
