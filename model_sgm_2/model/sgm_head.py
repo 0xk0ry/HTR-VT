@@ -32,6 +32,8 @@ def make_context_batch(texts, stoi, sub_str_len=5, device='cuda'):
       left_ctx  [B, Lmax, S], right_ctx [B, Lmax, S], tgt_ids [B, Lmax], tgt_mask [B, Lmax]
     """
     ids = texts_to_ids(texts, stoi)
+    # Ensure all per-sample id tensors are on the target device to avoid CPU/CUDA cat issues
+    ids = [t.to(device) for t in ids]
     B = len(ids)
     Lmax = max(t.size(0) for t in ids)
     S = sub_str_len
