@@ -110,12 +110,13 @@ def get_args_parser():
                      help='test data list')
     parser.add_argument('--nb-cls', default=80, type=int, help='nb of classes, IAM=79+1, READ2016=89+1')
 
-    parser.add_argument("--smtr-on", type=bool, default=True)
-    parser.add_argument("--smtr-ls", type=int, default=5, help="substring length")
-    parser.add_argument("--smtr-samples", type=int, default=16, help="substrings per line")
-    parser.add_argument("--smtr-lambda", type=float, default=0.15, help="loss weight")
-    parser.add_argument("--smtr-rand-replace-p", type=float, default=0.15,
-                        help="probability to replace 1 token in each substring")
-    parser.add_argument("--smtr-dropout", type=float, default=0.10)
+    parser.add_argument("--sgm-on", type=bool, default=True)
+    parser.add_argument("--sgm-mask-rate", type=float, default=0.15)     # fraction of text chars to mask
+    parser.add_argument("--sgm-layers", type=int, default=2)             # tiny semantic encoder depth
+    parser.add_argument("--sgm-heads", type=int, default=2)              # attention heads (keep small)
+    parser.add_argument("--sgm-dmodel", type=int, default=256)           # proj dim inside SGM
+    parser.add_argument("--sgm-dropout", type=float, default=0.1)
+    parser.add_argument("--sgm-lambda", type=float, default=0.15)        # loss weight (keep small)
+    parser.add_argument("--sgm-warmup-iters", type=int, default=0)      # start SGM after N iterations
 
     return parser.parse_args()
