@@ -240,6 +240,19 @@ class MaskedAutoencoderViT(nn.Module):
 
         return x
 
+    def extract_features(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False):
+        # embed patches
+        x = self.layer_norm(x)
+        x = self.patch_embed(x)                      # (B, C, W, H)
+        b, c, w, h = x.shape
+        x = x.view(b, c, -1).permute(0, 2, 1)        # (B, L, D)
+        if use_masking:
+            x = self.random_masking(x, mask_ratio, max_span_length)
+        x = x + self.pos_embed                       # absolute PE added once
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)                             # (B, L, D)
+        return x
 
 def create_model(nb_cls, img_size, **kwargs):
     model = MaskedAutoencoderViT(nb_cls,
