@@ -45,7 +45,7 @@ def compute_losses(
     text_ctc, length_ctc = converter.encode(
         texts)    # existing path (targets for CTC)
     preds_sz = torch.IntTensor([preds.size(1)] * batch_size).cuda()
-    loss_ctc = criterion_ctc(preds.permute(1, 0, 2).log_softmax(2).float(),
+    loss_ctc = criterion_ctc(preds.detach().permute(1, 0, 2).log_softmax(2).float(),
                              text_ctc.cuda(), preds_sz, length_ctc.cuda()).mean()
 
     # 3) SGM loss (optional)
@@ -53,7 +53,7 @@ def compute_losses(
     if sgm_head is not None and feats is not None:
         left_ctx, right_ctx, tgt_ids, tgt_mask = make_context_batch(
             texts, stoi, sub_str_len=getattr(args, 'sgm_sub_len', 5), device=preds.device)
-        out = sgm_head(feats.detach(), left_ctx, right_ctx, tgt_ids,
+        out = sgm_head(feats, left_ctx, right_ctx, tgt_ids,
                        tgt_mask)   # feats: [B,N,D] (detached)
         loss_sgm = out['loss_sgm']
 
