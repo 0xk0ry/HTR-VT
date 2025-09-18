@@ -45,7 +45,7 @@ def compute_losses(
     text_ctc, length_ctc = converter.encode(
         texts)    # existing path (targets for CTC)
     preds_sz = torch.IntTensor([preds.size(1)] * batch_size).cuda()
-    loss_ctc = criterion_ctc(preds.detach().permute(1, 0, 2).log_softmax(2).float(),
+    loss_ctc = criterion_ctc(preds.permute(1, 0, 2).log_softmax(2).float(),
                              text_ctc.cuda(), preds_sz, length_ctc.cuda()).mean()
 
     # 3) SGM loss (optional)
