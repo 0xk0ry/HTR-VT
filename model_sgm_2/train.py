@@ -128,8 +128,6 @@ def main():
                                              pin_memory=True,
                                              num_workers=args.num_workers)
 
-    optimizer = sam.SAM(model.parameters(), torch.optim.AdamW,
-                        lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
     converter = utils.CTCLabelConverter(train_dataset.ralph.values())
 
@@ -144,11 +142,21 @@ def main():
 
     sgm_head = SGMHead(d_vis=d_vis, vocab_size_sgm=vocab_size_sgm,
                        sub_str_len=sgm_sub_len).cuda()
+    if sgm_head is not None:
+        sgm_head.train()
     # Respect flag to disable SGM entirely
     if not sgm_enable:
         sgm_head = None
 
-    # Load optimizer state after initialization
+    # Build optimizer over model + SGM head (if enabled) so SGM params actually update
+    param_groups = list(model.parameters())
+    if sgm_enable and sgm_head is not None:
+        param_groups += list(sgm_head.parameters())
+        logger.info(f"Optimizing {sum(p.numel() for p in sgm_head.parameters())} SGM params in addition to model params")
+    optimizer = sam.SAM(param_groups, torch.optim.AdamW,
+                        lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
+
+    # Load optimizer & SGM head state after initialization
     if optimizer_state is not None:
         try:
             optimizer.load_state_dict(optimizer_state)
@@ -157,6 +165,26 @@ def main():
             logger.warning(f"Failed to load optimizer state: {e}")
             logger.info(
                 "Continuing training without optimizer state (will restart from initial lr/momentum)")
+    elif resume_path and os.path.isfile(resume_path):
+        try:
+            ckpt = torch.load(resume_path, map_location='cpu')
+            if 'optimizer' in ckpt:
+                optimizer.load_state_dict(ckpt['optimizer'])
+                logger.info("Loaded optimizer state from checkpoint directly")
+        except Exception as e:
+            logger.warning(f"Could not load optimizer state from checkpoint: {e}")
+
+    # If resuming and SGM head exists in checkpoint, restore it so SGM loss doesn't reset
+    if resume_path and os.path.isfile(resume_path) and sgm_head is not None:
+        try:
+            ckpt = torch.load(resume_path, map_location='cpu')
+            if 'sgm_head' in ckpt:
+                sgm_head.load_state_dict(ckpt['sgm_head'], strict=True)
+                logger.info("Restored SGM head state from checkpoint")
+            else:
+                logger.info("No SGM head state found in checkpoint; training SGM from scratch")
+        except Exception as e:
+            logger.warning(f"Failed to restore SGM head from checkpoint: {e}")
 
     best_cer, best_wer = best_cer, best_wer
     train_loss = train_loss
@@ -233,6 +261,8 @@ def main():
                     'train_loss': train_loss,
                     'train_loss_count': train_loss_count,
                 }
+                if sgm_head is not None:
+                    checkpoint['sgm_head'] = sgm_head.state_dict()
                 torch.save(checkpoint, os.path.join(args.save_dir, ckpt_name))
                 if val_cer < best_cer:
                     logger.info(
@@ -253,6 +283,8 @@ def main():
                         'train_loss': train_loss,
                         'train_loss_count': train_loss_count,
                     }
+                    if sgm_head is not None:
+                        checkpoint['sgm_head'] = sgm_head.state_dict()
                     torch.save(checkpoint, os.path.join(
                         args.save_dir, 'best_CER.pth'))
 
@@ -275,6 +307,8 @@ def main():
                         'train_loss': train_loss,
                         'train_loss_count': train_loss_count,
                     }
+                    if sgm_head is not None:
+                        checkpoint['sgm_head'] = sgm_head.state_dict()
                     torch.save(checkpoint, os.path.join(
                         args.save_dir, 'best_WER.pth'))
 
