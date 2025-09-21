@@ -7,7 +7,7 @@ import numpy as np
 from model import resnet18
 from functools import partial
 
-from model import plg
+from model.plg import LocalGlobalParallelBlockSimple
 
 
 class Attention(nn.Module):
@@ -158,61 +158,55 @@ class MaskedAutoencoderViT(nn.Module):
                  img_size=[512, 32],
                  patch_size=[8, 32],
                  embed_dim=1024,
-                 depth=4,
+                 depth=3,
                  num_heads=16,
                  mlp_ratio=4.,
                  norm_layer=nn.LayerNorm):
         super().__init__()
-
-        # --------------------------------------------------------------------------
-        # MAE encoder specifics
         self.layer_norm = LayerNorm()
         self.patch_embed = resnet18.ResNet18(embed_dim)
-        self.grid_size = [img_size[0] // patch_size[0],
-                          img_size[1] // patch_size[1]]
         self.embed_dim = embed_dim
+
+        # keep the old estimates (optional), but don't rely on them at runtime
+        self.grid_size = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
         self.num_patches = self.grid_size[0] * self.grid_size[1]
+
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim),
-                                      requires_grad=False)  # fixed sin-cos embedding
-        self.grid_size = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]  # [H, W]
-        H, W = self.grid_size
+        # set up a placeholder pos_embed we will refresh lazily
+        self.register_buffer("pos_embed", None, persistent=False)
+
+        # swap in LGP blocks
         self.blocks = nn.ModuleList([
-            plg.LGParallelBlock(
-                embed_dim=embed_dim,
-                grid_hw=(H, W),
-                r=0.5,
-                win_size=(7, 11),
-                pool=(1, 2),
-                heads_local=num_heads,
-                heads_global=num_heads,
-                drop=0.0
+            LocalGlobalParallelBlockSimple(
+                dim=embed_dim,
+                num_heads=num_heads,
+                window_size=12,          # try 8, 12, or 16
+                mlp_ratio=mlp_ratio,
+                qkv_bias=True,
+                drop=0.0,
+                attn_drop=0.0,
+                norm_layer=norm_layer,
+                drop_path=0.0            # add 0.05 later if training is stable
             )
-            for i in range(depth)])
+            for _ in range(depth)
+        ])
 
         self.norm = norm_layer(embed_dim, elementwise_affine=True)
-        self.head = torch.nn.Linear(embed_dim, nb_cls)
+        self.head = nn.Linear(embed_dim, nb_cls)
 
         self.initialize_weights()
 
+
     def initialize_weights(self):
-        # initialization
-        # initialize (and freeze) pos_embed by sin-cos embedding
-        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, self.grid_size)
-        self.pos_embed.data.copy_(
-            torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-        # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
-        # w = self.patch_embed.proj.weight.data
-        # torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-
-        # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
-        # pos_embed = get_2d_sincos_pos_embed(self.embed_dim, [1, self.nb_query])
-        # self.qry_tokens.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
         torch.nn.init.normal_(self.mask_token, std=.02)
-
-        # initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
+
+    def _ensure_pos_embed(self, H, W, device):
+        N = H * W
+        if (self.pos_embed is None) or (self.pos_embed.shape[1] != N):
+            pe = get_2d_sincos_pos_embed(self.embed_dim, [H, W])
+            pe = torch.from_numpy(pe).float().unsqueeze(0).to(device)  # [1,N,D]
+            self.pos_embed = pe  # buffer, not a Parameter
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -245,24 +239,27 @@ class MaskedAutoencoderViT(nn.Module):
         return x_masked
 
     def forward(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False):
-        # embed patches
+        # CNN backbone
         x = self.layer_norm(x)
-        x = self.patch_embed(x)
-        b, c, w, h = x.shape
-        x = x.view(b, c, -1).permute(0, 2, 1)
-        # masking: length -> length * mask_ratio
+        x = self.patch_embed(x)  # [B, C, H', W']
+        B, C, H, W = x.shape     # (note: your resnet yields H=1 for 32px tall lines) :contentReference[oaicite:4]{index=4}
+
+        # to tokens
+        x = x.view(B, C, H * W).permute(0, 2, 1)  # [B, N, D]
         if use_masking:
             x = self.random_masking(x, mask_ratio, max_span_length)
-        x = x + self.pos_embed
-        # apply Transformer blocks
+
+        # pos encoding (lazy, shape-safe)
+        self._ensure_pos_embed(H, W, x.device)
+        x = x + self.pos_embed  # [B, N, D]
+
+        # LGP encoder (pass H,W each time)
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x, H=H, W=W)
 
         x = self.norm(x)
-        # To CTC Loss
-        x = self.head(x)
+        x = self.head(x)        # [B, N, nb_cls] → CTC
         x = self.layer_norm(x)
-
         return x
 
 

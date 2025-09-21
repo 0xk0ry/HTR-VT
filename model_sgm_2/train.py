@@ -18,6 +18,7 @@ import re
 import importlib
 from model.sgm_head import SGMHead, build_sgm_vocab, make_context_batch
 
+
 def compute_losses(
     args,
     model,
@@ -152,7 +153,8 @@ def main():
     param_groups = list(model.parameters())
     if sgm_enable and sgm_head is not None:
         param_groups += list(sgm_head.parameters())
-        logger.info(f"Optimizing {sum(p.numel() for p in sgm_head.parameters())} SGM params in addition to model params")
+        logger.info(
+            f"Optimizing {sum(p.numel() for p in sgm_head.parameters())} SGM params in addition to model params")
     optimizer = sam.SAM(param_groups, torch.optim.AdamW,
                         lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
 
@@ -172,7 +174,8 @@ def main():
                 optimizer.load_state_dict(ckpt['optimizer'])
                 logger.info("Loaded optimizer state from checkpoint directly")
         except Exception as e:
-            logger.warning(f"Could not load optimizer state from checkpoint: {e}")
+            logger.warning(
+                f"Could not load optimizer state from checkpoint: {e}")
 
     # If resuming and SGM head exists in checkpoint, restore it so SGM loss doesn't reset
     if resume_path and os.path.isfile(resume_path) and sgm_head is not None:
@@ -182,7 +185,8 @@ def main():
                 sgm_head.load_state_dict(ckpt['sgm_head'], strict=True)
                 logger.info("Restored SGM head state from checkpoint")
             else:
-                logger.info("No SGM head state found in checkpoint; training SGM from scratch")
+                logger.info(
+                    "No SGM head state found in checkpoint; training SGM from scratch")
         except Exception as e:
             logger.warning(f"Failed to restore SGM head from checkpoint: {e}")
 

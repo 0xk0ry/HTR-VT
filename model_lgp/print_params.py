@@ -8,7 +8,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 # Adjust imports to your package layout (model_v1)
-from model_v1.model import HTR_VT
+from model_lgp.model import HTR_VT
+from model_lgp.model import plg
 
 
 def log_param_breakdown(module, title="Model", max_levels=(1, 2)):
