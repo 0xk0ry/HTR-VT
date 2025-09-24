@@ -152,4 +152,8 @@ def get_args_parser():
     parser.add_argument('--sgm-warmup-iters', default=0,
                         type=int, help='SGM warmup iters, 0 = start immediately')
 
+    parser.add_argument('--decode-method', default='beam_search', type=str,
+                        choices=['greedy', 'beam_search'], help='Decoding method')
+    parser.add_argument('--beam-size', default=5, type=int,
+                        help='Beam size for beam search decoding')
     return parser.parse_args()
