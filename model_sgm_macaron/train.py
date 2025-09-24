@@ -243,6 +243,7 @@ def main():
 
         if nb_iter % args.eval_iter == 0:
             model.eval()
+            model_ema.ema.eval()
             with torch.no_grad():
                 val_loss, val_cer, val_wer, preds, labels = valid.validation(model_ema.ema,
                                                                              criterion,
@@ -334,6 +335,7 @@ def main():
                         'iter': nb_iter,
                     }, step=nb_iter)
                 model.train()
+                model_ema.ema.train()
 
 
 if __name__ == '__main__':
