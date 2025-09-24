@@ -237,10 +237,20 @@ class MaskedAutoencoderViT(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim),
                                       requires_grad=False)  # fixed sin-cos embedding
+        window_w = 12  # try 12 or 16
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, self.num_patches,
-                  mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
-            for i in range(depth)])
+            LocalBlock1D(self.embed_dim, num_heads, window=window_w, shift=False,
+                        mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
+                        norm_layer=norm_layer),
+            LocalBlock1D(self.embed_dim, num_heads, window=window_w, shift=True,
+                        mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
+                        norm_layer=norm_layer),
+            Block(self.embed_dim, num_heads, self.num_patches,
+                mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1, norm_layer=norm_layer),
+            Block(self.embed_dim, num_heads, self.num_patches,
+                mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1, norm_layer=norm_layer),
+        ])
+
 
         self.norm = norm_layer(embed_dim, elementwise_affine=True)
         self.head = torch.nn.Linear(embed_dim, nb_cls)
@@ -315,7 +325,7 @@ class MaskedAutoencoderViT(nn.Module):
             x, mask_ratio, max_span_length, use_masking)  # [B, N, D]
         logits = self.head(feats)               # [B, N, nb_cls]  → CTC
         # keep your current post-norm if you like
-        logits = self.layer_norm(logits)
+        # logits = self.layer_norm(logits)
         if return_features:
             return logits, feats
         return logits
