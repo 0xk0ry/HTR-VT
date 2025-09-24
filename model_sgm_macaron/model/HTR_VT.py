@@ -271,7 +271,7 @@ class MaskedAutoencoderViT(nn.Module):
             # Run local attention at reduced inner_dim but keep I/O at embed_dim
             LocalBlock1D(self.embed_dim, 4, window=window_w, shift=False,
                          mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
-                         norm_layer=norm_layer, inner_dim=self.embed_dim // 4),
+                         norm_layer=norm_layer, inner_dim=self.embed_dim // 2),
             LocalBlock1D(self.embed_dim, 4, window=window_w, shift=True,
                          mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
                          norm_layer=norm_layer, inner_dim=self.embed_dim // 2),
