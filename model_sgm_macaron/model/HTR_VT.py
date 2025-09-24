@@ -39,8 +39,11 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
+
 class WindowMHSA1D(nn.Module):
     """1-D windowed MHSA over [B, N, D]; optional Swin-style shift; pads right then crops."""
+
     def __init__(self, dim, num_heads, window_size, shift=0,
                  qkv_bias=True, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -48,62 +51,62 @@ class WindowMHSA1D(nn.Module):
         self.win = window_size
         self.shift = (shift % window_size) if window_size > 0 else 0
         self.num_heads = num_heads
-        self.head_dim  = dim // num_heads
-        self.scale     = self.head_dim ** -0.5
-        self.qkv       = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj      = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         # simple 1-D relative bias (helps local attention)
-        self.rel_bias  = nn.Parameter(torch.zeros(num_heads, 2*window_size - 1))
+        self.rel_bias = nn.Parameter(torch.zeros(num_heads, 2*window_size - 1))
 
     def forward(self, x):  # [B, N, D]
         B, N, D = x.shape
         if self.shift:
             x = torch.roll(x, shifts=self.shift, dims=1)
         pad = (self.win - (N % self.win)) % self.win
-        if pad: x = F.pad(x, (0, 0, 0, pad))
+        if pad:
+            x = F.pad(x, (0, 0, 0, pad))
         Np, nW, w = x.shape[1], x.shape[1] // self.win, self.win
         xw = x.view(B, nW, w, D).reshape(B * nW, w, D)
 
-        qkv = self.qkv(xw).reshape(B*nW, w, 3, self.num_heads, self.head_dim).permute(2,0,3,1,4)
+        qkv = self.qkv(xw).reshape(B*nW, w, 3, self.num_heads,
+                                   self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         attn = (q @ k.transpose(-2, -1)) * self.scale
         # add relative bias
         idx = torch.arange(w, device=x.device)
-        rel = idx[None, :] - idx[:, None] + (w - 1)               # [w,w] in [0..2w-2]
+        rel = idx[None, :] - idx[:, None] + \
+            (w - 1)               # [w,w] in [0..2w-2]
         attn = attn + self.rel_bias[:, rel].unsqueeze(0)          # [1,H,w,w]
         attn = self.attn_drop(attn.softmax(dim=-1))
         y = (attn @ v).transpose(1, 2).reshape(B * nW, w, D)
         y = self.proj_drop(self.proj(y)).reshape(B, nW, w, D).reshape(B, Np, D)
-        if pad: y = y[:, :N, :]
-        if self.shift: y = torch.roll(y, shifts=-self.shift, dims=1)
+        if pad:
+            y = y[:, :N, :]
+        if self.shift:
+            y = torch.roll(y, shifts=-self.shift, dims=1)
         return y
 
 
 class LocalBlock1D(nn.Module):
     """Pre-LN → WindowMHSA1D → +res → Pre-LN → MLP → +res (drop-in like Block)."""
+
     def __init__(self, dim, num_heads, window, shift=False, mlp_ratio=4.,
                  qkv_bias=True, drop=0., attn_drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
         self.norm1 = norm_layer(dim, elementwise_affine=True)
-        self.attn  = WindowMHSA1D(dim, num_heads, window, shift=(window//2 if shift else 0),
-                                  qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.attn = WindowMHSA1D(dim, num_heads, window, shift=(window//2 if shift else 0),
+                                 qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         self.norm2 = norm_layer(dim, elementwise_affine=True)
-        self.mlp   = Mlp(in_features=dim, hidden_features=int(dim*mlp_ratio),
-                         act_layer=act_layer, drop=drop)
+        self.mlp = Mlp(in_features=dim, hidden_features=int(dim*mlp_ratio),
+                       act_layer=act_layer, drop=drop)
 
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
-def _ensure_pos_embed(self, W, H, device):
-    N = W * H
-    if (self.pos_embed is None) or (self.pos_embed.shape[1] != N):
-        pe = get_2d_sincos_pos_embed(self.embed_dim, [W, H])
-        pe = torch.from_numpy(pe).float().unsqueeze(0).to(device)
-        # store as a non-trainable buffer (same behavior as before)
-        self.pos_embed = nn.Parameter(pe, requires_grad=False)
+
 
 class LayerScale(nn.Module):
     def __init__(self, dim, init_values=1e-5, inplace=False):
@@ -217,8 +220,8 @@ class MaskedAutoencoderViT(nn.Module):
 
     def __init__(self,
                  nb_cls=80,
-                 img_size=[512, 32],
-                 patch_size=[8, 32],
+                 img_size=[512, 64],
+                 patch_size=[4, 64],
                  embed_dim=1024,
                  depth=24,
                  num_heads=16,
@@ -235,22 +238,21 @@ class MaskedAutoencoderViT(nn.Module):
         self.embed_dim = embed_dim
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim),
-                                      requires_grad=False)  # fixed sin-cos embedding
+        # Positional embeddings will be created lazily from actual (W, H) in forward
+        self.pos_embed = None
         window_w = 12  # try 12 or 16
         self.blocks = nn.ModuleList([
             LocalBlock1D(self.embed_dim, num_heads, window=window_w, shift=False,
-                        mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
-                        norm_layer=norm_layer),
+                         mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
+                         norm_layer=norm_layer),
             LocalBlock1D(self.embed_dim, num_heads, window=window_w, shift=True,
-                        mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
-                        norm_layer=norm_layer),
+                         mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
+                         norm_layer=norm_layer),
             Block(self.embed_dim, num_heads, self.num_patches,
-                mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1, norm_layer=norm_layer),
+                  mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1, norm_layer=norm_layer),
             Block(self.embed_dim, num_heads, self.num_patches,
-                mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1, norm_layer=norm_layer),
+                  mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1, norm_layer=norm_layer),
         ])
-
 
         self.norm = norm_layer(embed_dim, elementwise_affine=True)
         self.head = torch.nn.Linear(embed_dim, nb_cls)
@@ -259,10 +261,7 @@ class MaskedAutoencoderViT(nn.Module):
 
     def initialize_weights(self):
         # initialization
-        # initialize (and freeze) pos_embed by sin-cos embedding
-        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, self.grid_size)
-        self.pos_embed.data.copy_(
-            torch.from_numpy(pos_embed).float().unsqueeze(0))
+        # pos_embed is built dynamically from (W, H) in forward; do not pre-seed from grid_size
 
         # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
         # w = self.patch_embed.proj.weight.data
@@ -307,14 +306,14 @@ class MaskedAutoencoderViT(nn.Module):
         return x_masked
 
     def forward_features(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False):
-        x = self.layer_norm(x)
         x = self.patch_embed(x)                     # [B, C, W, H]
         b, c, W, H = x.shape
         x = x.view(b, c, -1).permute(0, 2, 1)       # [B, N, D]
         if use_masking:
             x = self.random_masking(x, mask_ratio, max_span_length)
         self._ensure_pos_embed(W, H, x.device)
-        x = x + self.pos_embed                      # [B, N, D]
+        if self.pos_embed is not None:
+            x = x + self.pos_embed                  # [B, N, D]
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
@@ -329,6 +328,17 @@ class MaskedAutoencoderViT(nn.Module):
         if return_features:
             return logits, feats
         return logits
+
+    def _ensure_pos_embed(self, W, H, device):
+        """Build fixed sin-cos positional embedding from actual feature map size.
+        Creates a non-trainable nn.Parameter of shape [1, W*H, D].
+        """
+        N = W * H
+        if (self.pos_embed is None) or (self.pos_embed.shape[1] != N):
+            pe = get_2d_sincos_pos_embed(self.embed_dim, [W, H])
+            pe = torch.from_numpy(pe).float().unsqueeze(0).to(device)
+            # store as a non-trainable parameter to keep prior behavior
+            self.pos_embed = nn.Parameter(pe, requires_grad=False)
 
 
 def create_model(nb_cls, img_size, **kwargs):
