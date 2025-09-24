@@ -6,6 +6,7 @@ from timm.models.vision_transformer import Mlp, DropPath
 import numpy as np
 from model import resnet18
 from functools import partial
+from typing import Optional
 
 
 class Attention(nn.Module):
@@ -90,20 +91,47 @@ class WindowMHSA1D(nn.Module):
 
 
 class LocalBlock1D(nn.Module):
-    """Pre-LN → WindowMHSA1D → +res → Pre-LN → MLP → +res (drop-in like Block)."""
+    """Pre-LN → (proj↓ → WindowMHSA1D → proj↑) → +res → Pre-LN → MLP → +res.
 
-    def __init__(self, dim, num_heads, window, shift=False, mlp_ratio=4.,
-                 qkv_bias=True, drop=0., attn_drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+    Allows running local attention at a reduced inner_dim while keeping the
+    input/output dimension (for residuals and LayerNorm) at in_dim.
+    """
+
+    def __init__(self, in_dim, num_heads, window, shift=False, mlp_ratio=4.,
+                 qkv_bias=True, drop=0., attn_drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
+                 inner_dim: Optional[int] = None):
         super().__init__()
-        self.norm1 = norm_layer(dim, elementwise_affine=True)
-        self.attn = WindowMHSA1D(dim, num_heads, window, shift=(window//2 if shift else 0),
+        self.in_dim = in_dim
+        self.inner_dim = inner_dim if inner_dim is not None else in_dim
+
+        # Pre-norm in input dimension
+        self.norm1 = norm_layer(in_dim, elementwise_affine=True)
+
+        # Optional channel reduction before attention, then project back
+        if self.inner_dim != self.in_dim:
+            self.proj_in = nn.Linear(self.in_dim, self.inner_dim)
+            self.proj_out = nn.Linear(self.inner_dim, self.in_dim)
+        else:
+            self.proj_in = nn.Identity()
+            self.proj_out = nn.Identity()
+
+        self.attn = WindowMHSA1D(self.inner_dim, num_heads, window, shift=(window//2 if shift else 0),
                                  qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
-        self.norm2 = norm_layer(dim, elementwise_affine=True)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim*mlp_ratio),
+
+        # Second pre-norm and MLP in input dimension (residual compatible)
+        self.norm2 = norm_layer(in_dim, elementwise_affine=True)
+        self.mlp = Mlp(in_features=in_dim, hidden_features=int(in_dim*mlp_ratio),
                        act_layer=act_layer, drop=drop)
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
+        # Local attention at reduced dim with residual in input dim
+        y = self.norm1(x)
+        y = self.proj_in(y)
+        y = self.attn(y)
+        y = self.proj_out(y)
+        x = x + y
+
+        # MLP block at input dim
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -215,8 +243,7 @@ class LayerNorm(nn.Module):
 
 
 class MaskedAutoencoderViT(nn.Module):
-    """ Masked Autoencoder with VisionTransformer backbone
-    """
+    """Masked Autoencoder with VisionTransformer backbone"""
 
     def __init__(self,
                  nb_cls=80,
@@ -229,7 +256,6 @@ class MaskedAutoencoderViT(nn.Module):
                  norm_layer=nn.LayerNorm):
         super().__init__()
 
-        # --------------------------------------------------------------------------
         # MAE encoder specifics
         self.layer_norm = LayerNorm()
         self.patch_embed = resnet18.ResNet18(embed_dim)
@@ -242,12 +268,13 @@ class MaskedAutoencoderViT(nn.Module):
         self.pos_embed = None
         window_w = 12  # try 12 or 16
         self.blocks = nn.ModuleList([
-            LocalBlock1D(self.embed_dim//4, num_heads, window=window_w, shift=False,
+            # Run local attention at reduced inner_dim but keep I/O at embed_dim
+            LocalBlock1D(self.embed_dim, 4, window=window_w, shift=False,
                          mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
-                         norm_layer=norm_layer),
-            LocalBlock1D(self.embed_dim//2, num_heads, window=window_w, shift=True,
+                         norm_layer=norm_layer, inner_dim=self.embed_dim // 4),
+            LocalBlock1D(self.embed_dim, 4, window=window_w, shift=True,
                          mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
-                         norm_layer=norm_layer),
+                         norm_layer=norm_layer, inner_dim=self.embed_dim // 2),
             Block(self.embed_dim, num_heads, self.num_patches,
                   mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1, norm_layer=norm_layer),
             Block(self.embed_dim, num_heads, self.num_patches,
@@ -261,46 +288,34 @@ class MaskedAutoencoderViT(nn.Module):
 
     def initialize_weights(self):
         # initialization
-        # pos_embed is built dynamically from (W, H) in forward; do not pre-seed from grid_size
-
-        # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
-        # w = self.patch_embed.proj.weight.data
-        # torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-
-        # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
-        # pos_embed = get_2d_sincos_pos_embed(self.embed_dim, [1, self.nb_query])
-        # self.qry_tokens.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
         torch.nn.init.normal_(self.mask_token, std=.02)
-
         # initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            # we use xavier_uniform following official JAX ViT:
             torch.nn.init.xavier_uniform_(m.weight)
-            if isinstance(m, nn.Linear) and m.bias is not None:
+            if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
 
     def generate_span_mask(self, x, mask_ratio, max_span_length):
         N, L, D = x.shape  # batch, length, dim
         mask = torch.ones(N, L, 1).to(x.device)
         span_length = int(L * mask_ratio)
-        num_spans = span_length // max_span_length
-        for i in range(num_spans):
-            idx = torch.randint(L - max_span_length, (1,))
+        num_spans = max(1, span_length // max(1, max_span_length)
+                        ) if span_length > 0 else 0
+        for _ in range(num_spans):
+            if L - max_span_length <= 0:
+                break
+            idx = torch.randint(L - max_span_length, (1,), device=x.device)
             mask[:, idx:idx + max_span_length, :] = 0
         return mask
 
     def random_masking(self, x, mask_ratio, max_span_length):
-        """
-        Perform per-sample random masking by per-sample shuffling.
-        Per-sample shuffling is done by argsort random noise.
-        x: [N, L, D], sequence
-        """
+        """Apply span masking on sequence x: [N, L, D]."""
         mask = self.generate_span_mask(x, mask_ratio, max_span_length)
         x_masked = x * mask + (1 - mask) * self.mask_token
         return x_masked
@@ -323,16 +338,12 @@ class MaskedAutoencoderViT(nn.Module):
         feats = self.forward_features(
             x, mask_ratio, max_span_length, use_masking)  # [B, N, D]
         logits = self.head(feats)               # [B, N, nb_cls]  → CTC
-        # keep your current post-norm if you like
-        # logits = self.layer_norm(logits)
         if return_features:
             return logits, feats
         return logits
 
     def _ensure_pos_embed(self, W, H, device):
-        """Build fixed sin-cos positional embedding from actual feature map size.
-        Creates a non-trainable nn.Parameter of shape [1, W*H, D].
-        """
+        """Build fixed sin-cos positional embedding from actual feature map size."""
         N = W * H
         if (self.pos_embed is None) or (self.pos_embed.shape[1] != N):
             pe = get_2d_sincos_pos_embed(self.embed_dim, [W, H])
