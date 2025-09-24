@@ -182,7 +182,7 @@ def main():
         try:
             ckpt = torch.load(resume_path, map_location='cpu')
             if 'sgm_head' in ckpt:
-                sgm_head.load_state_dict(ckpt['sgm_head'], strict=True, weights_only=False)
+                sgm_head.load_state_dict(ckpt['sgm_head'], strict=True)
                 logger.info("Restored SGM head state from checkpoint")
             else:
                 logger.info(
