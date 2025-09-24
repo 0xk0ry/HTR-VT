@@ -242,10 +242,10 @@ class MaskedAutoencoderViT(nn.Module):
         self.pos_embed = None
         window_w = 12  # try 12 or 16
         self.blocks = nn.ModuleList([
-            LocalBlock1D(self.embed_dim, num_heads, window=window_w, shift=False,
+            LocalBlock1D(self.embed_dim//4, num_heads, window=window_w, shift=False,
                          mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
                          norm_layer=norm_layer),
-            LocalBlock1D(self.embed_dim, num_heads, window=window_w, shift=True,
+            LocalBlock1D(self.embed_dim//2, num_heads, window=window_w, shift=True,
                          mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
                          norm_layer=norm_layer),
             Block(self.embed_dim, num_heads, self.num_patches,
