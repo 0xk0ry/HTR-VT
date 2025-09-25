@@ -145,6 +145,39 @@ class LayerScale(nn.Module):
     def forward(self, x):
         return x.mul_(self.gamma) if self.inplace else x * self.gamma
 
+class ConvLocalMixer1D(nn.Module):
+    """
+    Full-width (no bottleneck) local mixer for [B, N, D].
+    LN → 1x1 (2D) → GLU → DWConv1d(k) → BN → SiLU → 1x1 → Dropout → +res
+    Cheap, stable, and CTC-friendly (width-only).
+    """
+    def __init__(self, dim, kernel_size=7, drop=0.1, use_bn=True):
+        super().__init__()
+        assert kernel_size % 2 == 1
+        self.norm = nn.LayerNorm(dim, elementwise_affine=True)
+
+        self.pw_in  = nn.Linear(dim, dim * 2, bias=True)  # → GLU halves
+        self.glu    = nn.GLU(dim=-1)
+
+        self.dwconv = nn.Conv1d(dim, dim, kernel_size=kernel_size,
+                                padding=kernel_size // 2, groups=dim, bias=not use_bn)
+        self.bn     = nn.BatchNorm1d(dim) if use_bn else nn.Identity()
+        self.act    = nn.SiLU()
+        self.pw_out = nn.Linear(dim, dim, bias=True)
+        self.drop   = nn.Dropout(drop)
+
+    def forward(self, x):              # x: [B, N, D]
+        y = self.norm(x)
+        y = self.pw_in(y)
+        y = self.glu(y)                # [B, N, D]
+        y = y.transpose(1, 2)          # [B, D, N]
+        y = self.dwconv(y)
+        y = self.bn(y)
+        y = self.act(y)
+        y = y.transpose(1, 2)          # [B, N, D]
+        y = self.pw_out(y)
+        y = self.drop(y)
+        return x + y                   # residual
 
 class Block(nn.Module):
 
@@ -266,19 +299,20 @@ class MaskedAutoencoderViT(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         # Positional embeddings will be created lazily from actual (W, H) in forward
         self.pos_embed = None
-        window_w = 12  # try 12 or 16
+        self.local_mixers = nn.Sequential(
+            ConvLocalMixer1D(embed_dim, kernel_size=7, drop=0.1),
+            ConvLocalMixer1D(embed_dim, kernel_size=7, drop=0.1),
+        )
+
         self.blocks = nn.ModuleList([
-            # Run local attention at reduced inner_dim but keep I/O at embed_dim
-            LocalBlock1D(self.embed_dim, 4, window=window_w, shift=False,
-                         mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
-                         norm_layer=norm_layer, inner_dim=self.embed_dim // 2),
-            LocalBlock1D(self.embed_dim, 4, window=window_w, shift=True,
-                         mlp_ratio=mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1,
-                         norm_layer=norm_layer, inner_dim=self.embed_dim // 2),
-            Block(self.embed_dim, num_heads, self.num_patches,
-                  mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1, norm_layer=norm_layer),
-            Block(self.embed_dim, num_heads, self.num_patches,
-                  mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1, norm_layer=norm_layer),
+            Block(embed_dim, num_heads, self.num_patches,
+                mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1, norm_layer=norm_layer),
+            Block(embed_dim, num_heads, self.num_patches,
+                mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1, norm_layer=norm_layer),
+            Block(embed_dim, num_heads, self.num_patches,
+                mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1, norm_layer=norm_layer),
+            Block(embed_dim, num_heads, self.num_patches,
+                mlp_ratio, qkv_bias=True, drop=0.1, attn_drop=0.1, norm_layer=norm_layer),
         ])
 
         self.norm = norm_layer(embed_dim, elementwise_affine=True)
@@ -326,9 +360,12 @@ class MaskedAutoencoderViT(nn.Module):
         x = x.view(b, c, -1).permute(0, 2, 1)       # [B, N, D]
         if use_masking:
             x = self.random_masking(x, mask_ratio, max_span_length)
+        # inside forward_features(...)
         self._ensure_pos_embed(W, H, x.device)
         if self.pos_embed is not None:
-            x = x + self.pos_embed                  # [B, N, D]
+            x = x + self.pos_embed                 # [B, N, D]
+
+        x = self.local_mixers(x)
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
