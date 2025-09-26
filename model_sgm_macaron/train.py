@@ -180,7 +180,7 @@ def main():
     # If resuming and SGM head exists in checkpoint, restore it so SGM loss doesn't reset
     if resume_path and os.path.isfile(resume_path) and sgm_head is not None:
         try:
-            ckpt = torch.load(resume_path, map_location='cpu')
+            ckpt = torch.load(resume_path, map_location='cpu', weights_only=False)
             if 'sgm_head' in ckpt:
                 sgm_head.load_state_dict(ckpt['sgm_head'], strict=True)
                 logger.info("Restored SGM head state from checkpoint")
