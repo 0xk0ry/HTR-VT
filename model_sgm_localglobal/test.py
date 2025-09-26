@@ -58,16 +58,11 @@ def main():
 
     model.eval()
     with torch.no_grad():
-        # Support optional beam search decoding via args.decode_method / args.beam_size
-        decode_method = getattr(args, 'decode_method', 'greedy')
-        beam_size = int(getattr(args, 'beam_size', 5))
         val_loss, val_cer, val_wer, preds, labels = valid.validation(
             model,
             criterion,
             test_loader,
             converter,
-            decode_method=decode_method,
-            beam_size=beam_size,
         )
 
     logger.info(
