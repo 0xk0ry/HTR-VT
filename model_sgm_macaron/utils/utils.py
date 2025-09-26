@@ -221,7 +221,7 @@ def load_checkpoint(model, model_ema, optimizer, checkpoint_path, logger):
                     ema_dict[re.sub(pattern, '', k)] = v
                 else:
                     ema_dict[k] = v
-            model_ema.ema.load_state_dict(ema_dict, strict=True)
+            model_ema.ema.load_state_dict(ema_dict, strict=False)
             logger.info("Successfully loaded EMA model state dict")
 
         # Load optimizer state - handle SAM optimizer structure
