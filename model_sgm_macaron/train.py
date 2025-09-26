@@ -169,7 +169,7 @@ def main():
                 "Continuing training without optimizer state (will restart from initial lr/momentum)")
     elif resume_path and os.path.isfile(resume_path):
         try:
-            ckpt = torch.load(resume_path, map_location='cpu')
+            ckpt = torch.load(resume_path, map_location='cpu', weights_only=False)
             if 'optimizer' in ckpt:
                 optimizer.load_state_dict(ckpt['optimizer'])
                 logger.info("Loaded optimizer state from checkpoint directly")
