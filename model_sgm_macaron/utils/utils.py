@@ -210,7 +210,7 @@ def load_checkpoint(model, model_ema, optimizer, checkpoint_path, logger):
             else:
                 model_dict[k] = v
 
-        model.load_state_dict(model_dict, strict=True)
+        model.load_state_dict(model_dict, strict=False)
         logger.info("Successfully loaded main model state dict")
 
         # Load EMA state dict if available
