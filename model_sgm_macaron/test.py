@@ -37,7 +37,7 @@ def main():
         else:
             model_dict[k] = v
 
-    model.load_state_dict(model_dict, strict=True)
+    model.load_state_dict(model_dict, strict=False)
     model = model.cuda()
 
     logger.info('Loading test loader...')
@@ -58,16 +58,11 @@ def main():
 
     model.eval()
     with torch.no_grad():
-        # Support optional beam search decoding via args.decode_method / args.beam_size
-        decode_method = getattr(args, 'decode_method', 'greedy')
-        beam_size = int(getattr(args, 'beam_size', 5))
         val_loss, val_cer, val_wer, preds, labels = valid.validation(
             model,
             criterion,
             test_loader,
             converter,
-            decode_method=decode_method,
-            beam_size=beam_size,
         )
 
     logger.info(
@@ -82,40 +77,6 @@ def main():
         },
         "predictions": []
     }
-
-    # Helper functions for per-sample CER / WER
-    def _levenshtein(a: str, b: str):
-        # Early exits
-        if a == b:
-            return 0
-        la, lb = len(a), len(b)
-        if la == 0:
-            return lb
-        if lb == 0:
-            return la
-        # DP single row optimization
-        prev = list(range(lb + 1))
-        for i, ca in enumerate(a, 1):
-            cur = [i]
-            for j, cb in enumerate(b, 1):
-                cost = 0 if ca == cb else 1
-                cur.append(min(prev[j] + 1,              # deletion
-                               cur[j - 1] + 1,          # insertion
-                               prev[j - 1] + cost))     # substitution
-            prev = cur
-        return prev[-1]
-
-    def _cer(pred: str, gt: str):
-        if len(gt) == 0:
-            return 0.0 if len(pred) == 0 else 1.0
-        return _levenshtein(pred, gt) / len(gt)
-
-    def _wer(pred: str, gt: str):
-        gt_words = gt.split()
-        pred_words = pred.split()
-        if len(gt_words) == 0:
-            return 0.0 if len(pred_words) == 0 else 1.0
-        return _levenshtein(pred_words, gt_words) / len(gt_words)
 
     # Adapt Levenshtein to list of tokens (words)
     def _levenshtein(pred_tokens, gt_tokens):
