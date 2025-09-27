@@ -388,7 +388,7 @@ def create_model(nb_cls, img_size, **kwargs):
                                  img_size=img_size,
                                  patch_size=(4, 64),
                                  embed_dim=768,
-                                 depth=2,
+                                 depth=4,
                                  num_heads=4,
                                  mlp_ratio=4,
                                  norm_layer=partial(nn.LayerNorm, eps=1e-6),
