@@ -101,10 +101,12 @@ class _TPSGridGen(nn.Module):
         self.register_buffer('L_inv', L_inv)                      # (K+3, K+3)
 
         # Precompute the target grid features [U(||q - p_i||), 1, x, y]
-        xs = torch.linspace(-1.0, 1.0, out_w)
-        ys = torch.linspace(-1.0, 1.0, out_h)
+        # IMPORTANT: create all new tensors on the same device as base_fiducials to avoid CPU/CUDA mismatch
+        device = base_fiducials.device
+        xs = torch.linspace(-1.0, 1.0, out_w, device=device)
+        ys = torch.linspace(-1.0, 1.0, out_h, device=device)
         grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')    # (H,W)
-        grid = torch.stack([grid_x, grid_y], dim=-1).view(-1, 2)  # (HW,2)
+        grid = torch.stack([grid_x, grid_y], dim=-1).view(-1, 2)  # (HW,2) already on device
         self.register_buffer('Q', grid)                           # (HW,2)
 
         d = torch.cdist(grid, base_fiducials, p=2)                # (HW,K)
@@ -197,6 +199,10 @@ class STNOnlyResNet18(nn.Module):
         self.backbone = resnet18.ResNet18(nb_feat=nb_feat)
 
     def forward(self, x):
+        # Ensure input is on same device as model parameters
+        model_device = next(self.parameters()).device
+        if x.device != model_device:
+            x = x.to(model_device, non_blocking=True)
         x = self.stn(x)
         return self.backbone(x)
 
@@ -208,6 +214,10 @@ class TPSSTNResNet18(nn.Module):
         self.backbone = resnet18.ResNet18(nb_feat=nb_feat)
 
     def forward(self, x):
+        # Ensure input is on same device as model parameters (prevents X1 CPU / X2 CUDA mismatch)
+        model_device = next(self.parameters()).device
+        if x.device != model_device:
+            x = x.to(model_device, non_blocking=True)
         x = self.stn(x)
         return self.backbone(x)
 
