@@ -184,18 +184,17 @@ class TPS_STN(nn.Module):
                                align_corners=False)
         return x_warp
 
-
 # ------------------------------------------------------
 # Wrappers that combine STN -> ResNet18 feature extractor
 # ------------------------------------------------------
-from resnet18 import ResNet18
+from model import resnet18
 
 class STNOnlyResNet18(nn.Module):
     """Affine STN -> ResNet18 (your feature extractor stays untouched)."""
     def __init__(self, nb_feat=384, in_ch=1, rectified_size=None):
         super().__init__()
         self.stn = AffineSTN(in_ch=in_ch, rectified_size=rectified_size)
-        self.backbone = ResNet18(nb_feat=nb_feat)
+        self.backbone = resnet18.ResNet18(nb_feat=nb_feat)
 
     def forward(self, x):
         x = self.stn(x)
@@ -206,7 +205,7 @@ class TPSSTNResNet18(nn.Module):
     def __init__(self, nb_feat=384, in_ch=1, K=20, rectified_size=None):
         super().__init__()
         self.stn = TPS_STN(in_ch=in_ch, K=K, rectified_size=rectified_size)
-        self.backbone = ResNet18(nb_feat=nb_feat)
+        self.backbone = resnet18.ResNet18(nb_feat=nb_feat)
 
     def forward(self, x):
         x = self.stn(x)
