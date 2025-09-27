@@ -26,8 +26,10 @@ class Attention(nn.Module):
 
     def forward(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C //
+                                  self.num_heads).permute(2, 0, 3, 1, 4)
+        # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv.unbind(0)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
@@ -37,6 +39,7 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
 
 class LayerScale(nn.Module):
     def __init__(self, dim, init_values=1e-5, inplace=False):
@@ -67,15 +70,21 @@ class Block(nn.Module):
         super().__init__()
         self.norm1 = norm_layer(dim, elementwise_affine=True)
 
-        self.attn = Attention(dim, num_patches, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
-        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.attn = Attention(dim, num_patches, num_heads=num_heads,
+                              qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.ls1 = LayerScale(
+            dim, init_values=init_values) if init_values else nn.Identity()
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
-        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.drop_path1 = DropPath(
+            drop_path) if drop_path > 0. else nn.Identity()
 
         self.norm2 = norm_layer(dim, elementwise_affine=True)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
-        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
-        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.mlp = Mlp(in_features=dim, hidden_features=int(
+            dim * mlp_ratio), act_layer=act_layer, drop=drop)
+        self.ls2 = LayerScale(
+            dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(
+            drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
@@ -103,8 +112,10 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     assert embed_dim % 2 == 0
 
     # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+    emb_h = get_1d_sincos_pos_embed_from_grid(
+        embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(
+        embed_dim // 2, grid[1])  # (H*W, D/2)
 
     emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
     return emb
@@ -142,7 +153,7 @@ class MaskedAutoencoderViT(nn.Module):
 
     def __init__(self,
                  nb_cls=80,
-                 img_size=[512, 32] ,
+                 img_size=[512, 32],
                  patch_size=[8, 32],
                  embed_dim=1024,
                  depth=24,
@@ -155,7 +166,8 @@ class MaskedAutoencoderViT(nn.Module):
         # MAE encoder specifics
         self.layer_norm = LayerNorm()
         self.patch_embed = resnet18.ResNet18(embed_dim)
-        self.grid_size = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        self.grid_size = [img_size[0] // patch_size[0],
+                          img_size[1] // patch_size[1]]
         self.embed_dim = embed_dim
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -175,7 +187,8 @@ class MaskedAutoencoderViT(nn.Module):
         # initialization
         # initialize (and freeze) pos_embed by sin-cos embedding
         pos_embed = get_2d_sincos_pos_embed(self.embed_dim, self.grid_size)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        self.pos_embed.data.copy_(
+            torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
         # w = self.patch_embed.proj.weight.data
@@ -206,7 +219,7 @@ class MaskedAutoencoderViT(nn.Module):
         num_spans = span_length // max_span_length
         for i in range(num_spans):
             idx = torch.randint(L - max_span_length, (1,))
-            mask[:,idx:idx + max_span_length,:] = 0
+            mask[:, idx:idx + max_span_length, :] = 0
         return mask
 
     def random_masking(self, x, mask_ratio, max_span_length):
@@ -219,40 +232,29 @@ class MaskedAutoencoderViT(nn.Module):
         x_masked = x * mask + (1 - mask) * self.mask_token
         return x_masked
 
-    def forward(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False):
-        # embed patches
+    def forward_features(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False):
         x = self.layer_norm(x)
-        x = self.patch_embed(x)
+        x = self.patch_embed(x)                  # [B, C, W, H]
         b, c, w, h = x.shape
-        x = x.view(b, c, -1).permute(0, 2, 1)
-        # masking: length -> length * mask_ratio
+        x = x.view(b, c, -1).permute(0, 2, 1)    # [B, N, D]
         if use_masking:
             x = self.random_masking(x, mask_ratio, max_span_length)
-        x = x + self.pos_embed
-        # apply Transformer blocks
+        x = x + self.pos_embed                   # preserve 2D position
         for blk in self.blocks:
             x = blk(x)
+        x = self.norm(x)                         # <-- tap here
+        return x                                  # [B, N, D]
 
-        x = self.norm(x)
-        # To CTC Loss
-        x = self.head(x)
-        x = self.layer_norm(x)
+    def forward(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False, return_features=False):
+        feats = self.forward_features(
+            x, mask_ratio, max_span_length, use_masking)  # [B, N, D]
+        logits = self.head(feats)               # [B, N, nb_cls]  → CTC
+        # keep your current post-norm if you like
+        logits = self.layer_norm(logits)
+        if return_features:
+            return logits, feats
+        return logits
 
-        return x
-
-    def extract_features(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False):
-        # embed patches
-        x = self.layer_norm(x)
-        x = self.patch_embed(x)                      # (B, C, W, H)
-        b, c, w, h = x.shape
-        x = x.view(b, c, -1).permute(0, 2, 1)        # (B, L, D)
-        if use_masking:
-            x = self.random_masking(x, mask_ratio, max_span_length)
-        x = x + self.pos_embed                       # absolute PE added once
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.norm(x)                             # (B, L, D)
-        return x
 
 def create_model(nb_cls, img_size, **kwargs):
     model = MaskedAutoencoderViT(nb_cls,
@@ -265,4 +267,3 @@ def create_model(nb_cls, img_size, **kwargs):
                                  norm_layer=partial(nn.LayerNorm, eps=1e-6),
                                  **kwargs)
     return model
-

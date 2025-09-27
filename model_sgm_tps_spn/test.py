@@ -58,10 +58,12 @@ def main():
 
     model.eval()
     with torch.no_grad():
-        val_loss, val_cer, val_wer, preds, labels = valid.validation(model,
-                                                                     criterion,
-                                                                     test_loader,
-                                                                     converter)
+        val_loss, val_cer, val_wer, preds, labels = valid.validation(
+            model,
+            criterion,
+            test_loader,
+            converter,
+        )
 
     logger.info(
         f'Test. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} ')

@@ -2,7 +2,6 @@ import torch
 import torch.utils.data
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
-import torch.nn.functional as F
 
 import os
 import json
@@ -12,54 +11,56 @@ from utils import sam
 from utils import option
 from data import dataset
 from model import HTR_VT
-from model.sgm import *
 from functools import partial
 import random
 import numpy as np
 import re
 import importlib
+from model.sgm_head import SGMHead, build_sgm_vocab, make_context_batch
 
 
-def compute_loss(args, model, criterion, batch, converter,
-                 sgm_on=False, sgm_head=None, sgm_vocab_stoi=None,
-                 nb_iter=0):
-    """
-    Returns total_loss, ctc_loss_detached, sgm_loss_detached
-    Uses one encoder pass and shares features across CTC & SGM.
-    """
-    images = batch[0].cuda()
-    labels_raw = batch[1]                     # list[str]
-    text, length = converter.encode(labels_raw)
-    batch_size = images.size(0)
+def compute_losses(
+    args,
+    model,
+    sgm_head,
+    image,
+    texts,
+    batch_size,
+    criterion_ctc,
+    converter,
+    nb_iter,
+    ctc_lambda,
+    sgm_lambda,
+    stoi,
+):
+    # 1) Forward
+    if sgm_head is None or nb_iter < getattr(args, 'sgm_warmup_iters', 0):
+        preds = model(image, args.mask_ratio, args.max_span_length,
+                      use_masking=True)   # [B, N, V_ctc]
+        feats = None
+    else:
+        preds, feats = model(image, args.mask_ratio, args.max_span_length,
+                             use_masking=True, return_features=True)
 
-    # ---- encoder features once ----
-    feats = model.extract_features(
-        # (B,L,D)
-        images, args.mask_ratio, args.max_span_length, use_masking=True)
+    # 2) CTC loss
+    text_ctc, length_ctc = converter.encode(
+        texts)    # existing path (targets for CTC)
+    preds_sz = torch.IntTensor([preds.size(1)] * batch_size).cuda()
+    loss_ctc = criterion_ctc(preds.permute(1, 0, 2).log_softmax(2).float(),
+                             text_ctc.cuda(), preds_sz, length_ctc.cuda()).mean()
 
-    # ---- CTC loss ----
-    logits = model.head(feats).float()       # (B,L,V_ctc)
-    preds_size = torch.IntTensor([logits.size(1)] * batch_size).cuda()
-    log_probs = logits.permute(1, 0, 2).log_softmax(2)
-    torch.backends.cudnn.enabled = False
-    ctc_loss = criterion(log_probs, text.cuda(),
-                         preds_size, length.cuda()).mean()
-    torch.backends.cudnn.enabled = True
+    # 3) SGM loss (optional)
+    loss_sgm = torch.zeros((), device=preds.device)
+    if sgm_head is not None and feats is not None:
+        left_ctx, right_ctx, tgt_ids, tgt_mask = make_context_batch(
+            texts, stoi, sub_str_len=getattr(args, 'sgm_sub_len', 5), device=preds.device)
+        out = sgm_head(feats, left_ctx, right_ctx, tgt_ids,
+                       tgt_mask)   # feats: [B,N,D] (detached)
+        loss_sgm = out['loss_sgm']
 
-    # ---- SGM (optional; train-time) ----
-    sgm_loss = torch.tensor(0., device=logits.device)
-    warmup_iters = getattr(args, "sgm_warmup_iters", 0)
-    if sgm_on and (sgm_head is not None) and (nb_iter >= warmup_iters):
-        txt_ids, tgt_ids, mask_pos = make_sgm_batch(
-            labels_raw, sgm_vocab_stoi, getattr(args, "sgm_mask_rate", 0.15))
-        txt_ids, tgt_ids, mask_pos = txt_ids.cuda(), tgt_ids.cuda(), mask_pos.cuda()
-        sgm_logits, _ = sgm_head(feats, txt_ids, mask_pos)  # (B,N,V)
-        sgm_logits = sgm_logits.view(-1, sgm_logits.size(-1))
-        tgt_flat = tgt_ids.view(-1)
-        sgm_loss = F.cross_entropy(sgm_logits, tgt_flat, ignore_index=-100)
-
-    total_loss = ctc_loss + getattr(args, "sgm_lambda", 0.15) * sgm_loss
-    return total_loss, ctc_loss.detach(), sgm_loss.detach()
+    # 4) Combine with weights
+    total = ctc_lambda * loss_ctc + sgm_lambda * loss_sgm
+    return total, loss_ctc.detach(), loss_sgm.detach()
 
 
 def main():
@@ -90,6 +91,7 @@ def main():
 
     model = HTR_VT.create_model(
         nb_cls=args.nb_cls, img_size=args.img_size[::-1])
+
     total_param = sum(p.numel() for p in model.parameters())
     logger.info('total_param is {}'.format(total_param))
 
@@ -130,23 +132,33 @@ def main():
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
     converter = utils.CTCLabelConverter(train_dataset.ralph.values())
 
-    sgm_on = args.sgm_on
-    sgm_vocab_itos, sgm_vocab_stoi = build_sgm_vocab(converter.dict.keys())
-    sgm_head = (SGMHead(vocab_size=len(sgm_vocab_itos),
-                        d_vis=model.head.in_features,
-                        d_sgm=args.sgm_dmodel,
-                        num_layers=args.sgm_layers,
-                        num_heads=args.sgm_heads,
-                        dropout=args.sgm_dropout).cuda()
-                if sgm_on else None)
+    sgm_enable = getattr(args, 'sgm_enable', True)
+    sgm_lambda = getattr(args, 'sgm_lambda', 1.0)       # λ2 in the paper
+    ctc_lambda = getattr(args, 'ctc_lambda', 0.1)       # λ1 in the paper
+    sgm_sub_len = getattr(args, 'sgm_sub_len', 5)
+    sgm_warmup = getattr(args, 'sgm_warmup_iters', 0)   # 0 = start immediately
+    stoi, itos, pad_id, eos_id, bos_l_id, bos_r_id = build_sgm_vocab(converter)
+    vocab_size_sgm = len(itos)
+    d_vis = model.embed_dim
 
-    params = list(model.parameters())
-    if sgm_on:
-        params += list(sgm_head.parameters())
-    optimizer = sam.SAM(params, torch.optim.AdamW,
+    sgm_head = SGMHead(d_vis=d_vis, vocab_size_sgm=vocab_size_sgm,
+                       sub_str_len=sgm_sub_len).cuda()
+    if sgm_head is not None:
+        sgm_head.train()
+    # Respect flag to disable SGM entirely
+    if not sgm_enable:
+        sgm_head = None
+
+    # Build optimizer over model + SGM head (if enabled) so SGM params actually update
+    param_groups = list(model.parameters())
+    if sgm_enable and sgm_head is not None:
+        param_groups += list(sgm_head.parameters())
+        logger.info(
+            f"Optimizing {sum(p.numel() for p in sgm_head.parameters())} SGM params in addition to model params")
+    optimizer = sam.SAM(param_groups, torch.optim.AdamW,
                         lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
 
-    # Load optimizer state after initialization
+    # Load optimizer & SGM head state after initialization
     if optimizer_state is not None:
         try:
             optimizer.load_state_dict(optimizer_state)
@@ -155,6 +167,28 @@ def main():
             logger.warning(f"Failed to load optimizer state: {e}")
             logger.info(
                 "Continuing training without optimizer state (will restart from initial lr/momentum)")
+    elif resume_path and os.path.isfile(resume_path):
+        try:
+            ckpt = torch.load(resume_path, map_location='cpu')
+            if 'optimizer' in ckpt:
+                optimizer.load_state_dict(ckpt['optimizer'])
+                logger.info("Loaded optimizer state from checkpoint directly")
+        except Exception as e:
+            logger.warning(
+                f"Could not load optimizer state from checkpoint: {e}")
+
+    # If resuming and SGM head exists in checkpoint, restore it so SGM loss doesn't reset
+    if resume_path and os.path.isfile(resume_path) and sgm_head is not None:
+        try:
+            ckpt = torch.load(resume_path, map_location='cpu')
+            if 'sgm_head' in ckpt:
+                sgm_head.load_state_dict(ckpt['sgm_head'], strict=True)
+                logger.info("Restored SGM head state from checkpoint")
+            else:
+                logger.info(
+                    "No SGM head state found in checkpoint; training SGM from scratch")
+        except Exception as e:
+            logger.warning(f"Failed to restore SGM head from checkpoint: {e}")
 
     best_cer, best_wer = best_cer, best_wer
     train_loss = train_loss
@@ -168,38 +202,31 @@ def main():
 
         optimizer.zero_grad()
         batch = next(train_iter)
+        image = batch[0].cuda()
+        text, length = converter.encode(batch[1])
+        batch_size = image.size(0)
 
-        # 1st SAM step
-        total_loss, ctc_loss_val, sgm_loss_val = compute_loss(
-            args, model, criterion, batch, converter,
-            sgm_on=sgm_on, sgm_head=sgm_head, sgm_vocab_stoi=sgm_vocab_stoi,
-            nb_iter=nb_iter
-        )
-        total_loss.backward()
+        loss, loss_ctc, loss_sgm = compute_losses(
+            args, model, sgm_head, image, batch[1], batch_size, criterion, converter, nb_iter,
+            ctc_lambda, sgm_lambda, stoi)
+        loss.backward()
         optimizer.first_step(zero_grad=True)
 
-        # 2nd SAM step: recompute the SAME loss with perturbed weights
-        total_loss, ctc_loss_val, sgm_loss_val = compute_loss(
-            args, model, criterion, batch, converter,
-            sgm_on=sgm_on, sgm_head=sgm_head, sgm_vocab_stoi=sgm_vocab_stoi,
-            nb_iter=nb_iter
-        )
-        total_loss.backward()
+        loss2, _, _ = compute_losses(
+            args, model, sgm_head, image, batch[1], batch_size, criterion, converter, nb_iter,
+            ctc_lambda, sgm_lambda, stoi)
+        loss2.backward()
         optimizer.second_step(zero_grad=True)
-
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
-
-        train_loss += total_loss.item()
+        train_loss += loss.item()
         train_loss_count += 1
 
         if nb_iter % args.print_iter == 0:
             train_loss_avg = train_loss / train_loss_count if train_loss_count > 0 else 0.0
 
-            logger.info(f'Iter : {nb_iter} \t LR : {current_lr:0.5f} '
-                        f'\t train_loss : {train_loss_avg:0.5f} '
-                        f'\t CTC : {ctc_loss_val.item():0.5f} '
-                        f'\t SGM : {sgm_loss_val.item():0.5f}')
+            logger.info(
+                f'Iter : {nb_iter} \t LR : {current_lr:0.5f} \t total : {train_loss_avg:0.5f} \t CTC : {loss_ctc.mean():0.5f} \t SGM : {loss_sgm.mean():0.5f} \t ')
 
             writer.add_scalar('./Train/lr', current_lr, nb_iter)
             writer.add_scalar('./Train/train_loss', train_loss_avg, nb_iter)
@@ -207,8 +234,8 @@ def main():
                 wandb.log({
                     'train/lr': current_lr,
                     'train/loss': train_loss_avg,
-                    'train/ctc_loss': ctc_loss_val.item(),
-                    'train/sgm_loss': sgm_loss_val.item(),
+                    'train/CTC': loss_ctc.mean(),
+                    'train/SGM': loss_sgm.mean(),
                     'iter': nb_iter,
                 }, step=nb_iter)
             train_loss = 0.0
@@ -238,6 +265,8 @@ def main():
                     'train_loss': train_loss,
                     'train_loss_count': train_loss_count,
                 }
+                if sgm_head is not None:
+                    checkpoint['sgm_head'] = sgm_head.state_dict()
                 torch.save(checkpoint, os.path.join(args.save_dir, ckpt_name))
                 if val_cer < best_cer:
                     logger.info(
@@ -258,6 +287,8 @@ def main():
                         'train_loss': train_loss,
                         'train_loss_count': train_loss_count,
                     }
+                    if sgm_head is not None:
+                        checkpoint['sgm_head'] = sgm_head.state_dict()
                     torch.save(checkpoint, os.path.join(
                         args.save_dir, 'best_CER.pth'))
 
@@ -280,6 +311,8 @@ def main():
                         'train_loss': train_loss,
                         'train_loss_count': train_loss_count,
                     }
+                    if sgm_head is not None:
+                        checkpoint['sgm_head'] = sgm_head.state_dict()
                     torch.save(checkpoint, os.path.join(
                         args.save_dir, 'best_WER.pth'))
 
