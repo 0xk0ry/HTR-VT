@@ -41,8 +41,16 @@ def compute_losses(
         preds = model(image, use_masking=True, mask_mode=mask_mode, mask_ratio=mask_ratio, max_span_length=max_span_length)   # [B, N, V_ctc]
         feats = None
     else:
-        preds, feats = model(image, args.mask_ratio, args.max_span_length,
-                             use_masking=True, return_features=True, mask_mode=mask_mode, mask_ratio=mask_ratio, max_span_length=max_span_length)   # [B, N, V_ctc], [B,N,D]
+        # Updated call: removed outdated positional arguments (args.mask_ratio, args.max_span_length)
+        # to avoid passing multiple values for 'use_masking' (TypeError). Use keyword args instead.
+        preds, feats = model(
+            image,
+            use_masking=True,
+            return_features=True,
+            mask_mode=mask_mode,
+            mask_ratio=mask_ratio if mask_ratio is not None else getattr(args, 'mask_ratio', 0.0),
+            max_span_length=max_span_length if max_span_length is not None else getattr(args, 'max_span_length', 0)
+        )   # [B, N, V_ctc], [B, N, D]
 
     # 2) CTC loss
     text_ctc, length_ctc = converter.encode(
