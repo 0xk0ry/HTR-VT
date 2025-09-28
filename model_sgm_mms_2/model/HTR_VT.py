@@ -259,6 +259,13 @@ class MaskedAutoencoderViT(nn.Module):
         return mask
 
     def _mask_span_1d(self, B: int, L: int, ratio: float, max_span: int, device) -> torch.Tensor:
+        """
+        Span masking in 1-D (YOUR OLD SEMANTICS, but robust):
+        - place contiguous spans of random length s ∈ [1, max_span]
+        - enforce an Algorithm-1-like spacing policy via k depending on ratio
+        - continue until ~ratio*L tokens are covered
+        Returns bool [B, L], True = masked.
+        """
         if ratio <= 0.0:
             return torch.zeros(B, L, dtype=torch.bool, device=device)
 
@@ -297,24 +304,6 @@ class MaskedAutoencoderViT(nn.Module):
             mask[b] = used
         return mask
 
-    def _mask_span_old_1d(self, B: int, L: int, ratio: float, max_span: int, device) -> torch.Tensor:
-        if ratio <= 0.0 or max_span <= 0 or L <= 0:
-            return torch.zeros(B, L, dtype=torch.bool, device=device)
-
-        span_total = int(L * ratio)
-        num_spans  = span_total // max(1, max_span)
-        if num_spans <= 0:
-            return torch.zeros(B, L, dtype=torch.bool, device=device)
-
-        s = min(max_span, L)  # fixed length (old behavior)
-        mask = torch.zeros(B, L, dtype=torch.bool, device=device)
-
-        for _ in range(num_spans):
-            start = torch.randint(0, L - s + 1, (1,), device=device).item()
-            mask[:, start:start + s] = True    # same start for the whole batch
-
-        return mask
-
     def generate_mms_mask(self, x: torch.Tensor,
                         ratios: dict = None,
                         max_span_length: int = 8,
@@ -332,7 +321,7 @@ class MaskedAutoencoderViT(nn.Module):
 
         m_rand  = self._mask_random_1d(B, L, ratios.get("random", 0.50), x.device)              # [B,L] True=masked
         m_block = self._mask_block_1d(B, L, ratios.get("block", 0.25), x.device, min_block)     # [B,L]
-        m_span  = self._mask_span_old_1d(B, L, ratios.get("span", 0.25), max_span_length, x.device) # [B,L]
+        m_span  = self._mask_span_1d(B, L, ratios.get("span", 0.25), max_span_length, x.device) # [B,L]
 
         m_union = (m_rand | m_block | m_span)   # True = masked by any strategy
         mask_keep = (~m_union).float().unsqueeze(-1)  # [B,L,1], 1=keep, 0=mask
@@ -340,14 +329,19 @@ class MaskedAutoencoderViT(nn.Module):
 
     # ---- (kept for compatibility) single-span generator, now correctness-fixed ----
     def generate_span_mask(self, x, mask_ratio, max_span_length):
-        N, L, D = x.shape  # batch, length, dim
-        mask = torch.ones(N, L, 1).to(x.device)
-        span_length = int(L * mask_ratio)
-        num_spans = span_length // max_span_length
-        for i in range(num_spans):
-            idx = torch.randint(L - max_span_length, (1,))
-            mask[:,idx:idx + max_span_length,:] = 0
-        return mask
+        """
+        Backward-compatible span mask (now masks full columns across rows).
+        Returns: mask_keep float [B, L, 1], where 1=keep, 0=mask.
+        """
+        B, L, _ = x.shape
+        grid_h = self.grid_size[0]
+        grid_w = self.grid_size[1]
+        assert grid_h * \
+            grid_w == L, f"Grid {grid_h}x{grid_w} != sequence length {L}"
+        m_span = self._mask_span(
+            # [B,L], True=masked
+            B, grid_w, grid_h, mask_ratio, max_span_length, x.device)
+        return (~m_span).float().unsqueeze(-1)
 
     def random_masking(self, x, mask_ratio, max_span_length):
         """
@@ -393,9 +387,9 @@ class MaskedAutoencoderViT(nn.Module):
         return self.norm(x)                           # [B,N,D]
 
 
-    def forward(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False, return_features=False):
+    def forward(self, x, mask_ratio=0.0, max_span=1, use_masking=False, return_features=False, mask_mode="mms", mask_ratios=None, max_span_length=None):
         feats = self.forward_features(
-            x, mask_ratio, max_span_length, use_masking)  # [B, N, D]
+            x, use_masking=use_masking, mask_mode=mask_mode, mask_ratio=mask_ratio, max_span_length=max_span_length)  # [B, N, D]
         logits = self.head(feats)               # [B, N, nb_cls]  → CTC
         # keep your current post-norm if you like
         logits = self.layer_norm(logits)

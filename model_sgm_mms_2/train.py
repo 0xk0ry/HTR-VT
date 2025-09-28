@@ -32,6 +32,9 @@ def compute_losses(
     ctc_lambda,
     sgm_lambda,
     stoi,
+    mask_mode='span_old',
+    mask_ratio=0.30,
+    max_span_length=8,
 ):
     # 1) Forward
     if sgm_head is None or nb_iter < getattr(args, 'sgm_warmup_iters', 0):

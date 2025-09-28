@@ -387,9 +387,9 @@ class MaskedAutoencoderViT(nn.Module):
         return self.norm(x)                           # [B,N,D]
 
 
-    def forward(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False, return_features=False):
+    def forward(self, x, mask_ratio=0.0, max_span=1, use_masking=False, return_features=False, mask_mode="mms", mask_ratios=None, max_span_length=None):
         feats = self.forward_features(
-            x, mask_ratio, max_span_length, use_masking)  # [B, N, D]
+            x, use_masking=use_masking, mask_mode=mask_mode, mask_ratio=mask_ratio, max_span_length=max_span_length)  # [B, N, D]
         logits = self.head(feats)               # [B, N, nb_cls]  → CTC
         # keep your current post-norm if you like
         logits = self.layer_norm(logits)
