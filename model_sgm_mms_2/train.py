@@ -38,11 +38,11 @@ def compute_losses(
 ):
     # 1) Forward
     if sgm_head is None or nb_iter < getattr(args, 'sgm_warmup_iters', 0):
-        preds = model(image, use_masking=True, mask_mode=mask_mode, mask_ratios=mask_ratios, max_span_length=max_span_length)   # [B, N, V_ctc]
+        preds = model(image, use_masking=True, mask_mode=mask_mode, mask_ratio=mask_ratio, max_span_length=max_span_length)   # [B, N, V_ctc]
         feats = None
     else:
         preds, feats = model(image, args.mask_ratio, args.max_span_length,
-                             use_masking=True, return_features=True, mask_mode=mask_mode, mask_ratios=mask_ratios, max_span_length=max_span_length)   # [B, N, V_ctc], [B,N,D]
+                             use_masking=True, return_features=True, mask_mode=mask_mode, mask_ratio=masmask_ratiok_ratios, max_span_length=max_span_length)   # [B, N, V_ctc], [B,N,D]
 
     # 2) CTC loss
     text_ctc, length_ctc = converter.encode(
