@@ -315,13 +315,13 @@ class MaskedAutoencoderViT(nn.Module):
         """
         B, L, _ = x.shape
         if ratios is None:
-            ratios = getattr(self, "mms_ratios", {"random": 0.75, "block": 0.50, "span": 0.50})
+            ratios = getattr(self, "mms_ratios", {"random": 0.50, "block": 0.25, "span": 0.25})
         block_params = block_params or {}
         min_block = int(block_params.get("min_block", 2))
 
-        m_rand  = self._mask_random_1d(B, L, ratios.get("random", 0.75), x.device)              # [B,L] True=masked
-        m_block = self._mask_block_1d(B, L, ratios.get("block", 0.50), x.device, min_block)     # [B,L]
-        m_span  = self._mask_span_1d(B, L, ratios.get("span", 0.50), max_span_length, x.device) # [B,L]
+        m_rand  = self._mask_random_1d(B, L, ratios.get("random", 0.50), x.device)              # [B,L] True=masked
+        m_block = self._mask_block_1d(B, L, ratios.get("block", 0.25), x.device, min_block)     # [B,L]
+        m_span  = self._mask_span_1d(B, L, ratios.get("span", 0.25), max_span_length, x.device) # [B,L]
 
         m_union = (m_rand | m_block | m_span)   # True = masked by any strategy
         mask_keep = (~m_union).float().unsqueeze(-1)  # [B,L,1], 1=keep, 0=mask
