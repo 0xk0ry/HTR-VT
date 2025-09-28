@@ -63,6 +63,30 @@ def compute_losses(
     return total, loss_ctc.detach(), loss_sgm.detach()
 
 
+def tri_masked_loss(args, model, sgm_head, image, labels, batch_size,
+                    criterion, converter, nb_iter, ctc_lambda, sgm_lambda, stoi,
+                    r_rand=0.30, r_block=0.20, r_span=0.20, max_span=8):
+    total = 0.0
+    total_ctc = 0.0
+    total_sgm = 0.0
+    weights = {"random": 1.0, "block": 1.0, "span_old": 1.0}
+    plans = [("random", r_rand), ("block", r_block), ("span_old", r_span)]
+
+    for mode, ratio in plans:
+        loss, loss_ctc, loss_sgm = compute_losses(
+            args, model, sgm_head, image, labels, batch_size, criterion, converter,
+            nb_iter, ctc_lambda, sgm_lambda, stoi,
+            mask_mode=mode, mask_ratio=ratio, max_span_length=max_span
+        )
+        w = weights[mode]
+        total += w * loss
+        total_ctc += w * loss_ctc
+        total_sgm += w * loss_sgm
+
+    denom = sum(weights.values())
+    return total/denom, total_ctc/denom, total_sgm/denom
+
+
 def main():
 
     args = option.get_args_parser()
@@ -202,21 +226,27 @@ def main():
 
         optimizer.zero_grad()
         batch = next(train_iter)
-        image = batch[0].cuda()
+        image = batch[0].cuda(non_blocking=True)
         text, length = converter.encode(batch[1])
         batch_size = image.size(0)
 
-        loss, loss_ctc, loss_sgm = compute_losses(
-            args, model, sgm_head, image, batch[1], batch_size, criterion, converter, nb_iter,
-            ctc_lambda, sgm_lambda, stoi)
+        loss, loss_ctc, loss_sgm = tri_masked_loss(
+            args, model, sgm_head, image, batch[1], batch_size, criterion, converter,
+            nb_iter, ctc_lambda, sgm_lambda, stoi,
+            r_rand=0.60, r_block=0.40, r_span=0.40, max_span=8
+        )
         loss.backward()
         optimizer.first_step(zero_grad=True)
 
-        loss2, _, _ = compute_losses(
-            args, model, sgm_head, image, batch[1], batch_size, criterion, converter, nb_iter,
-            ctc_lambda, sgm_lambda, stoi)
+        # ---- SECOND SAM PASS: recompute tri-CTC loss at the perturbed weights ----
+        loss2, _, _ = tri_masked_loss(
+            args, model, sgm_head, image, batch[1], batch_size, criterion, converter,
+            nb_iter, ctc_lambda, sgm_lambda, stoi,
+            r_rand=0.60, r_block=0.40, r_span=0.40, max_span=8
+        )
         loss2.backward()
         optimizer.second_step(zero_grad=True)
+
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
         train_loss += loss.item()

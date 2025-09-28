@@ -360,18 +360,32 @@ class MaskedAutoencoderViT(nn.Module):
         x_masked = x * mask + (1 - mask) * self.mask_token
         return x_masked
 
-    def forward_features(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False):
-        x = self.layer_norm(x)
-        x = self.patch_embed(x)                  # [B, C, W, H]
-        b, c, w, h = x.shape
-        x = x.view(b, c, -1).permute(0, 2, 1)    # [B, N, D]
+    # inside MaskedAutoencoderViT.forward_features(...)
+    def forward_features(self, x, use_masking=False,
+                        mask_mode="mms",   # "random" | "block" | "span_old" | "mms"
+                        mask_ratio=0.5, max_span_length=8,
+                        ratios=None, block_params=None):
+        x = self.patch_embed(x)                       # [B,C,W,H] -> your [B,N,D] after reshape
+        B, C, W, H = x.shape
+        x = x.view(B, C, -1).permute(0, 2, 1)         # [B,N,D]
+
         if use_masking:
-            x = self.random_masking(x, mask_ratio, max_span_length)
-        x = x + self.pos_embed                   # preserve 2D position
+            if mask_mode == "random":
+                keep = (~self._mask_random_1d(B, x.size(1), mask_ratio, x.device)).float().unsqueeze(-1)
+            elif mask_mode == "block":
+                keep = (~self._mask_block_1d(B, x.size(1), mask_ratio, x.device)).float().unsqueeze(-1)
+            elif mask_mode == "span_old":
+                keep = (~self._mask_span_old_1d(B, x.size(1), mask_ratio, max_span_length, x.device)).float().unsqueeze(-1)
+            else:  # "mms" union (what you already have)
+                keep = self.generate_mms_mask(x, ratios=ratios, max_span_length=max_span_length, block_params=block_params)
+            x = x * keep + (1 - keep) * self.mask_token  # [B,N,D]
+
+        # pos + transformer as you already do
+        x = x + self.pos_embed[:, :x.size(1), :]
         for blk in self.blocks:
             x = blk(x)
-        x = self.norm(x)                         # <-- tap here
-        return x                                  # [B, N, D]
+        return self.norm(x)                           # [B,N,D]
+
 
     def forward(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False, return_features=False):
         feats = self.forward_features(
