@@ -215,137 +215,115 @@ class MaskedAutoencoderViT(nn.Module):
                 nn.init.constant_(m.weight, 1.0)
 
     # ---- MMS helpers ----
-    def _mask_random(self, B: int, L: int, ratio: float, device) -> torch.Tensor:
-        """
-        Random patch masking on 1-D sequence.
-        Returns: bool mask [B, L] where True = masked
-        """
-        if ratio <= 0.0:
+    # ---------------------------
+    # 1-D Multiple Masking (MMS)
+    # ---------------------------
+
+    def _mask_random_1d(self, B: int, L: int, ratio: float, device) -> torch.Tensor:
+        """Random token masking on 1-D sequence. Returns bool [B, L], True = masked."""
+        if ratio <= 0.0: 
             return torch.zeros(B, L, dtype=torch.bool, device=device)
         num = int(round(ratio * L))
         if num <= 0:
             return torch.zeros(B, L, dtype=torch.bool, device=device)
         noise = torch.rand(B, L, device=device)
-        # per-sample indices to mask
-        idx = noise.argsort(dim=1)[:, :num]
+        idx = noise.argsort(dim=1)[:, :num]         # per-sample masked indices
         mask = torch.zeros(B, L, dtype=torch.bool, device=device)
         mask.scatter_(1, idx, True)
         return mask
 
-    def _mask_block(self, B: int, w: int, h: int, ratio: float,
-                    device, min_block: int = 2, max_aspect: float = 3.0) -> torch.Tensor:
+    def _mask_block_1d(self, B: int, L: int, ratio: float, device,
+                    min_block: int = 2) -> torch.Tensor:
         """
-        Blockwise masking on the 2-D token grid (BEiT-style rectangles).
-        Returns: bool mask [B, L] where True = masked
+        Blockwise masking in 1-D (contiguous segments), no spacing constraints.
+        Returns bool [B, L], True = masked.
         """
         if ratio <= 0.0:
-            return torch.zeros(B, w*h, dtype=torch.bool, device=device)
-        target = int(round(ratio * w * h))
-        mask2d = torch.zeros(B, h, w, dtype=torch.bool, device=device)
-
+            return torch.zeros(B, L, dtype=torch.bool, device=device)
+        target = int(round(ratio * L))
+        mask = torch.zeros(B, L, dtype=torch.bool, device=device)
         for b in range(B):
-            covered = int(mask2d[b].sum().item())
+            covered = int(mask[b].sum().item())
             # cap iterations to avoid infinite loops on tiny targets
             for _ in range(10000):
                 if covered >= target:
                     break
-                # choose approximate block area
+                # choose a block length
                 remain = max(1, target - covered)
-                area = random.randint(min_block, max(remain, min_block))
-                # log-uniform aspect ratio in [1/max_aspect, max_aspect]
-                ar = math.exp(
-                    random.uniform(-math.log(max_aspect), math.log(max_aspect)))
-                bh = max(min_block, int(round(math.sqrt(area / ar))))
-                bw = max(min_block, int(round(bh * ar)))
-                bh, bw = min(bh, h), min(bw, w)
-                y0 = random.randint(0, h - bh)
-                x0 = random.randint(0, w - bw)
-                block = mask2d[b, y0:y0+bh, x0:x0+bw]
-                prev = int(block.sum().item())
-                block[:] = True
-                covered += int(block.sum().item()) - prev
+                blk = random.randint(min_block, max(min_block, min(remain, L)))
+                start = random.randint(0, max(0, L - blk))
+                seg = mask[b, start:start+blk]
+                prev = int(seg.sum().item())
+                seg[:] = True
+                covered += int(seg.sum().item()) - prev
+        return mask
 
-        return mask2d.view(B, -1)
-
-    def _mask_span(self, B: int, w: int, h: int, ratio: float,
-                   max_span: int, device) -> torch.Tensor:
+    def _mask_span_1d(self, B: int, L: int, ratio: float, max_span: int, device) -> torch.Tensor:
         """
-        Span masking (Algorithm 1 in the paper), extended to multi-row grid:
-        Mask *entire columns* over horizontal spans. Returns bool mask [B, L].
+        Span masking in 1-D (YOUR OLD SEMANTICS, but robust):
+        - place contiguous spans of random length s ∈ [1, max_span]
+        - enforce an Algorithm-1-like spacing policy via k depending on ratio
+        - continue until ~ratio*L tokens are covered
+        Returns bool [B, L], True = masked.
         """
         if ratio <= 0.0:
-            return torch.zeros(B, w*h, dtype=torch.bool, device=device)
+            return torch.zeros(B, L, dtype=torch.bool, device=device)
 
-        # number of columns to cover (each column has h tokens)
-        target_cols = int(round(ratio * w))
-        mask2d = torch.zeros(B, h, w, dtype=torch.bool, device=device)
+        L = int(L)
+        max_span = int(max(1, min(max_span, L)))
+        target = int(round(ratio * L))
+        mask = torch.zeros(B, L, dtype=torch.bool, device=device)
 
-        # spacing k policy per Algorithm 1
+        # spacing policy similar to Alg.1 (adapted to 1-D)
         def spacing_for(R):
             if R <= 0.4:
-                return None   # k = span length (set per-span)
+                return None   # use k = span length (separates spans when ratio small)
             elif R <= 0.7:
                 return 1
             else:
                 return 0
-
         fixed_k = spacing_for(ratio)
 
         for b in range(B):
-            # which columns are masked
-            used = torch.zeros(w, dtype=torch.bool, device=device)
+            used = torch.zeros(L, dtype=torch.bool, device=device)
             covered = int(used.sum().item())
             for _ in range(10000):
-                if covered >= target_cols:
+                if covered >= target:
                     break
-                s = random.randint(1, max(1, max_span))
-                l = random.randint(0, max(0, w - s))
+                s = random.randint(1, max_span)
+                if s > L: s = L
+                l = random.randint(0, L - s)
                 r = l + s - 1
                 k = s if fixed_k is None else fixed_k
-                # ensure spacing neighborhood is clear
-                left_ok = (l - k) < 0 or not used[max(0, l - k):l].any()
-                right_ok = (
-                    r + 1) >= w or not used[r+1:min(w, r + 1 + k)].any()
+                # check spacing neighborhood
+                left_ok  = (l - k) < 0 or not used[max(0, l - k):l].any()
+                right_ok = (r + 1) >= L or not used[r+1:min(L, r + 1 + k)].any()
                 if left_ok and right_ok:
                     used[l:r+1] = True
-                    mask2d[b, :, l:r+1] = True
                     covered = int(used.sum().item())
-
-        return mask2d.view(B, -1)
+            mask[b] = used
+        return mask
 
     def generate_mms_mask(self, x: torch.Tensor,
-                          ratios: dict = None,
-                          max_span_length: int = 8,
-                          block_params: dict = None) -> torch.Tensor:
+                        ratios: dict = None,
+                        max_span_length: int = 8,
+                        block_params: dict = None) -> torch.Tensor:
         """
-        Build a *union* mask from three strategies: random, blockwise, span.
+        Build UNION of three 1-D masks: random, blockwise, span.
         x: [B, L, D] tokens.
         Returns: mask_keep float [B, L, 1], where 1=keep, 0=mask.
         """
         B, L, _ = x.shape
-        # token grid from model config (must match your pos_embed grid)
-        grid_h = self.grid_size[0]
-        grid_w = self.grid_size[1]
-        assert grid_h * \
-            grid_w == L, f"Grid {grid_h}x{grid_w} != sequence length {L}"
-
-        # default ratios per paper (you can override by setting self.mms_ratios externally)
         if ratios is None:
-            ratios = getattr(self, "mms_ratios", {
-                             "random": 0.75, "block": 0.50, "span": 0.50})
+            ratios = getattr(self, "mms_ratios", {"random": 0.75, "block": 0.50, "span": 0.50})
         block_params = block_params or {}
-        min_block = block_params.get("min_block", 2)
-        max_aspect = block_params.get("max_aspect", 3.0)
+        min_block = int(block_params.get("min_block", 2))
 
-        m_rand = self._mask_random(B, L, ratios.get(
-            "random", 0.75), x.device)                 # [B,L]
-        m_block = self._mask_block(B, grid_w, grid_h, ratios.get("block", 0.50), x.device,
-                                   # [B,L]
-                                   min_block=min_block, max_aspect=max_aspect)
-        m_span = self._mask_span(B, grid_w, grid_h, ratios.get(
-            "span", 0.50), max_span_length, x.device)  # [B,L]
+        m_rand  = self._mask_random_1d(B, L, ratios.get("random", 0.75), x.device)              # [B,L] True=masked
+        m_block = self._mask_block_1d(B, L, ratios.get("block", 0.50), x.device, min_block)     # [B,L]
+        m_span  = self._mask_span_1d(B, L, ratios.get("span", 0.50), max_span_length, x.device) # [B,L]
 
-        m_union = (m_rand | m_block | m_span)        # True = masked anywhere
+        m_union = (m_rand | m_block | m_span)   # True = masked by any strategy
         mask_keep = (~m_union).float().unsqueeze(-1)  # [B,L,1], 1=keep, 0=mask
         return mask_keep
 
