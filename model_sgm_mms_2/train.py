@@ -54,7 +54,7 @@ def compute_losses(
     if sgm_head is not None and feats is not None:
         left_ctx, right_ctx, tgt_ids, tgt_mask = make_context_batch(
             texts, stoi, sub_str_len=getattr(args, 'sgm_sub_len', 5), device=preds.device)
-        out = sgm_head(feats, left_ctx, right_ctx, tgt_ids,
+        out = sgm_head(feats.detach(), left_ctx, right_ctx, tgt_ids,
                        tgt_mask)   # feats: [B,N,D] (detached)
         loss_sgm = out['loss_sgm']
 
