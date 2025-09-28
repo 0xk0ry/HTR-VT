@@ -6,7 +6,8 @@ from timm.models.vision_transformer import Mlp, DropPath
 import numpy as np
 from model import resnet18
 from functools import partial
-import math, random
+import math
+import random
 
 
 class Attention(nn.Module):
@@ -27,8 +28,10 @@ class Attention(nn.Module):
 
     def forward(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C //
+                                  self.num_heads).permute(2, 0, 3, 1, 4)
+        # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv.unbind(0)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
@@ -38,6 +41,7 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
 
 class LayerScale(nn.Module):
     def __init__(self, dim, init_values=1e-5, inplace=False):
@@ -68,15 +72,21 @@ class Block(nn.Module):
         super().__init__()
         self.norm1 = norm_layer(dim, elementwise_affine=True)
 
-        self.attn = Attention(dim, num_patches, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
-        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.attn = Attention(dim, num_patches, num_heads=num_heads,
+                              qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.ls1 = LayerScale(
+            dim, init_values=init_values) if init_values else nn.Identity()
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
-        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.drop_path1 = DropPath(
+            drop_path) if drop_path > 0. else nn.Identity()
 
         self.norm2 = norm_layer(dim, elementwise_affine=True)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
-        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
-        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.mlp = Mlp(in_features=dim, hidden_features=int(
+            dim * mlp_ratio), act_layer=act_layer, drop=drop)
+        self.ls2 = LayerScale(
+            dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(
+            drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
@@ -104,8 +114,10 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     assert embed_dim % 2 == 0
 
     # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+    emb_h = get_1d_sincos_pos_embed_from_grid(
+        embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(
+        embed_dim // 2, grid[1])  # (H*W, D/2)
 
     emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
     return emb
@@ -143,7 +155,7 @@ class MaskedAutoencoderViT(nn.Module):
 
     def __init__(self,
                  nb_cls=80,
-                 img_size=[512, 32] ,
+                 img_size=[512, 32],
                  patch_size=[8, 32],
                  embed_dim=1024,
                  depth=24,
@@ -156,7 +168,8 @@ class MaskedAutoencoderViT(nn.Module):
         # MAE encoder specifics
         self.layer_norm = LayerNorm()
         self.patch_embed = resnet18.ResNet18(embed_dim)
-        self.grid_size = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        self.grid_size = [img_size[0] // patch_size[0],
+                          img_size[1] // patch_size[1]]
         self.embed_dim = embed_dim
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -176,7 +189,8 @@ class MaskedAutoencoderViT(nn.Module):
         # initialization
         # initialize (and freeze) pos_embed by sin-cos embedding
         pos_embed = get_2d_sincos_pos_embed(self.embed_dim, self.grid_size)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        self.pos_embed.data.copy_(
+            torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
         # w = self.patch_embed.proj.weight.data
@@ -212,7 +226,8 @@ class MaskedAutoencoderViT(nn.Module):
         if num <= 0:
             return torch.zeros(B, L, dtype=torch.bool, device=device)
         noise = torch.rand(B, L, device=device)
-        idx = noise.argsort(dim=1)[:, :num]                   # per-sample indices to mask
+        # per-sample indices to mask
+        idx = noise.argsort(dim=1)[:, :num]
         mask = torch.zeros(B, L, dtype=torch.bool, device=device)
         mask.scatter_(1, idx, True)
         return mask
@@ -238,7 +253,8 @@ class MaskedAutoencoderViT(nn.Module):
                 remain = max(1, target - covered)
                 area = random.randint(min_block, max(remain, min_block))
                 # log-uniform aspect ratio in [1/max_aspect, max_aspect]
-                ar = math.exp(random.uniform(-math.log(max_aspect), math.log(max_aspect)))
+                ar = math.exp(
+                    random.uniform(-math.log(max_aspect), math.log(max_aspect)))
                 bh = max(min_block, int(round(math.sqrt(area / ar))))
                 bw = max(min_block, int(round(bh * ar)))
                 bh, bw = min(bh, h), min(bw, w)
@@ -276,7 +292,8 @@ class MaskedAutoencoderViT(nn.Module):
         fixed_k = spacing_for(ratio)
 
         for b in range(B):
-            used = torch.zeros(w, dtype=torch.bool, device=device)  # which columns are masked
+            # which columns are masked
+            used = torch.zeros(w, dtype=torch.bool, device=device)
             covered = int(used.sum().item())
             for _ in range(10000):
                 if covered >= target_cols:
@@ -286,8 +303,9 @@ class MaskedAutoencoderViT(nn.Module):
                 r = l + s - 1
                 k = s if fixed_k is None else fixed_k
                 # ensure spacing neighborhood is clear
-                left_ok  = (l - k) < 0 or not used[max(0, l - k):l].any()
-                right_ok = (r + 1) >= w or not used[r+1:min(w, r + 1 + k)].any()
+                left_ok = (l - k) < 0 or not used[max(0, l - k):l].any()
+                right_ok = (
+                    r + 1) >= w or not used[r+1:min(w, r + 1 + k)].any()
                 if left_ok and right_ok:
                     used[l:r+1] = True
                     mask2d[b, :, l:r+1] = True
@@ -308,22 +326,27 @@ class MaskedAutoencoderViT(nn.Module):
         # token grid from model config (must match your pos_embed grid)
         grid_h = self.grid_size[0]
         grid_w = self.grid_size[1]
-        assert grid_h * grid_w == L, f"Grid {grid_h}x{grid_w} != sequence length {L}"
+        assert grid_h * \
+            grid_w == L, f"Grid {grid_h}x{grid_w} != sequence length {L}"
 
         # default ratios per paper (you can override by setting self.mms_ratios externally)
         if ratios is None:
-            ratios = getattr(self, "mms_ratios", {"random": 0.75, "block": 0.50, "span": 0.50})
+            ratios = getattr(self, "mms_ratios", {
+                             "random": 0.75, "block": 0.50, "span": 0.50})
         block_params = block_params or {}
         min_block = block_params.get("min_block", 2)
         max_aspect = block_params.get("max_aspect", 3.0)
 
-        m_rand  = self._mask_random(B, L, ratios.get("random", 0.75), x.device)                 # [B,L]
+        m_rand = self._mask_random(B, L, ratios.get(
+            "random", 0.75), x.device)                 # [B,L]
         m_block = self._mask_block(B, grid_w, grid_h, ratios.get("block", 0.50), x.device,
-                                   min_block=min_block, max_aspect=max_aspect)                  # [B,L]
-        m_span  = self._mask_span(B, grid_w, grid_h, ratios.get("span", 0.50), max_span_length, x.device)  # [B,L]
+                                   # [B,L]
+                                   min_block=min_block, max_aspect=max_aspect)
+        m_span = self._mask_span(B, grid_w, grid_h, ratios.get(
+            "span", 0.50), max_span_length, x.device)  # [B,L]
 
         m_union = (m_rand | m_block | m_span)        # True = masked anywhere
-        mask_keep = (~m_union).float().unsqueeze(-1) # [B,L,1], 1=keep, 0=mask
+        mask_keep = (~m_union).float().unsqueeze(-1)  # [B,L,1], 1=keep, 0=mask
         return mask_keep
 
     # ---- (kept for compatibility) single-span generator, now correctness-fixed ----
@@ -335,8 +358,11 @@ class MaskedAutoencoderViT(nn.Module):
         B, L, _ = x.shape
         grid_h = self.grid_size[0]
         grid_w = self.grid_size[1]
-        assert grid_h * grid_w == L, f"Grid {grid_h}x{grid_w} != sequence length {L}"
-        m_span = self._mask_span(B, grid_w, grid_h, mask_ratio, max_span_length, x.device)  # [B,L], True=masked
+        assert grid_h * \
+            grid_w == L, f"Grid {grid_h}x{grid_w} != sequence length {L}"
+        m_span = self._mask_span(
+            # [B,L], True=masked
+            B, grid_w, grid_h, mask_ratio, max_span_length, x.device)
         return (~m_span).float().unsqueeze(-1)
 
     def random_masking(self, x, mask_ratio, max_span_length):
@@ -348,33 +374,36 @@ class MaskedAutoencoderViT(nn.Module):
         if use_mms:
             mask = self.generate_mms_mask(x, ratios=getattr(self, "mms_ratios", None),
                                           max_span_length=max_span_length,
-                                          block_params=getattr(self, "mms_block_params", None))  # [B,L,1]
+                                          # [B,L,1]
+                                          block_params=getattr(self, "mms_block_params", None))
         else:
-            mask = self.generate_span_mask(x, mask_ratio, max_span_length)  # [B,L,1]
+            mask = self.generate_span_mask(
+                x, mask_ratio, max_span_length)  # [B,L,1]
         x_masked = x * mask + (1 - mask) * self.mask_token
         return x_masked
 
-
-    def forward(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False):
-        # embed patches
+    def forward_features(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False):
         x = self.layer_norm(x)
-        x = self.patch_embed(x)
+        x = self.patch_embed(x)                  # [B, C, W, H]
         b, c, w, h = x.shape
-        x = x.view(b, c, -1).permute(0, 2, 1)
-        # masking: length -> length * mask_ratio
+        x = x.view(b, c, -1).permute(0, 2, 1)    # [B, N, D]
         if use_masking:
             x = self.random_masking(x, mask_ratio, max_span_length)
-        x = x + self.pos_embed
-        # apply Transformer blocks
+        x = x + self.pos_embed                   # preserve 2D position
         for blk in self.blocks:
             x = blk(x)
+        x = self.norm(x)                         # <-- tap here
+        return x                                  # [B, N, D]
 
-        x = self.norm(x)
-        # To CTC Loss
-        x = self.head(x)
-        x = self.layer_norm(x)
-
-        return x
+    def forward(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False, return_features=False):
+        feats = self.forward_features(
+            x, mask_ratio, max_span_length, use_masking)  # [B, N, D]
+        logits = self.head(feats)               # [B, N, nb_cls]  → CTC
+        # keep your current post-norm if you like
+        logits = self.layer_norm(logits)
+        if return_features:
+            return logits, feats
+        return logits
 
 
 def create_model(nb_cls, img_size, **kwargs):
@@ -388,4 +417,3 @@ def create_model(nb_cls, img_size, **kwargs):
                                  norm_layer=partial(nn.LayerNorm, eps=1e-6),
                                  **kwargs)
     return model
-
