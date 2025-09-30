@@ -255,15 +255,6 @@ def main():
             nb_iter, ctc_lambda, sgm_lambda, stoi,
             r_rand=0.60, r_block=0.40, r_span=0.40, max_span=8
         )
-
-        # After first forward pass, sync EMA model with main model (in case architecture was built)
-        if nb_iter == start_iter:
-            # The model architecture might have been built during the first forward pass
-            # so we need to ensure the EMA model matches the updated architecture
-            model_ema.ema.load_state_dict(model.state_dict())
-            logger.info(
-                "Synchronized EMA model with main model after architecture initialization")
-
         loss.backward()
         optimizer.first_step(zero_grad=True)
 
