@@ -28,7 +28,6 @@ def window_reverse(windows, wh, ww, H, W, B):
 
 # ----- RELATIVE POSITION BIAS -----
 
-
 class WindowAttention2D(nn.Module):
     def __init__(self, dim, num_heads, window_size):
         super().__init__()
@@ -136,6 +135,10 @@ class SwinBlock2D(nn.Module):
         # x: [B, H*W, C]
         B, N, C = x.shape
         assert N == H*W
+        
+        # save residual before windows/shift
+        x_res = x
+        
         x = x.view(B, H, W, C)
 
         # cyclic shift
@@ -160,14 +163,18 @@ class SwinBlock2D(nn.Module):
 
         # reverse cyclic shift
         if self.sh or self.sw:
-            x_hat = torch.roll(merged, shifts=(self.sh, self.sw), dims=(1, 2))
+            x_attn = torch.roll(merged, shifts=(self.sh, self.sw), dims=(1, 2))
         else:
-            x_hat = merged
+            x_attn = merged
 
-        x_hat = x_hat.view(B, H*W, C)
-        # FFN
-        x_hat = x_hat + self.mlp(self.norm2(x_hat))
-        return x_hat
+        x_attn = x_attn.view(B, H*W, C)
+        
+        # add attention residual
+        x = x_res + x_attn
+        
+        # FFN with residual
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 # ----- HEIGHT-ONLY MERGE (2x1) -----
 
@@ -333,28 +340,28 @@ class HTR_VT_Swin(nn.Module):
         else:
             self.proj = nn.Identity()
 
-        # Stage 1/2/3 blocks
-        self.stage1 = nn.ModuleList([
-            SwinBlock2D(D, self._heads[0], self._wins[0],
-                        self._shifts[0], self.mlp_ratio, self.drop)
-            for _ in range(self._depths[0])
-        ])
+        # Stage 1/2/3 blocks with alternating W-MSA / SW-MSA
+        self.stage1 = nn.ModuleList()
+        win1 = self._wins[0]
+        for i in range(self._depths[0]):
+            shift = (0, 0) if i % 2 == 0 else (win1[0]//2, win1[1]//2)
+            self.stage1.append(SwinBlock2D(D, self._heads[0], win1, shift, self.mlp_ratio, self.drop))
         self.merge1 = HeightOnlyPatchMerging(D, D*2)
         D *= 2
 
-        self.stage2 = nn.ModuleList([
-            SwinBlock2D(D, self._heads[1], self._wins[1],
-                        self._shifts[1], self.mlp_ratio, self.drop)
-            for _ in range(self._depths[1])
-        ])
+        self.stage2 = nn.ModuleList()
+        win2 = self._wins[1]
+        for i in range(self._depths[1]):
+            shift = (0, 0) if i % 2 == 0 else (win2[0]//2, win2[1]//2)
+            self.stage2.append(SwinBlock2D(D, self._heads[1], win2, shift, self.mlp_ratio, self.drop))
         self.merge2 = HeightOnlyPatchMerging(D, D*2)
         D *= 2
 
-        self.stage3 = nn.ModuleList([
-            SwinBlock2D(D, self._heads[2], self._wins[2],
-                        self._shifts[2], self.mlp_ratio, self.drop)
-            for _ in range(self._depths[2])
-        ])
+        self.stage3 = nn.ModuleList()
+        win3 = self._wins[2]
+        for i in range(self._depths[2]):
+            shift = (0, 0) if i % 2 == 0 else (win3[0]//2, win3[1]//2)
+            self.stage3.append(SwinBlock2D(D, self._heads[2], win3, shift, self.mlp_ratio, self.drop))
 
         self.combiner = Combining(D, D, drop=self.drop)
         self.head = nn.Linear(D, self.nb_cls)
