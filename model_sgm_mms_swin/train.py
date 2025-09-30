@@ -130,11 +130,9 @@ def main():
     model = HTR_VT.create_model(
         nb_cls=args.nb_cls)
 
-    total_param = sum(p.numel() for p in model.parameters())
-    model_dummy = HTR_VT_Swin(nb_cls=..., d_model=192)
     dummy = torch.randn(1, 1, 64, 512)
-    _ = model_dummy(dummy)  # triggers _build_swin()
-    print(sum(p.numel() for p in model_dummy.parameters()))
+    _ = model(dummy)  # triggers _build_swin()
+    total_param = sum(p.numel() for p in model.parameters())
 
     logger.info('total_param is {}'.format(total_param))
 
@@ -257,6 +255,15 @@ def main():
             nb_iter, ctc_lambda, sgm_lambda, stoi,
             r_rand=0.60, r_block=0.40, r_span=0.40, max_span=8
         )
+
+        # After first forward pass, sync EMA model with main model (in case architecture was built)
+        if nb_iter == start_iter:
+            # The model architecture might have been built during the first forward pass
+            # so we need to ensure the EMA model matches the updated architecture
+            model_ema.ema.load_state_dict(model.state_dict())
+            logger.info(
+                "Synchronized EMA model with main model after architecture initialization")
+
         loss.backward()
         optimizer.first_step(zero_grad=True)
 
