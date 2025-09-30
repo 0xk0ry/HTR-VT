@@ -177,7 +177,7 @@ def main():
     sgm_warmup = getattr(args, 'sgm_warmup_iters', 0)   # 0 = start immediately
     stoi, itos, pad_id, eos_id, bos_l_id, bos_r_id = build_sgm_vocab(converter)
     vocab_size_sgm = len(itos)
-    d_vis = model._requested_d_model
+    d_vis = model._requested_d_model*4
 
     sgm_head = SGMHead(d_vis=d_vis, vocab_size_sgm=vocab_size_sgm,
                        sub_str_len=sgm_sub_len).cuda()

@@ -254,7 +254,7 @@ def _mask_span_1d(self, B: int, L: int, ratio: float, max_span: int, device) -> 
         return torch.zeros(B, L, dtype=torch.bool, device=device)
 
     span_total = int(L * ratio)
-    num_spans  = span_total // max(1, max_span)
+    num_spans = span_total // max(1, max_span)
     if num_spans <= 0:
         return torch.zeros(B, L, dtype=torch.bool, device=device)
 
@@ -337,8 +337,10 @@ class HTR_VT_Swin(nn.Module):
     def _build_swin(self, Cfe):
         # Get the device of the existing patch_embed to ensure consistency
         device = next(self.patch_embed.parameters()).device
-        
+
         D = Cfe if self._requested_d_model is None else self._requested_d_model
+        initial_D = D  # Save the initial D for mask_token
+
         if D != Cfe:
             self.proj = nn.Conv2d(Cfe, D, kernel_size=1, bias=False).to(device)
         else:
@@ -373,12 +375,14 @@ class HTR_VT_Swin(nn.Module):
         self.combiner = Combining(D, D, drop=self.drop).to(device)
         self.head = nn.Linear(D, self.nb_cls).to(device)
 
-        # resize mask_token to correct channel dim and device
+        # resize mask_token to match the initial D (before merging stages)
+        # because masking is applied right after projection, not at the end
         with torch.no_grad():
-            self.mask_token = nn.Parameter(torch.zeros(1, 1, D, device=device))
+            self.mask_token = nn.Parameter(
+                torch.zeros(1, 1, initial_D, device=device))
+            # ------------- forward_features (with optional MMS masking) -------------
             nn.init.normal_(self.mask_token, std=0.02)
 
-    # ------------- forward_features (with optional MMS masking) -------------
     def forward_features(self, x, use_masking=False, mask_mode="mms",
                          mask_ratio=0.3, max_span_length=8,
                          ratios=None, block_params=None):
