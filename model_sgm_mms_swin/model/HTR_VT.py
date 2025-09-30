@@ -241,7 +241,12 @@ def _mask_block_1d(B, L, ratio, device, min_block=2):
             if covered >= target:
                 break
             remain = max(1, target - covered)
-            blk = random.randint(min_block, min(remain, L))
+            max_blk = min(remain, L)
+            # Ensure min_block <= max_blk to avoid empty range
+            if min_block > max_blk:
+                blk = max_blk
+            else:
+                blk = random.randint(min_block, max_blk)
             start = random.randint(0, max(0, L - blk))
             prev = int(mask[b, start:start+blk].sum().item())
             mask[b, start:start+blk] = True
