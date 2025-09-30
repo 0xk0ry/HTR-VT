@@ -301,7 +301,7 @@ class HTR_VT_Swin(nn.Module):
     def __init__(self,
                  nb_cls=80,
                  d_model=128,            # if None, use Cfe from ResNet; else 1x1 conv to project
-                 stage_depths=(2, 2, 2),
+                 stage_depths=(1, 2, 1),
                  stage_heads=(4, 4, 4),
                  stage_windows=((4, 8), (2, 8), (1, 8)),
                  stage_shifts=((0, 0), (0, 4), (0, 4)),
