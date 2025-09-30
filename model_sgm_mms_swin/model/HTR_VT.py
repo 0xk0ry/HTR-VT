@@ -335,11 +335,14 @@ class HTR_VT_Swin(nn.Module):
         self._requested_d_model = d_model
 
     def _build_swin(self, Cfe):
+        # Get the device of the existing patch_embed to ensure consistency
+        device = next(self.patch_embed.parameters()).device
+        
         D = Cfe if self._requested_d_model is None else self._requested_d_model
         if D != Cfe:
-            self.proj = nn.Conv2d(Cfe, D, kernel_size=1, bias=False)
+            self.proj = nn.Conv2d(Cfe, D, kernel_size=1, bias=False).to(device)
         else:
-            self.proj = nn.Identity()
+            self.proj = nn.Identity().to(device)
 
         # Stage 1/2/3 blocks with alternating W-MSA / SW-MSA
         self.stage1 = nn.ModuleList()
@@ -347,8 +350,8 @@ class HTR_VT_Swin(nn.Module):
         for i in range(self._depths[0]):
             shift = (0, 0) if i % 2 == 0 else (win1[0]//2, win1[1]//2)
             self.stage1.append(SwinBlock2D(
-                D, self._heads[0], win1, shift, self.mlp_ratio, self.drop))
-        self.merge1 = HeightOnlyPatchMerging(D, D*2)
+                D, self._heads[0], win1, shift, self.mlp_ratio, self.drop).to(device))
+        self.merge1 = HeightOnlyPatchMerging(D, D*2).to(device)
         D *= 2
 
         self.stage2 = nn.ModuleList()
@@ -356,8 +359,8 @@ class HTR_VT_Swin(nn.Module):
         for i in range(self._depths[1]):
             shift = (0, 0) if i % 2 == 0 else (win2[0]//2, win2[1]//2)
             self.stage2.append(SwinBlock2D(
-                D, self._heads[1], win2, shift, self.mlp_ratio, self.drop))
-        self.merge2 = HeightOnlyPatchMerging(D, D*2)
+                D, self._heads[1], win2, shift, self.mlp_ratio, self.drop).to(device))
+        self.merge2 = HeightOnlyPatchMerging(D, D*2).to(device)
         D *= 2
 
         self.stage3 = nn.ModuleList()
@@ -365,14 +368,14 @@ class HTR_VT_Swin(nn.Module):
         for i in range(self._depths[2]):
             shift = (0, 0) if i % 2 == 0 else (win3[0]//2, win3[1]//2)
             self.stage3.append(SwinBlock2D(
-                D, self._heads[2], win3, shift, self.mlp_ratio, self.drop))
+                D, self._heads[2], win3, shift, self.mlp_ratio, self.drop).to(device))
 
-        self.combiner = Combining(D, D, drop=self.drop)
-        self.head = nn.Linear(D, self.nb_cls)
+        self.combiner = Combining(D, D, drop=self.drop).to(device)
+        self.head = nn.Linear(D, self.nb_cls).to(device)
 
-        # resize mask_token to correct channel dim
+        # resize mask_token to correct channel dim and device
         with torch.no_grad():
-            self.mask_token = nn.Parameter(torch.zeros(1, 1, D))
+            self.mask_token = nn.Parameter(torch.zeros(1, 1, D, device=device))
             nn.init.normal_(self.mask_token, std=0.02)
 
     # ------------- forward_features (with optional MMS masking) -------------
