@@ -254,7 +254,7 @@ def _mask_block_1d(B, L, ratio, device, min_block=2):
     return mask
 
 
-def _mask_span_1d(self, B: int, L: int, ratio: float, max_span: int, device) -> torch.Tensor:
+def _mask_span_1d(B, L, ratio, max_span, device):
     if ratio <= 0.0 or max_span <= 0 or L <= 0:
         return torch.zeros(B, L, dtype=torch.bool, device=device)
 

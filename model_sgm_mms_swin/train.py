@@ -131,6 +131,11 @@ def main():
         nb_cls=args.nb_cls)
 
     total_param = sum(p.numel() for p in model.parameters())
+    model_dummy = HTR_VT_Swin(nb_cls=..., d_model=192)
+    dummy = torch.randn(1, 1, 64, 512)
+    _ = model_dummy(dummy)  # triggers _build_swin()
+    print(sum(p.numel() for p in model_dummy.parameters()))
+
     logger.info('total_param is {}'.format(total_param))
 
     model.train()
