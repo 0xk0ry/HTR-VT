@@ -10,8 +10,7 @@ from utils import utils
 from utils import sam
 from utils import option
 from data import dataset
-# from model import HTR_VT
-from model import svtr
+from model import HTR_VT
 from functools import partial
 import random
 import numpy as np
@@ -39,9 +38,7 @@ def compute_losses(
 ):
     # 1) Forward
     if sgm_head is None or nb_iter < getattr(args, 'sgm_warmup_iters', 0):
-        preds = model(image, use_masking=True, mask_mode=mask_mode,
-                      # [B, N, V_ctc]
-                      mask_ratio=mask_ratio, max_span_length=max_span_length)
+        preds = model(image, use_masking=True, mask_mode=mask_mode, mask_ratio=mask_ratio, max_span_length=max_span_length)   # [B, N, V_ctc]
         feats = None
     else:
         # Updated call: removed outdated positional arguments (args.mask_ratio, args.max_span_length)
@@ -51,10 +48,8 @@ def compute_losses(
             use_masking=True,
             return_features=True,
             mask_mode=mask_mode,
-            mask_ratio=mask_ratio if mask_ratio is not None else getattr(
-                args, 'mask_ratio', 0.0),
-            max_span_length=max_span_length if max_span_length is not None else getattr(
-                args, 'max_span_length', 0)
+            mask_ratio=mask_ratio if mask_ratio is not None else getattr(args, 'mask_ratio', 0.0),
+            max_span_length=max_span_length if max_span_length is not None else getattr(args, 'max_span_length', 0)
         )   # [B, N, V_ctc], [B, N, D]
 
     # 2) CTC loss
@@ -128,10 +123,8 @@ def main():
     else:
         wandb = None
 
-    # model = HTR_VT.create_model(
-    #     nb_cls=args.nb_cls, img_size=args.img_size[::-1])
-    model = svtr.create_model(
-        nb_cls=args.nb_cls)
+    model = HTR_VT.create_model(
+        nb_cls=args.nb_cls, img_size=args.img_size[::-1])
 
     total_param = sum(p.numel() for p in model.parameters())
     logger.info('total_param is {}'.format(total_param))
@@ -210,8 +203,7 @@ def main():
                 "Continuing training without optimizer state (will restart from initial lr/momentum)")
     elif resume_path and os.path.isfile(resume_path):
         try:
-            ckpt = torch.load(resume_path, map_location='cpu',
-                              weights_only=False)
+            ckpt = torch.load(resume_path, map_location='cpu', weights_only=False)
             if 'optimizer' in ckpt:
                 optimizer.load_state_dict(ckpt['optimizer'])
                 logger.info("Loaded optimizer state from checkpoint directly")
@@ -222,11 +214,9 @@ def main():
     # If resuming and SGM head exists in checkpoint, restore it so SGM loss doesn't reset
     if resume_path and os.path.isfile(resume_path) and sgm_head is not None:
         try:
-            ckpt = torch.load(resume_path, map_location='cpu',
-                              weights_only=False)
+            ckpt = torch.load(resume_path, map_location='cpu', weights_only=False)
             if 'sgm_head' in ckpt:
-                sgm_head.load_state_dict(
-                    ckpt['sgm_head'], strict=True, weights_only=False)
+                sgm_head.load_state_dict(ckpt['sgm_head'], strict=True, weights_only=False)
                 logger.info("Restored SGM head state from checkpoint")
             else:
                 logger.info(
