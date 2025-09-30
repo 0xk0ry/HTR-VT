@@ -28,6 +28,7 @@ def window_reverse(windows, wh, ww, H, W, B):
 
 # ----- RELATIVE POSITION BIAS -----
 
+
 class WindowAttention2D(nn.Module):
     def __init__(self, dim, num_heads, window_size):
         super().__init__()
@@ -135,10 +136,10 @@ class SwinBlock2D(nn.Module):
         # x: [B, H*W, C]
         B, N, C = x.shape
         assert N == H*W
-        
+
         # save residual before windows/shift
         x_res = x
-        
+
         x = x.view(B, H, W, C)
 
         # cyclic shift
@@ -168,10 +169,10 @@ class SwinBlock2D(nn.Module):
             x_attn = merged
 
         x_attn = x_attn.view(B, H*W, C)
-        
+
         # add attention residual
         x = x_res + x_attn
-        
+
         # FFN with residual
         x = x + self.mlp(self.norm2(x))
         return x
@@ -248,22 +249,22 @@ def _mask_block_1d(B, L, ratio, device, min_block=2):
     return mask
 
 
-def _mask_span_1d(B, L, ratio, max_span, device):
-    if ratio <= 0.0:
+def _mask_span_1d(self, B: int, L: int, ratio: float, max_span: int, device) -> torch.Tensor:
+    if ratio <= 0.0 or max_span <= 0 or L <= 0:
         return torch.zeros(B, L, dtype=torch.bool, device=device)
-    target = int(round(ratio*L))
+
+    span_total = int(L * ratio)
+    num_spans  = span_total // max(1, max_span)
+    if num_spans <= 0:
+        return torch.zeros(B, L, dtype=torch.bool, device=device)
+
+    s = min(max_span, L)  # fixed length (old behavior)
     mask = torch.zeros(B, L, dtype=torch.bool, device=device)
-    for b in range(B):
-        covered = 0
-        for _ in range(10000):
-            if covered >= target:
-                break
-            s = random.randint(1, max_span)
-            l = random.randint(0, L - s)
-            r = l + s
-            if not mask[b, l:r].any():
-                mask[b, l:r] = True
-                covered += s
+
+    for _ in range(num_spans):
+        start = torch.randint(0, L - s + 1, (1,), device=device).item()
+        mask[:, start:start + s] = True    # same start for the whole batch
+
     return mask
 
 
@@ -345,7 +346,8 @@ class HTR_VT_Swin(nn.Module):
         win1 = self._wins[0]
         for i in range(self._depths[0]):
             shift = (0, 0) if i % 2 == 0 else (win1[0]//2, win1[1]//2)
-            self.stage1.append(SwinBlock2D(D, self._heads[0], win1, shift, self.mlp_ratio, self.drop))
+            self.stage1.append(SwinBlock2D(
+                D, self._heads[0], win1, shift, self.mlp_ratio, self.drop))
         self.merge1 = HeightOnlyPatchMerging(D, D*2)
         D *= 2
 
@@ -353,7 +355,8 @@ class HTR_VT_Swin(nn.Module):
         win2 = self._wins[1]
         for i in range(self._depths[1]):
             shift = (0, 0) if i % 2 == 0 else (win2[0]//2, win2[1]//2)
-            self.stage2.append(SwinBlock2D(D, self._heads[1], win2, shift, self.mlp_ratio, self.drop))
+            self.stage2.append(SwinBlock2D(
+                D, self._heads[1], win2, shift, self.mlp_ratio, self.drop))
         self.merge2 = HeightOnlyPatchMerging(D, D*2)
         D *= 2
 
@@ -361,7 +364,8 @@ class HTR_VT_Swin(nn.Module):
         win3 = self._wins[2]
         for i in range(self._depths[2]):
             shift = (0, 0) if i % 2 == 0 else (win3[0]//2, win3[1]//2)
-            self.stage3.append(SwinBlock2D(D, self._heads[2], win3, shift, self.mlp_ratio, self.drop))
+            self.stage3.append(SwinBlock2D(
+                D, self._heads[2], win3, shift, self.mlp_ratio, self.drop))
 
         self.combiner = Combining(D, D, drop=self.drop)
         self.head = nn.Linear(D, self.nb_cls)
