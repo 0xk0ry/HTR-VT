@@ -22,7 +22,7 @@ def main():
     logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
 
     model = HTR_VT.create_model(
-        nb_cls=args.nb_cls, img_size=args.img_size[::-1])
+        nb_cls=args.nb_cls)
 
     pth_path = args.resume
     logger.info('loading HWR checkpoint from {}'.format(pth_path))
