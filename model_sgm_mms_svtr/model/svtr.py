@@ -1,4 +1,3 @@
-%%writefile /kaggle/working/HTR-VT/model_sgm_mms_svtr/model/svtr.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
