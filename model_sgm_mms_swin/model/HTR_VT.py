@@ -137,9 +137,12 @@ class SwinBlock2D(nn.Module):
         B, N, C = x.shape
         assert N == H*W
 
-        # save residual before windows/shift
-        x_res = x
-
+        # Standard Swin Transformer: x = x + attn(norm(x))
+        # Apply LayerNorm first, then attention with residual connection
+        shortcut = x
+        x = self.norm1(x)  # Apply norm to input tokens first
+        
+        # Reshape for windowing
         x = x.view(B, H, W, C)
 
         # cyclic shift
@@ -156,24 +159,24 @@ class SwinBlock2D(nn.Module):
             # repeat mask per-batch
             attn_mask = attn_mask.repeat(B, 1, 1)
 
-        # attention
-        xw = self.attn(self.norm1(windows), attn_mask=attn_mask)
+        # attention (no norm here since we applied it earlier)
+        attn_windows = self.attn(windows, attn_mask=attn_mask)
 
         # merge windows
-        merged = window_reverse(xw, self.wh, self.ww, H, W, B)
+        merged = window_reverse(attn_windows, self.wh, self.ww, H, W, B)
 
         # reverse cyclic shift
         if self.sh or self.sw:
-            x_attn = torch.roll(merged, shifts=(self.sh, self.sw), dims=(1, 2))
+            x = torch.roll(merged, shifts=(self.sh, self.sw), dims=(1, 2))
         else:
-            x_attn = merged
+            x = merged
 
-        x_attn = x_attn.view(B, H*W, C)
+        x = x.view(B, H*W, C)
 
-        # add attention residual
-        x = x_res + x_attn
+        # add attention residual connection
+        x = shortcut + x
 
-        # FFN with residual
+        # FFN with residual: x = x + mlp(norm(x))
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -457,4 +460,12 @@ class HTR_VT_Swin(nn.Module):
 
 
 def create_model(nb_cls, **kwargs):
-    return HTR_VT_Swin(nb_cls=nb_cls, **kwargs)
+    return HTR_VT_Swin(nb_cls=nb_cls,
+                       nb_cls=80,
+                       d_model=128,
+                       stage_depths=(2, 2, 2),
+                       stage_heads=(2, 4, 6),
+                       stage_windows=((4, 8), (2, 8), (1, 8)),
+                       stage_shifts=((0, 0), (0, 4), (0, 4)),
+                       mlp_ratio=4.0, drop=0.0,
+                       **kwargs)
