@@ -563,7 +563,7 @@ class MaskedAutoencoderViT(nn.Module):
         return logits
 
 
-def create_model(nb_cls, img_size, mlp_ratio, **kwargs):
+def create_model(nb_cls, img_size, mlp_ratio=4, **kwargs):
     model = MaskedAutoencoderViT(
         nb_cls,
         img_size=img_size,
