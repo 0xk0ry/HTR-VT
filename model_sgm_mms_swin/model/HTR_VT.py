@@ -461,7 +461,6 @@ class HTR_VT_Swin(nn.Module):
 
 def create_model(nb_cls, **kwargs):
     return HTR_VT_Swin(nb_cls=nb_cls,
-                       nb_cls=80,
                        d_model=128,
                        stage_depths=(2, 2, 2),
                        stage_heads=(2, 4, 6),
