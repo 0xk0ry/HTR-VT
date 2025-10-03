@@ -94,51 +94,6 @@ class Block(nn.Module):
         return x
 
 
-class VerticalAttentionBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0.1):
-        super(VerticalAttentionBlock, self).__init__()
-        self.num_heads = num_heads
-        self.embed_dim = embed_dim
-
-        # Linear layers for Q, K, V
-        self.query = nn.Linear(embed_dim, embed_dim)
-        self.key = nn.Linear(embed_dim, embed_dim)
-        self.value = nn.Linear(embed_dim, embed_dim)
-
-        # Output linear layer
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        B, C, H, W = x.size()  # (batch, channels, height, width)
-
-        # Reshape x to (B, H, C*W) for vertical self-attention
-        x_reshaped = x.view(B, C * W, H).permute(0, 2, 1)
-
-        # Query, Key, Value projections
-        Q = self.query(x_reshaped)
-        K = self.key(x_reshaped)
-        V = self.value(x_reshaped)
-
-        # Attention mechanism along height (axis 1)
-        attention_weights = torch.matmul(
-            Q, K.transpose(-2, -1)) / (self.embed_dim ** 0.5)
-        attention_weights = torch.softmax(attention_weights, dim=-1)
-        attention_weights = self.dropout(attention_weights)
-
-        # Output of attention layer
-        attn_output = torch.matmul(attention_weights, V)
-
-        # Project back to the original embed_dim
-        output = self.out_proj(attn_output)
-
-        # Reshape back to (B, C, H, W)
-        output = output.permute(0, 2, 1).view(B, C, H, W)
-
-        return output
-
-
 def get_2d_sincos_pos_embed(embed_dim, grid_size):
     """
     grid_size: int of the grid height and width
@@ -194,10 +149,100 @@ class LayerNorm(nn.Module):
         return F.layer_norm(x, x.size()[1:], weight=None, bias=None, eps=1e-05)
 
 
+"""VAN components (Visual Attention Network) for collapsing height dimension.
+Reference: Visual Attention Network (Li et al. 2022) – uses Large Kernel Attention (LKA).
+We keep this lightweight since our input feature map is only H=4, W=128.
+Goal here: (B, C, 4, 128)  ->  (B, C, 1, 128).
+"""
+
+
+class LargeKernelAttention(nn.Module):
+    """Large Kernel Attention (simplified) used in VAN.
+    Standard LKA uses depth-wise conv 5x5, then depth-wise dilated 7x7 (dilation=3), then pointwise 1x1.
+    Here we retain that pattern; given very small height (4), receptive field easily covers it.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dw = nn.Conv2d(dim, dim, kernel_size=5, padding=2, groups=dim, bias=False)
+        self.dwd = nn.Conv2d(dim, dim, kernel_size=7, padding=9, dilation=3, groups=dim, bias=False)
+        self.pw = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        u = x
+        attn = self.dw(x)
+        attn = self.dwd(attn)
+        attn = self.pw(attn)
+        attn = self.bn(attn)
+        return u * attn
+
+
+class VANBlock(nn.Module):
+    """A minimal VAN block: 1x1 -> GELU -> LKA -> 1x1 + residual."""
+
+    def __init__(self, dim: int, drop_path: float = 0.0):
+        super().__init__()
+        self.proj1 = nn.Conv2d(dim, dim, kernel_size=1, bias=True)
+        self.act = nn.GELU()
+        self.lka = LargeKernelAttention(dim)
+        self.proj2 = nn.Conv2d(dim, dim, kernel_size=1, bias=True)
+        self.norm = nn.BatchNorm2d(dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shortcut = x
+        x = self.proj1(x)
+        x = self.act(x)
+        x = self.lka(x)
+        x = self.proj2(x)
+        x = self.norm(x)
+        x = self.drop_path(x)
+        return x + shortcut
+
+
+class VANHeightReducer(nn.Module):
+    """Stack a few VANBlocks then collapse height -> 1 via adaptive pooling.
+    This module assumes input shape (B,C,H,W) with small H (e.g., 4).
+    """
+
+    def __init__(self, dim: int, depth: int = 2, drop_path: float = 0.0, pool: str = "avg"):
+        super().__init__()
+        self.blocks = nn.Sequential(*[VANBlock(dim, drop_path=drop_path) for _ in range(depth)])
+        if pool == "avg":
+            self.pool = nn.AdaptiveAvgPool2d((1, None))  # keep width, collapse height
+        elif pool == "max":
+            self.pool = nn.AdaptiveMaxPool2d((1, None))
+        else:
+            raise ValueError(f"Unsupported pool type: {pool}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B,C,H,W)
+        x = self.blocks(x)
+        x = self.pool(x)  # (B,C,1,W)
+        return x
+
+
 class MaskedAutoencoderViT(nn.Module):
-    def __init__(self, nb_cls=80, img_size=[512, 32], patch_size=[8, 32], embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4., norm_layer=nn.LayerNorm):
+    """ Masked Autoencoder with VisionTransformer backbone
+    """
+
+    def __init__(self,
+                 nb_cls=80,
+                 img_size=[512, 64],
+                 patch_size=[8, 32],
+                 embed_dim=1024,
+                 depth=24,
+                 num_heads=16,
+                 mlp_ratio=4.,
+                 norm_layer=nn.LayerNorm,
+                 van_depth: int = 2,
+                 van_pool: str = "avg",
+                 van_drop_path: float = 0.0):
         super().__init__()
 
+        # --------------------------------------------------------------------------
+        # MAE encoder specifics
         self.layer_norm = LayerNorm()
         self.patch_embed = resnet18.ResNet18(embed_dim)
         self.grid_size = [img_size[0] // patch_size[0],
@@ -205,43 +250,269 @@ class MaskedAutoencoderViT(nn.Module):
         self.embed_dim = embed_dim
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # Initial positional embedding for the original (H*W) layout; we'll dynamically
+        # recompute if sequence length changes after VAN height reduction.
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, self.num_patches, embed_dim), requires_grad=False
+        )
 
-        # Define the Vertical Attention Block
-        self.vertical_attention = VerticalAttentionBlock(embed_dim, num_heads)
-
-        self.pos_embed = nn.Parameter(torch.zeros(
-            1, self.num_patches, embed_dim), requires_grad=False)
-
-        # Transformer Encoder Blocks
+        # VAN module to collapse height (e.g., 4 -> 1). We rely on downstream logic to
+        # handle new sequence length (= width) after pooling.
+        self.van_reducer = VANHeightReducer(
+            embed_dim, depth=van_depth, drop_path=van_drop_path, pool=van_pool
+        )
+        # Will lazily create a 1x1 projection if backbone channels != embed_dim
+        self.proj_in = None
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, self.num_patches, mlp_ratio, qkv_bias=True, norm_layer=norm_layer) for i in range(depth)
-        ])
+            Block(embed_dim, num_heads, self.num_patches,
+                  mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
+            for i in range(depth)])
 
         self.norm = norm_layer(embed_dim, elementwise_affine=True)
         self.head = torch.nn.Linear(embed_dim, nb_cls)
 
         self.initialize_weights()
 
-    def forward_features(self, x, use_masking=False):
-        x = self.patch_embed(x)  # Shape: [B, C, H, W]
+    def initialize_weights(self):
+        # initialization
+        # initialize (and freeze) pos_embed by sin-cos embedding
+        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, self.grid_size)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
-        # Add Positional Encoding
-        x = x + self.pos_embed[:, :x.size(1), :]  # Add pos embedding
+        # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
+        # w = self.patch_embed.proj.weight.data
+        # torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
 
-        # Apply Vertical Attention Block (VAN)
-        # Apply vertical attention to downsample height while keeping width intact
-        x = self.vertical_attention(x)
+        # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
+        # pos_embed = get_2d_sincos_pos_embed(self.embed_dim, [1, self.nb_query])
+        # self.qry_tokens.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        torch.nn.init.normal_(self.mask_token, std=.02)
 
-        # Pass through Transformer Encoder
+        # initialize nn.Linear and nn.LayerNorm
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            # we use xavier_uniform following official JAX ViT:
+            torch.nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
+
+    # ---- MMS helpers ----
+    # ---------------------------
+    # 1-D Multiple Masking (MMS)
+    # ---------------------------
+
+    def _mask_random_1d(self, B: int, L: int, ratio: float, device) -> torch.Tensor:
+        """Random token masking on 1-D sequence. Returns bool [B, L], True = masked."""
+        if ratio <= 0.0:
+            return torch.zeros(B, L, dtype=torch.bool, device=device)
+        num = int(round(ratio * L))
+        if num <= 0:
+            return torch.zeros(B, L, dtype=torch.bool, device=device)
+        noise = torch.rand(B, L, device=device)
+        idx = noise.argsort(dim=1)[:, :num]         # per-sample masked indices
+        mask = torch.zeros(B, L, dtype=torch.bool, device=device)
+        mask.scatter_(1, idx, True)
+        return mask
+
+    def _mask_block_1d(self, B: int, L: int, ratio: float, device,
+                       min_block: int = 2) -> torch.Tensor:
+        """
+        Blockwise masking in 1-D (contiguous segments), no spacing constraints.
+        Returns bool [B, L], True = masked.
+        """
+        if ratio <= 0.0:
+            return torch.zeros(B, L, dtype=torch.bool, device=device)
+        target = int(round(ratio * L))
+        mask = torch.zeros(B, L, dtype=torch.bool, device=device)
+        for b in range(B):
+            covered = int(mask[b].sum().item())
+            # cap iterations to avoid infinite loops on tiny targets
+            for _ in range(10000):
+                if covered >= target:
+                    break
+                # choose a block length
+                remain = max(1, target - covered)
+                blk = random.randint(min_block, max(min_block, min(remain, L)))
+                start = random.randint(0, max(0, L - blk))
+                seg = mask[b, start:start+blk]
+                prev = int(seg.sum().item())
+                seg[:] = True
+                covered += int(seg.sum().item()) - prev
+        return mask
+
+    def _mask_span_1d(self, B: int, L: int, ratio: float, max_span: int, device) -> torch.Tensor:
+        """
+        Span masking in 1-D (YOUR OLD SEMANTICS, but robust):
+        - place contiguous spans of random length s ∈ [1, max_span]
+        - enforce an Algorithm-1-like spacing policy via k depending on ratio
+        - continue until ~ratio*L tokens are covered
+        Returns bool [B, L], True = masked.
+        """
+        if ratio <= 0.0:
+            return torch.zeros(B, L, dtype=torch.bool, device=device)
+
+        L = int(L)
+        max_span = int(max(1, min(max_span, L)))
+        target = int(round(ratio * L))
+        mask = torch.zeros(B, L, dtype=torch.bool, device=device)
+
+        # spacing policy similar to Alg.1 (adapted to 1-D)
+        def spacing_for(R):
+            if R <= 0.4:
+                # use k = span length (separates spans when ratio small)
+                return None
+            elif R <= 0.7:
+                return 1
+            else:
+                return 0
+        fixed_k = spacing_for(ratio)
+
+        for b in range(B):
+            used = torch.zeros(L, dtype=torch.bool, device=device)
+            covered = int(used.sum().item())
+            for _ in range(10000):
+                if covered >= target:
+                    break
+                s = random.randint(1, max_span)
+                if s > L:
+                    s = L
+                l = random.randint(0, L - s)
+                r = l + s - 1
+                k = s if fixed_k is None else fixed_k
+                # check spacing neighborhood
+                left_ok = (l - k) < 0 or not used[max(0, l - k):l].any()
+                right_ok = (
+                    r + 1) >= L or not used[r+1:min(L, r + 1 + k)].any()
+                if left_ok and right_ok:
+                    used[l:r+1] = True
+                    covered = int(used.sum().item())
+            mask[b] = used
+        return mask
+
+    def _mask_span_old_1d(self, B: int, L: int, ratio: float, max_span: int, device) -> torch.Tensor:
+        if ratio <= 0.0 or max_span <= 0 or L <= 0:
+            return torch.zeros(B, L, dtype=torch.bool, device=device)
+
+        span_total = int(L * ratio)
+        num_spans = span_total // max(1, max_span)
+        if num_spans <= 0:
+            return torch.zeros(B, L, dtype=torch.bool, device=device)
+
+        s = min(max_span, L)  # fixed length (old behavior)
+        mask = torch.zeros(B, L, dtype=torch.bool, device=device)
+
+        for _ in range(num_spans):
+            start = torch.randint(0, L - s + 1, (1,), device=device).item()
+            mask[:, start:start + s] = True    # same start for the whole batch
+
+        return mask
+
+    def generate_mms_mask(self, x: torch.Tensor,
+                          ratios: dict = None,
+                          max_span_length: int = 8,
+                          block_params: dict = None) -> torch.Tensor:
+        """
+        Build UNION of three 1-D masks: random, blockwise, span.
+        x: [B, L, D] tokens.
+        Returns: mask_keep float [B, L, 1], where 1=keep, 0=mask.
+        """
+        B, L, _ = x.shape
+        if ratios is None:
+            ratios = getattr(self, "mms_ratios", {
+                             "random": 0.50, "block": 0.25, "span": 0.25})
+        block_params = block_params or {}
+        min_block = int(block_params.get("min_block", 2))
+
+        m_rand = self._mask_random_1d(B, L, ratios.get(
+            "random", 0.50), x.device)              # [B,L] True=masked
+        m_block = self._mask_block_1d(B, L, ratios.get(
+            "block", 0.25), x.device, min_block)     # [B,L]
+        m_span = self._mask_span_1d(B, L, ratios.get(
+            "span", 0.25), max_span_length, x.device)  # [B,L]
+
+        m_union = (m_rand | m_block | m_span)   # True = masked by any strategy
+        mask_keep = (~m_union).float().unsqueeze(-1)  # [B,L,1], 1=keep, 0=mask
+        return mask_keep
+
+    def generate_span_mask(self, x, mask_ratio, max_span_length):
+        N, L, D = x.shape  # batch, length, dim
+        mask = torch.ones(N, L, 1).to(x.device)
+        span_length = int(L * mask_ratio)
+        num_spans = span_length // max_span_length
+        for i in range(num_spans):
+            idx = torch.randint(L - max_span_length, (1,))
+            mask[:, idx:idx + max_span_length, :] = 0
+        return mask
+
+    # inside MaskedAutoencoderViT.forward_features(...)
+    def forward_features(self, x, use_masking=False,
+                         mask_mode="mms",   # "random" | "block" | "span_old" | "mms"
+                         mask_ratio=0.5, max_span_length=8,
+                         ratios=None, block_params=None):
+        # [B,C,W,H] -> your [B,N,D] after reshape
+        # --- Backbone (ResNet) ---
+        x = self.patch_embed(x)              # (B, C, H=4, W=128) expected
+        B, C, H, W = x.shape
+
+        # If backbone channels differ from transformer embed_dim, project
+        if C != self.embed_dim:
+            if self.proj_in is None:
+                # Create projection on the fly and move it to the same device as x
+                self.proj_in = nn.Conv2d(C, self.embed_dim, kernel_size=1, bias=False).to(x.device)
+            x = self.proj_in(x)
+            C = self.embed_dim
+
+        # --- VAN Height Reduction (collapse H -> 1) ---
+        x = self.van_reducer(x)             # (B, C, 1, W)
+        x = x.squeeze(2)                    # (B, C, W)
+        x = x.permute(0, 2, 1)              # (B, W, C) treat width as sequence length
+        N = x.size(1)
+
+        if use_masking:
+            if mask_mode == "random":
+                keep = (~self._mask_random_1d(B, x.size(1),
+                        mask_ratio, x.device)).float().unsqueeze(-1)
+            elif mask_mode == "block":
+                keep = (~self._mask_block_1d(B, x.size(1),
+                        mask_ratio, x.device)).float().unsqueeze(-1)
+            elif mask_mode == "span_old":
+                keep = (~self._mask_span_old_1d(B, x.size(1), mask_ratio,
+                        max_span_length, x.device)).float().unsqueeze(-1)
+            else:  # "mms" union (what you already have)
+                keep = self.generate_mms_mask(
+                    x, ratios=ratios, max_span_length=max_span_length, block_params=block_params)
+            x = x * keep + (1 - keep) * self.mask_token  # [B,N,D]
+
+        # pos + transformer as you already do
+        # --- Positional Embedding ---
+        if N == self.pos_embed.size(1):
+            # Use precomputed (original) if sizes match (e.g., no height reduction case)
+            pos = self.pos_embed[:, :N, :]
+        else:
+            # Dynamically create 2D sin-cos for (1, W) -> shape (W, C)
+            dyn_pos = get_2d_sincos_pos_embed(self.embed_dim, [1, N])  # (1*W, C)
+            pos = torch.from_numpy(dyn_pos).float().to(x.device).unsqueeze(0)
+        x = x + pos
+
         for blk in self.blocks:
             x = blk(x)
+        return self.norm(x)                           # [B,N,D]
 
-        return self.norm(x)  # Final normalization
-
-    def forward(self, x, use_masking=False):
-        feats = self.forward_features(x, use_masking)
-        logits = self.head(feats)
+    def forward(self, x, use_masking=False, return_features=False, mask_mode="mms", mask_ratio=None, max_span_length=None):
+        feats = self.forward_features(
+            x, use_masking=use_masking, mask_mode=mask_mode,
+            mask_ratio=mask_ratio if mask_ratio is not None else 0.5,
+            max_span_length=max_span_length if max_span_length is not None else 8)
+        logits = self.head(feats)               # [B, N, nb_cls]  → CTC
+        # keep your current post-norm if you like
         logits = self.layer_norm(logits)
+        if return_features:
+            return logits, feats
         return logits
 
 
