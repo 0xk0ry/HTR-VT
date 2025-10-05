@@ -164,8 +164,10 @@ class LargeKernelAttention(nn.Module):
 
     def __init__(self, dim: int):
         super().__init__()
-        self.dw = nn.Conv2d(dim, dim, kernel_size=5, padding=2, groups=dim, bias=False)
-        self.dwd = nn.Conv2d(dim, dim, kernel_size=7, padding=9, dilation=3, groups=dim, bias=False)
+        self.dw = nn.Conv2d(dim, dim, kernel_size=5,
+                            padding=2, groups=dim, bias=False)
+        self.dwd = nn.Conv2d(dim, dim, kernel_size=7,
+                             padding=9, dilation=3, groups=dim, bias=False)
         self.pw = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn = nn.BatchNorm2d(dim)
 
@@ -188,7 +190,8 @@ class VANBlock(nn.Module):
         self.lka = LargeKernelAttention(dim)
         self.proj2 = nn.Conv2d(dim, dim, kernel_size=1, bias=True)
         self.norm = nn.BatchNorm2d(dim)
-        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+        self.drop_path = DropPath(
+            drop_path) if drop_path > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x
@@ -208,9 +211,11 @@ class VANHeightReducer(nn.Module):
 
     def __init__(self, dim: int, depth: int = 2, drop_path: float = 0.0, pool: str = "avg"):
         super().__init__()
-        self.blocks = nn.Sequential(*[VANBlock(dim, drop_path=drop_path) for _ in range(depth)])
+        self.blocks = nn.Sequential(
+            *[VANBlock(dim, drop_path=drop_path) for _ in range(depth)])
         if pool == "avg":
-            self.pool = nn.AdaptiveAvgPool2d((1, None))  # keep width, collapse height
+            self.pool = nn.AdaptiveAvgPool2d(
+                (1, None))  # keep width, collapse height
         elif pool == "max":
             self.pool = nn.AdaptiveMaxPool2d((1, None))
         else:
@@ -223,9 +228,33 @@ class VANHeightReducer(nn.Module):
         return x
 
 
-class MaskedAutoencoderViT(nn.Module):
-    """ Masked Autoencoder with VisionTransformer backbone
+class HorizontalMixer(nn.Module):
     """
+    Depthwise 1xk conv along width + pointwise fuse, BN, GELU with residual.
+    Operates on (B, C, 1, W) and preserves shape.
+    """
+
+    def __init__(self, dim: int, k: int = 9):
+        super().__init__()
+        pad = (k // 2)
+        self.dw = nn.Conv2d(dim, dim, kernel_size=(
+            1, k), padding=(0, pad), groups=dim, bias=False)
+        self.pw = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(dim)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B,C,1,W)
+        shortcut = x
+        y = self.dw(x)
+        y = self.pw(y)
+        y = self.bn(y)
+        y = shortcut + y
+        y = self.act(y)
+        return y
+
+
+class MaskedAutoencoderViT(nn.Module):
 
     def __init__(self,
                  nb_cls=80,
@@ -238,7 +267,9 @@ class MaskedAutoencoderViT(nn.Module):
                  norm_layer=nn.LayerNorm,
                  van_depth: int = 2,
                  van_pool: str = "avg",
-                 van_drop_path: float = 0.0):
+                 van_drop_path: float = 0.0,
+                 use_horizontal_mixer: bool = True,
+                 hmix_kernel: int = 9):
         super().__init__()
 
         # --------------------------------------------------------------------------
@@ -261,6 +292,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.van_reducer = VANHeightReducer(
             embed_dim, depth=van_depth, drop_path=van_drop_path, pool=van_pool
         )
+        self.hmix = HorizontalMixer(embed_dim, k=int(hmix_kernel))
         # Will lazily create a 1x1 projection if backbone channels != embed_dim
         self.proj_in = None
         self.blocks = nn.ModuleList([
@@ -277,7 +309,8 @@ class MaskedAutoencoderViT(nn.Module):
         # initialization
         # initialize (and freeze) pos_embed by sin-cos embedding
         pos_embed = get_2d_sincos_pos_embed(self.embed_dim, self.grid_size)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        self.pos_embed.data.copy_(
+            torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
         # w = self.patch_embed.proj.weight.data
@@ -346,55 +379,6 @@ class MaskedAutoencoderViT(nn.Module):
         return mask
 
     def _mask_span_1d(self, B: int, L: int, ratio: float, max_span: int, device) -> torch.Tensor:
-        """
-        Span masking in 1-D (YOUR OLD SEMANTICS, but robust):
-        - place contiguous spans of random length s ∈ [1, max_span]
-        - enforce an Algorithm-1-like spacing policy via k depending on ratio
-        - continue until ~ratio*L tokens are covered
-        Returns bool [B, L], True = masked.
-        """
-        if ratio <= 0.0:
-            return torch.zeros(B, L, dtype=torch.bool, device=device)
-
-        L = int(L)
-        max_span = int(max(1, min(max_span, L)))
-        target = int(round(ratio * L))
-        mask = torch.zeros(B, L, dtype=torch.bool, device=device)
-
-        # spacing policy similar to Alg.1 (adapted to 1-D)
-        def spacing_for(R):
-            if R <= 0.4:
-                # use k = span length (separates spans when ratio small)
-                return None
-            elif R <= 0.7:
-                return 1
-            else:
-                return 0
-        fixed_k = spacing_for(ratio)
-
-        for b in range(B):
-            used = torch.zeros(L, dtype=torch.bool, device=device)
-            covered = int(used.sum().item())
-            for _ in range(10000):
-                if covered >= target:
-                    break
-                s = random.randint(1, max_span)
-                if s > L:
-                    s = L
-                l = random.randint(0, L - s)
-                r = l + s - 1
-                k = s if fixed_k is None else fixed_k
-                # check spacing neighborhood
-                left_ok = (l - k) < 0 or not used[max(0, l - k):l].any()
-                right_ok = (
-                    r + 1) >= L or not used[r+1:min(L, r + 1 + k)].any()
-                if left_ok and right_ok:
-                    used[l:r+1] = True
-                    covered = int(used.sum().item())
-            mask[b] = used
-        return mask
-
-    def _mask_span_old_1d(self, B: int, L: int, ratio: float, max_span: int, device) -> torch.Tensor:
         if ratio <= 0.0 or max_span <= 0 or L <= 0:
             return torch.zeros(B, L, dtype=torch.bool, device=device)
 
@@ -411,33 +395,6 @@ class MaskedAutoencoderViT(nn.Module):
             mask[:, start:start + s] = True    # same start for the whole batch
 
         return mask
-
-    def generate_mms_mask(self, x: torch.Tensor,
-                          ratios: dict = None,
-                          max_span_length: int = 8,
-                          block_params: dict = None) -> torch.Tensor:
-        """
-        Build UNION of three 1-D masks: random, blockwise, span.
-        x: [B, L, D] tokens.
-        Returns: mask_keep float [B, L, 1], where 1=keep, 0=mask.
-        """
-        B, L, _ = x.shape
-        if ratios is None:
-            ratios = getattr(self, "mms_ratios", {
-                             "random": 0.50, "block": 0.25, "span": 0.25})
-        block_params = block_params or {}
-        min_block = int(block_params.get("min_block", 2))
-
-        m_rand = self._mask_random_1d(B, L, ratios.get(
-            "random", 0.50), x.device)              # [B,L] True=masked
-        m_block = self._mask_block_1d(B, L, ratios.get(
-            "block", 0.25), x.device, min_block)     # [B,L]
-        m_span = self._mask_span_1d(B, L, ratios.get(
-            "span", 0.25), max_span_length, x.device)  # [B,L]
-
-        m_union = (m_rand | m_block | m_span)   # True = masked by any strategy
-        mask_keep = (~m_union).float().unsqueeze(-1)  # [B,L,1], 1=keep, 0=mask
-        return mask_keep
 
     def generate_span_mask(self, x, mask_ratio, max_span_length):
         N, L, D = x.shape  # batch, length, dim
@@ -463,14 +420,19 @@ class MaskedAutoencoderViT(nn.Module):
         if C != self.embed_dim:
             if self.proj_in is None:
                 # Create projection on the fly and move it to the same device as x
-                self.proj_in = nn.Conv2d(C, self.embed_dim, kernel_size=1, bias=False).to(x.device)
+                self.proj_in = nn.Conv2d(
+                    C, self.embed_dim, kernel_size=1, bias=False).to(x.device)
             x = self.proj_in(x)
             C = self.embed_dim
 
         # --- VAN Height Reduction (collapse H -> 1) ---
         x = self.van_reducer(x)             # (B, C, 1, W)
+        # --- Horizontal local mixing along width (optional) ---
+        if self.use_horizontal_mixer:
+            x = self.hmix(x)                # (B, C, 1, W)
         x = x.squeeze(2)                    # (B, C, W)
-        x = x.permute(0, 2, 1)              # (B, W, C) treat width as sequence length
+        # (B, W, C) treat width as sequence length
+        x = x.permute(0, 2, 1)
         N = x.size(1)
 
         if use_masking:
@@ -480,12 +442,9 @@ class MaskedAutoencoderViT(nn.Module):
             elif mask_mode == "block":
                 keep = (~self._mask_block_1d(B, x.size(1),
                         mask_ratio, x.device)).float().unsqueeze(-1)
-            elif mask_mode == "span_old":
+            else:
                 keep = (~self._mask_span_old_1d(B, x.size(1), mask_ratio,
                         max_span_length, x.device)).float().unsqueeze(-1)
-            else:  # "mms" union (what you already have)
-                keep = self.generate_mms_mask(
-                    x, ratios=ratios, max_span_length=max_span_length, block_params=block_params)
             x = x * keep + (1 - keep) * self.mask_token  # [B,N,D]
 
         # pos + transformer as you already do
@@ -495,7 +454,8 @@ class MaskedAutoencoderViT(nn.Module):
             pos = self.pos_embed[:, :N, :]
         else:
             # Dynamically create 2D sin-cos for (1, W) -> shape (W, C)
-            dyn_pos = get_2d_sincos_pos_embed(self.embed_dim, [1, N])  # (1*W, C)
+            dyn_pos = get_2d_sincos_pos_embed(
+                self.embed_dim, [1, N])  # (1*W, C)
             pos = torch.from_numpy(dyn_pos).float().to(x.device).unsqueeze(0)
         x = x + pos
 
@@ -525,5 +485,7 @@ def create_model(nb_cls, img_size, **kwargs):
                                  num_heads=6,
                                  mlp_ratio=4,
                                  norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                                 use_horizontal_mixer=True,
+                                 hmix_kernel=9,
                                  **kwargs)
     return model
