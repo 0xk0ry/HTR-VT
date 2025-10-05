@@ -7,6 +7,8 @@ import numpy as np
 from model import resnet18
 from functools import partial
 import random
+import re
+
 
 class Attention(nn.Module):
     def __init__(self, dim, num_patches, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
@@ -113,20 +115,36 @@ class FeedForward(nn.Module):
 
 
 class ConvModule(nn.Module):
-    """Conformer convolution module (1D) implementing: LN -> pw conv -> GLU -> dw conv -> BN -> SiLU -> pw conv.
-    Expect input (B, N, C)."""
+    """Conformer convolution module (1D) implementing:
+    LN -> pw conv -> GLU -> dw conv -> GroupNorm -> SiLU -> pw conv.
+    Expect input (B, N, C).
+    GroupNorm is used instead of BatchNorm for small batch stability.
+    """
 
-    def __init__(self, dim, kernel_size=3, dropout=0.1, drop_path=0.0):
+    def __init__(self, dim, kernel_size=3, dropout=0.1, drop_path=0.0, expansion=1.0):
         super().__init__()
         self.layer_norm = nn.LayerNorm(dim)
-        self.pointwise_conv1 = nn.Conv1d(dim, 2 * dim, kernel_size=1)
-        self.glu = nn.GLU(dim=1)
+        # smaller expansion to avoid huge internal bottleneck; expansion=1.0 means no expansion
+        hidden_channels = int(dim * expansion)
+        # pointwise conv: (B, C, N) -> (B, hidden, N)
+        self.pointwise_conv1 = nn.Conv1d(dim, hidden_channels, kernel_size=1)
+        self.glu = nn.GLU(dim=1) if hidden_channels % 2 == 0 else None
+        # depthwise conv
         self.depthwise_conv = nn.Conv1d(
-            dim, dim, kernel_size=kernel_size, padding=kernel_size // 2, groups=dim, bias=True
+            hidden_channels // 2 if self.glu is not None else hidden_channels,
+            hidden_channels // 2 if self.glu is not None else hidden_channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=(hidden_channels //
+                    2 if self.glu is not None else hidden_channels),
+            bias=True
         )
-        self.batch_norm = nn.BatchNorm1d(dim, eps=1e-5)
+        # use GroupNorm for stable small-batch training
+        self.norm = nn.GroupNorm(
+            1, hidden_channels // 2 if self.glu is not None else hidden_channels, eps=1e-5)
         self.act = nn.SiLU()
-        self.pointwise_conv2 = nn.Conv1d(dim, dim, kernel_size=1)
+        self.pointwise_conv2 = nn.Conv1d(
+            hidden_channels // 2 if self.glu is not None else hidden_channels, dim, kernel_size=1)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = DropPath(
             drop_path) if drop_path > 0.0 else nn.Identity()
@@ -135,15 +153,16 @@ class ConvModule(nn.Module):
         # x: (B, N, C)
         residual = x
         x = self.layer_norm(x)
-        x = x.transpose(1, 2)           # (B, C, N)
-        x = self.pointwise_conv1(x)
-        x = self.glu(x)
+        x = x.transpose(1, 2)  # (B, C, N)
+        x = self.pointwise_conv1(x)  # (B, hidden, N)
+        if self.glu is not None:
+            x = self.glu(x)  # reduces to (B, hidden/2, N)
         x = self.depthwise_conv(x)
-        x = self.batch_norm(x)
+        x = self.norm(x)
         x = self.act(x)
         x = self.pointwise_conv2(x)
         x = self.dropout(x)
-        x = x.transpose(1, 2)           # (B, N, C)
+        x = x.transpose(1, 2)  # (B, N, C)
         return residual + self.drop_path(x)
 
 
@@ -236,12 +255,17 @@ class ConformerBlock(nn.Module):
         self.ffn2_norm = norm_layer(dim, elementwise_affine=True)
         self.ffn2 = FeedForward(dim, ff_hidden, dropout=ff_dropout)
         self.final_norm = norm_layer(dim, elementwise_affine=True)
+
         # Note: self.dropout removed as it was unused
         # drop path (stochastic depth) on residual branches
-        self.drop_path_ffn1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.drop_path_attn = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.drop_path_conv = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.drop_path_ffn2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path_ffn1 = DropPath(
+            drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path_attn = DropPath(
+            drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path_conv = DropPath(
+            drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path_ffn2 = DropPath(
+            drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x):
         # Macaron FFN (scaled by 1/2)
@@ -328,7 +352,7 @@ class MaskedAutoencoderViT(nn.Module):
         norm_layer=nn.LayerNorm,
         conv_kernel_size: int = 3,
         dropout: float = 0.1,
-        drop_path: float = 0.0
+        drop_path: float = 0.1
     ):
         super().__init__()
 
@@ -346,10 +370,10 @@ class MaskedAutoencoderViT(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path, depth)]
         self.blocks = nn.ModuleList([
             ConformerBlock(embed_dim, num_heads, self.num_patches,
-                            mlp_ratio=mlp_ratio,
-                            ff_dropout=dropout, attn_dropout=dropout,
-                            conv_dropout=dropout, conv_kernel_size=conv_kernel_size,
-                            norm_layer=norm_layer, drop_path=dpr[i])  # NEW
+                           mlp_ratio=mlp_ratio,
+                           ff_dropout=dropout, attn_dropout=dropout,
+                           conv_dropout=dropout, conv_kernel_size=conv_kernel_size,
+                           norm_layer=norm_layer, drop_path=dpr[i])  # NEW
             for i in range(depth)
         ])
         self.norm = norm_layer(embed_dim, elementwise_affine=True)
@@ -376,6 +400,65 @@ class MaskedAutoencoderViT(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+    # --- Backward compatibility for loading older checkpoints ---
+    def _upgrade_state_dict_keys(self, state_dict: dict) -> dict:
+        """
+        Map legacy parameter names to the current module structure, in-place.
+        - blocks.*.conv_layer_norm.* -> blocks.*.conv_module.layer_norm.*
+        """
+        if not isinstance(state_dict, dict):
+            return state_dict
+
+        remapped = {}
+        to_delete = []
+
+        # 0) Strip an optional leading 'module.' from DataParallel checkpoints
+        has_module_prefix = all(k.startswith("module.") for k in state_dict.keys())
+        if has_module_prefix:
+            for k, v in list(state_dict.items()):
+                new_k = k[len("module."):]
+                if new_k not in state_dict:
+                    remapped[new_k] = v
+                to_delete.append(k)
+            # apply moving keys
+            for k in to_delete:
+                state_dict.pop(k, None)
+            state_dict.update(remapped)
+            remapped.clear()
+            to_delete.clear()
+
+        # Direct string replace should be safe and faster than regex for this case
+        conv_legacy_patterns = [
+            (".conv_layer_norm.", ".conv_module.layer_norm."),
+            (".conv_pointwise_conv1.", ".conv_module.pointwise_conv1."),
+            (".conv_depthwise_conv.", ".conv_module.depthwise_conv."),
+            (".conv_norm.", ".conv_module.norm."),
+            (".conv_pointwise_conv2.", ".conv_module.pointwise_conv2."),
+        ]
+
+        for k, v in list(state_dict.items()):
+            for old, new in conv_legacy_patterns:
+                if old in k and new not in k:
+                    new_k = k.replace(old, new)
+                    # Only set if target key not already present
+                    if new_k not in state_dict:
+                        remapped[new_k] = v
+                    to_delete.append(k)
+                    break
+
+        if remapped or to_delete:
+            # apply removals then additions to avoid key overlap issues
+            for k in to_delete:
+                state_dict.pop(k, None)
+            state_dict.update(remapped)
+
+        return state_dict
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        # Remap legacy keys before delegating to PyTorch loader
+        upgraded = self._upgrade_state_dict_keys(dict(state_dict))
+        return super().load_state_dict(upgraded, strict=strict)
+
     # ---- MMS helpers ----
     # ---------------------------
     # 1-D Multiple Masking (MMS)
@@ -383,7 +466,7 @@ class MaskedAutoencoderViT(nn.Module):
 
     def _mask_random_1d(self, B: int, L: int, ratio: float, device) -> torch.Tensor:
         """Random token masking on 1-D sequence. Returns bool [B, L], True = masked."""
-        if ratio <= 0.0 or ratio > 1.0: 
+        if ratio <= 0.0 or ratio > 1.0:
             return torch.zeros(B, L, dtype=torch.bool, device=device)
         num = int(round(ratio * L))
         if num <= 0:
@@ -395,7 +478,7 @@ class MaskedAutoencoderViT(nn.Module):
         return mask
 
     def _mask_block_1d(self, B: int, L: int, ratio: float, device,
-                    min_block: int = 2) -> torch.Tensor:
+                       min_block: int = 2) -> torch.Tensor:
         """
         Blockwise masking in 1-D (contiguous segments), no spacing constraints.
         Returns bool [B, L], True = masked.
@@ -407,7 +490,8 @@ class MaskedAutoencoderViT(nn.Module):
         for b in range(B):
             covered = int(mask[b].sum().item())
             # cap iterations to avoid infinite loops on tiny targets
-            max_iterations = min(10000, target * 3)  # More reasonable upper bound
+            # More reasonable upper bound
+            max_iterations = min(10000, target * 3)
             for iteration in range(max_iterations):
                 if covered >= target:
                     break
@@ -419,7 +503,7 @@ class MaskedAutoencoderViT(nn.Module):
                 prev = int(seg.sum().item())
                 seg[:] = True
                 covered += int(seg.sum().item()) - prev
-                
+
                 # Early exit if we're not making progress
                 if iteration > 100 and covered < target * 0.1:
                     break
@@ -444,7 +528,8 @@ class MaskedAutoencoderViT(nn.Module):
         # spacing policy similar to Alg.1 (adapted to 1-D)
         def spacing_for(R):
             if R <= 0.4:
-                return None   # use k = span length (separates spans when ratio small)
+                # use k = span length (separates spans when ratio small)
+                return None
             elif R <= 0.7:
                 return 1
             else:
@@ -458,13 +543,15 @@ class MaskedAutoencoderViT(nn.Module):
                 if covered >= target:
                     break
                 s = random.randint(1, max_span)
-                if s > L: s = L
+                if s > L:
+                    s = L
                 l = random.randint(0, L - s)
                 r = l + s - 1
                 k = s if fixed_k is None else fixed_k
                 # check spacing neighborhood
-                left_ok  = (l - k) < 0 or not used[max(0, l - k):l].any()
-                right_ok = (r + 1) >= L or not used[r+1:min(L, r + 1 + k)].any()
+                left_ok = (l - k) < 0 or not used[max(0, l - k):l].any()
+                right_ok = (
+                    r + 1) >= L or not used[r+1:min(L, r + 1 + k)].any()
                 if left_ok and right_ok:
                     used[l:r+1] = True
                     covered = int(used.sum().item())
@@ -476,7 +563,7 @@ class MaskedAutoencoderViT(nn.Module):
             return torch.zeros(B, L, dtype=torch.bool, device=device)
 
         span_total = int(L * ratio)
-        num_spans  = span_total // max(1, max_span)
+        num_spans = span_total // max(1, max_span)
         if num_spans <= 0:
             return torch.zeros(B, L, dtype=torch.bool, device=device)
 
@@ -490,9 +577,9 @@ class MaskedAutoencoderViT(nn.Module):
         return mask
 
     def generate_mms_mask(self, x: torch.Tensor,
-                        ratios: dict = None,
-                        max_span_length: int = 8,
-                        block_params: dict = None) -> torch.Tensor:
+                          ratios: dict = None,
+                          max_span_length: int = 8,
+                          block_params: dict = None) -> torch.Tensor:
         """
         Build UNION of three 1-D masks: random, blockwise, span.
         x: [B, L, D] tokens.
@@ -500,18 +587,21 @@ class MaskedAutoencoderViT(nn.Module):
         """
         B, L, _ = x.shape
         if ratios is None:
-            ratios = getattr(self, "mms_ratios", {"random": 0.50, "block": 0.25, "span": 0.25})
+            ratios = getattr(self, "mms_ratios", {
+                             "random": 0.50, "block": 0.25, "span": 0.25})
         block_params = block_params or {}
         min_block = int(block_params.get("min_block", 2))
 
-        m_rand  = self._mask_random_1d(B, L, ratios.get("random", 0.50), x.device)              # [B,L] True=masked
-        m_block = self._mask_block_1d(B, L, ratios.get("block", 0.25), x.device, min_block)     # [B,L]
-        m_span  = self._mask_span_1d(B, L, ratios.get("span", 0.25), max_span_length, x.device) # [B,L]
+        m_rand = self._mask_random_1d(B, L, ratios.get(
+            "random", 0.50), x.device)              # [B,L] True=masked
+        m_block = self._mask_block_1d(B, L, ratios.get(
+            "block", 0.25), x.device, min_block)     # [B,L]
+        m_span = self._mask_span_1d(B, L, ratios.get(
+            "span", 0.25), max_span_length, x.device)  # [B,L]
 
         m_union = (m_rand | m_block | m_span)   # True = masked by any strategy
         mask_keep = (~m_union).float().unsqueeze(-1)  # [B,L,1], 1=keep, 0=mask
         return mask_keep
-
 
     def generate_span_mask(self, x, mask_ratio, max_span_length):
         N, L, D = x.shape  # batch, length, dim
@@ -520,15 +610,16 @@ class MaskedAutoencoderViT(nn.Module):
         num_spans = span_length // max_span_length
         for i in range(num_spans):
             idx = torch.randint(L - max_span_length, (1,))
-            mask[:,idx:idx + max_span_length,:] = 0
+            mask[:, idx:idx + max_span_length, :] = 0
         return mask
 
     # inside MaskedAutoencoderViT.forward_features(...)
     def forward_features(self, x, use_masking=False,
-                        mask_mode="mms",   # "random" | "block" | "span_old" | "mms"
-                        mask_ratio=0.5, max_span_length=8,
-                        ratios=None, block_params=None):
-        x = self.patch_embed(x)                       # [B,C,W,H] -> your [B,N,D] after reshape
+                         mask_mode="mms",   # "random" | "block" | "span_old" | "mms"
+                         mask_ratio=0.5, max_span_length=8,
+                         ratios=None, block_params=None):
+        # [B,C,W,H] -> your [B,N,D] after reshape
+        x = self.patch_embed(x)
         B, C, W, H = x.shape
         # Ensure dimensions are correct before reshaping
         assert C == self.embed_dim, f"Expected embed_dim {self.embed_dim}, got {C}"
@@ -536,13 +627,17 @@ class MaskedAutoencoderViT(nn.Module):
 
         if use_masking:
             if mask_mode == "random":
-                keep = (~self._mask_random_1d(B, x.size(1), mask_ratio, x.device)).float().unsqueeze(-1)
+                keep = (~self._mask_random_1d(B, x.size(1),
+                        mask_ratio, x.device)).float().unsqueeze(-1)
             elif mask_mode == "block":
-                keep = (~self._mask_block_1d(B, x.size(1), mask_ratio, x.device)).float().unsqueeze(-1)
+                keep = (~self._mask_block_1d(B, x.size(1),
+                        mask_ratio, x.device)).float().unsqueeze(-1)
             elif mask_mode == "span_old":
-                keep = (~self._mask_span_old_1d(B, x.size(1), mask_ratio, max_span_length, x.device)).float().unsqueeze(-1)
+                keep = (~self._mask_span_old_1d(B, x.size(1), mask_ratio,
+                        max_span_length, x.device)).float().unsqueeze(-1)
             else:  # "mms" union (what you already have)
-                keep = self.generate_mms_mask(x, ratios=ratios, max_span_length=max_span_length, block_params=block_params)
+                keep = self.generate_mms_mask(
+                    x, ratios=ratios, max_span_length=max_span_length, block_params=block_params)
             x = x * keep + (1 - keep) * self.mask_token  # [B,N,D]
 
         # pos + transformer as you already do
@@ -551,10 +646,10 @@ class MaskedAutoencoderViT(nn.Module):
             x = blk(x)
         return self.norm(x)                           # [B,N,D]
 
-
     def forward(self, x, use_masking=False, return_features=False, mask_mode="mms", mask_ratio=None, max_span_length=None):
         feats = self.forward_features(
-            x, use_masking=use_masking, mask_mode=mask_mode, mask_ratio=mask_ratio, max_span_length=max_span_length)  # [B, N, D]
+            # [B, N, D]
+            x, use_masking=use_masking, mask_mode=mask_mode, mask_ratio=mask_ratio, max_span_length=max_span_length)
         logits = self.head(feats)               # [B, N, nb_cls]  → CTC
         # keep your current post-norm if you like
         logits = self.layer_norm(logits)
