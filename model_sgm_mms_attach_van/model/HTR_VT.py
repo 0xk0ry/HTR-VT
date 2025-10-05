@@ -268,7 +268,6 @@ class MaskedAutoencoderViT(nn.Module):
                  van_depth: int = 2,
                  van_pool: str = "avg",
                  van_drop_path: float = 0.0,
-                 use_horizontal_mixer: bool = True,
                  hmix_kernel: int = 9):
         super().__init__()
 
@@ -428,8 +427,7 @@ class MaskedAutoencoderViT(nn.Module):
         # --- VAN Height Reduction (collapse H -> 1) ---
         x = self.van_reducer(x)             # (B, C, 1, W)
         # --- Horizontal local mixing along width (optional) ---
-        if self.use_horizontal_mixer:
-            x = self.hmix(x)                # (B, C, 1, W)
+        x = self.hmix(x)                # (B, C, 1, W)
         x = x.squeeze(2)                    # (B, C, W)
         # (B, W, C) treat width as sequence length
         x = x.permute(0, 2, 1)
@@ -485,7 +483,6 @@ def create_model(nb_cls, img_size, **kwargs):
                                  num_heads=6,
                                  mlp_ratio=4,
                                  norm_layer=partial(nn.LayerNorm, eps=1e-6),
-                                 use_horizontal_mixer=True,
                                  hmix_kernel=9,
                                  **kwargs)
     return model
