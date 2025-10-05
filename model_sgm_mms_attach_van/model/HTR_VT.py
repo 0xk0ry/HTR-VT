@@ -441,7 +441,7 @@ class MaskedAutoencoderViT(nn.Module):
                 keep = (~self._mask_block_1d(B, x.size(1),
                         mask_ratio, x.device)).float().unsqueeze(-1)
             else:
-                keep = (~self._mask_span_old_1d(B, x.size(1), mask_ratio,
+                keep = (~self._mask_span_1d(B, x.size(1), mask_ratio,
                         max_span_length, x.device)).float().unsqueeze(-1)
             x = x * keep + (1 - keep) * self.mask_token  # [B,N,D]
 
