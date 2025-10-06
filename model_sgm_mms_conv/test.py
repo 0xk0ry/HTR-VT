@@ -19,7 +19,7 @@ def main():
     args.save_dir = os.path.join(args.out_dir, args.exp_name)
     os.makedirs(args.save_dir, exist_ok=True)
     logger = utils.get_logger(args.save_dir)
-    logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
+    # logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
 
     model = HTR_VT.create_model(
         nb_cls=args.nb_cls, img_size=args.img_size[::-1])
